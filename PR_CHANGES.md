@@ -10,6 +10,52 @@ connection pool settings to handle cloud-hosted Neo4j idle timeouts.
 
 ---
 
+## Microsoft Agent Framework Integration
+
+All files under `src/neo4j_agent_memory/integrations/microsoft_agent/` are **new** in
+this branch. They implement the provider interfaces required by Microsoft's
+`agent-framework` package (`>= 1.0.0b260212`) so Neo4j Agent Memory can plug
+directly into the framework's agent lifecycle.
+
+### Module overview
+
+| File | Framework interface | Purpose |
+|------|---------------------|---------|
+| `__init__.py` | — | Public API, version pinning, graceful `ImportError` when framework isn't installed |
+| `chat_store.py` | `BaseHistoryProvider` | Persistent conversation history. The framework calls `get_messages()` before each run and `save_messages()` after. Messages are stored as a `NEXT_MESSAGE` chain in Neo4j. Supports optional entity extraction and embedding generation on save. |
+| `context_provider.py` | `BaseContextProvider` | Injects multi-layer memory context before agent invocation via `before_run()`. Assembles short-term (recent + semantic search), long-term (entities + preferences), and reasoning (similar past traces) context into system instructions. Runs entity extraction in `after_run()` without blocking. |
+| `tools.py` | `FunctionTool` / `@tool` | Defines 9 callable tools the agent can self-invoke during streaming: `search_memory`, `remember_preference`, `recall_preferences`, `search_knowledge`, `remember_fact`, `find_similar_tasks`, plus 3 optional GDS tools. |
+| `memory.py` | — | Unified facade composing `Neo4jContextProvider`, `Neo4jChatMessageStore`, and `GDSIntegration`. Factory method `from_memory_client()` for quick setup. Delegates convenience methods (`get_context`, `save_message`, `search_memory`, etc.) to the underlying providers. |
+| `gds.py` | — | Graph algorithm support (PageRank, community detection, shortest path, node similarity). Falls back to degree centrality / connected components / Jaccard-like Cypher when the GDS library is not available. Controlled by `GDSConfig`. |
+| `tracing.py` | — | Records agent executions as reasoning traces. Converts conversation messages into structured steps (thought, action, tool calls, results, outcome) and stores them in Neo4j's reasoning memory for later similarity retrieval. |
+
+### Why these are needed
+
+The Microsoft Agent Framework uses a **provider pipeline** pattern: agents
+accept `context_providers` that hook into `before_run` / `after_run` lifecycle
+events, and `tools` that the framework auto-invokes during streaming. Without
+these implementations, an application would need to manually inject memory
+context, parse streaming tool calls, and persist history — the exact boilerplate
+the retail assistant example was doing before this branch.
+
+### Architecture
+
+```
+Neo4jMicrosoftMemory (facade)
+├── Neo4jContextProvider  (BaseContextProvider)
+│   ├── short-term context  (recent + semantic search)
+│   ├── long-term context   (entities + preferences)
+│   └── reasoning context   (similar past traces)
+├── Neo4jChatMessageStore (BaseHistoryProvider)
+│   └── conversation persistence via NEXT_MESSAGE chain
+├── GDSIntegration
+│   └── PageRank / communities / shortest path / similarity (with fallbacks)
+└── create_memory_tools() → list[FunctionTool]
+    └── 6 base + 3 optional GDS tools
+```
+
+---
+
 ## 1. Callable FunctionTool Conversion
 
 The framework's streaming model requires **callable** `FunctionTool` instances so
@@ -142,8 +188,13 @@ ranking behavior.
 |------|------|
 | `src/neo4j_agent_memory/__init__.py` | Added `MemoryClient.graph` property |
 | `src/neo4j_agent_memory/graph/queries.py` | `id()` → `elementId()`, added `NULLS LAST` |
+| `src/neo4j_agent_memory/integrations/microsoft_agent/__init__.py` | Module entry point, version pinning, import guard |
+| `src/neo4j_agent_memory/integrations/microsoft_agent/chat_store.py` | `BaseHistoryProvider` implementation |
+| `src/neo4j_agent_memory/integrations/microsoft_agent/context_provider.py` | `BaseContextProvider` implementation |
+| `src/neo4j_agent_memory/integrations/microsoft_agent/memory.py` | Unified facade over providers |
 | `src/neo4j_agent_memory/integrations/microsoft_agent/tools.py` | Callable `FunctionTool` conversion |
-| `src/neo4j_agent_memory/integrations/microsoft_agent/gds.py` | `id()` → `elementId()` |
+| `src/neo4j_agent_memory/integrations/microsoft_agent/gds.py` | Graph algorithms with fallbacks, `id()` → `elementId()` |
+| `src/neo4j_agent_memory/integrations/microsoft_agent/tracing.py` | Reasoning trace recording |
 | `src/neo4j_agent_memory/config/settings.py` | Connection pool settings for cloud compatibility |
 | `src/neo4j_agent_memory/graph/client.py` | Pass new pool settings to driver |
 
