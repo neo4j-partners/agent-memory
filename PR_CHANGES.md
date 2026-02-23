@@ -5,7 +5,8 @@
 This PR updates the Microsoft Agent Framework provider to align with the latest
 `agent-framework` interfaces and modernizes all Cypher queries to follow Neo4j
 best practices. It also fixes several broken API calls in the retail assistant
-example so the backend passes all smoke tests (9/9).
+example so the backend passes all smoke tests (9/9). Additionally, it adds
+connection pool settings to handle cloud-hosted Neo4j idle timeouts.
 
 ---
 
@@ -129,6 +130,8 @@ ranking behavior.
 | `src/neo4j_agent_memory/graph/queries.py` | `id()` → `elementId()`, added `NULLS LAST` |
 | `src/neo4j_agent_memory/integrations/microsoft_agent/tools.py` | Callable `FunctionTool` conversion |
 | `src/neo4j_agent_memory/integrations/microsoft_agent/gds.py` | `id()` → `elementId()` |
+| `src/neo4j_agent_memory/config/settings.py` | Connection pool settings for cloud compatibility |
+| `src/neo4j_agent_memory/graph/client.py` | Pass new pool settings to driver |
 
 ### Example: Retail assistant
 
@@ -141,6 +144,23 @@ ranking behavior.
 | `examples/microsoft_agent_retail_assistant/backend/tools/inventory.py` | `execute_query` → `execute_read` |
 | `examples/microsoft_agent_retail_assistant/backend/tools/product_search.py` | `execute_query` → `execute_read`, `NULLS LAST` |
 | `examples/microsoft_agent_retail_assistant/backend/tools/recommendations.py` | Deprecated GDS removal, `NULLS LAST`, API fix |
+
+---
+
+## 4. Connection Pool Settings for Cloud Compatibility
+
+Added three new connection pool settings to `Neo4jConfig` and wired them into the driver in `Neo4jClient`:
+
+- `max_connection_lifetime` (default 300s) — proactively closes and replaces pooled connections older than this limit, preventing use of connections that the server (e.g. Aura) may have already dropped.
+- `liveness_check_timeout` (default 60s) — checks idle connections are still alive before reusing them.
+- `keep_alive` (default True) — enables TCP keep-alive to prevent idle connection drops.
+
+**Rationale:** Cloud-hosted Neo4j instances (Aura, DBX) have server-side idle timeouts. Without these settings, the driver can hold stale connections in the pool and fail on the next query with a connection reset error. These defaults keep the pool healthy without requiring users to configure anything.
+
+| File | Type |
+|------|------|
+| `src/neo4j_agent_memory/config/settings.py` | Added `max_connection_lifetime`, `liveness_check_timeout`, `keep_alive` fields |
+| `src/neo4j_agent_memory/graph/client.py` | Pass new settings through to driver constructor |
 
 ---
 
