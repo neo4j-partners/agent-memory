@@ -55,6 +55,20 @@ store. `MemoryClient` itself kept `_client` private, forcing consumers to reach
 through `memory_client.short_term.client` or access `_client` directly. The GDS
 integration was already breaking encapsulation via `self._client._client.session()`.
 
+**Usage:** The retail assistant example uses `.graph` extensively (41 calls across
+all backend files) for product, cart, inventory, and recommendation queries via
+`memory_client.graph.execute_read()` and `memory_client.graph.execute_write()`.
+This lets the example reuse the single Neo4j connection pool that `MemoryClient`
+already manages rather than standing up a second driver for application-specific
+queries.
+
+**Alternative considered:** Each application could create its own
+`neo4j.AsyncGraphDatabase.driver(...)` for non-memory queries. This was rejected
+because it doubles the connection pool overhead against the same database,
+duplicates connection config (URI, auth, pool size, timeouts), and requires a
+separate lifecycle (init/close) to manage. Since the memory client already
+maintains a healthy connection pool, exposing it via `.graph` is the simpler path.
+
 ---
 
 ## 3. Modern Cypher Best Practices
