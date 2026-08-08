@@ -188,10 +188,29 @@ class TestAdoptExistingGraph:
         assert rows[0]["cnt"] == 1
 
         # Add a message that should produce a MENTIONS edge into Alice.
-        await client.short_term.add_message(session_id, "user", "I had lunch with Alice yesterday.")
+        message = await client.short_term.add_message(
+            session_id, "user", "I had lunch with Alice yesterday."
+        )
 
         # There should still be exactly one Alice node — the library
         # MERGE'd on (:Entity {name:'Alice', type:'PERSON'}) and found the
         # adopted domain node.
         rows = await client._client.execute_read("MATCH (p {name: 'Alice'}) RETURN count(p) AS cnt")
         assert rows[0]["cnt"] == 1
+
+        # And the edge must actually exist, landing on the adopted :Person.
+        # Asserting only the node count above passes even when the MENTIONS
+        # write matched nothing, which is exactly how the dropped-edge defect
+        # survived this suite.
+        rows = await client._client.execute_read(
+            """
+            MATCH (m:Message {id: $id})-[:MENTIONS]->(e:Entity {name: 'Alice'})
+            RETURN e.id AS id, labels(e) AS labels
+            """,
+            {"id": str(message.id)},
+        )
+        assert len(rows) == 1, "MENTIONS edge into the adopted node was not written"
+        assert "Person" in rows[0]["labels"]
+        # Adoption assigns '<label_lc>:<name>', never a uuid. A uuid here
+        # means the link went to a fresh duplicate, not the adopted node.
+        assert rows[0]["id"] == "person:Alice"

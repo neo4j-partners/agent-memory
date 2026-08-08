@@ -333,10 +333,24 @@ class TestBuildCreateEntityQuery:
         assert "ON MATCH SET" in query
         assert "e.updated_at = datetime()" in query
 
-    def test_query_contains_return(self):
-        """Test that generated query ends with RETURN."""
+    def test_on_match_backfills_missing_id(self):
+        """A matched node that carries no id must be given one.
+
+        Callers link on the returned id, and a null id makes the
+        MENTIONS write match nothing and drop the edge silently.
+        """
         query = build_create_entity_query("PERSON", None)
-        assert query.strip().endswith("RETURN e")
+        assert "e.id = COALESCE(e.id, $id)" in query
+
+    def test_query_contains_return(self):
+        """Test that generated query ends with RETURN.
+
+        ``e.id`` is returned as a named column so callers can link on the
+        stored id rather than the ``$id`` they passed in, which a matched
+        node never adopts.
+        """
+        query = build_create_entity_query("PERSON", None)
+        assert query.strip().endswith("RETURN e, e.id AS id")
 
     def test_query_includes_type_label_in_pascal_case(self):
         """Test that query includes type as PascalCase label."""

@@ -784,6 +784,7 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
                     MERGE (e:Entity {name: $name, type: $type})
                     ON CREATE SET e.id = coalesce(e.id, $name + ':' + $type),
                                   e.created_at = datetime()
+                    ON MATCH SET e.id = coalesce(e.id, $name + ':' + $type)
                     RETURN e.id AS id
                     """,
                     {"name": ref.name, "type": ref.type},
@@ -795,11 +796,19 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
                     MERGE (e:Entity {name: $name})
                     ON CREATE SET e.id = coalesce(e.id, $name),
                                   e.created_at = datetime()
+                    ON MATCH SET e.id = coalesce(e.id, $name)
                     RETURN e.id AS id
                     """,
                     {"name": ref.name},
                 )
                 entity_id = rows[0]["id"]
+
+            # A null id here would make LINK_MESSAGE_TO_ENTITY's MATCH bind
+            # nothing and drop the edge without raising. The ON MATCH clauses
+            # above should make this unreachable; skip rather than write a
+            # link that silently does not exist.
+            if entity_id is None:
+                continue
 
             await self._client.execute_write(
                 queries.LINK_MESSAGE_TO_ENTITY,
@@ -1174,7 +1183,7 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
                     entity_id = str(uuid4())
                     entity_subtype = getattr(entity, "subtype", None)
                     create_query = build_create_entity_query(entity.type, entity_subtype)
-                    await self._client.execute_write(
+                    rows = await self._client.execute_write(
                         create_query,
                         {
                             "id": entity_id,
@@ -1189,6 +1198,12 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
                             "location": None,  # Required for LOCATION entities
                         },
                     )
+
+                    # Read the id back --- see _extract_and_link_entities. A
+                    # matched node keeps its own id, so linking on the
+                    # generated uuid would drop the MENTIONS edge without
+                    # raising, while entities_extracted below still counted it.
+                    entity_id = rows[0]["id"] if rows else entity_id
 
                     # Store mapping for relation linking
                     entity_name_to_id[entity.name.lower().strip()] = entity_id
@@ -1357,7 +1372,7 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
             metadata_payload = (
                 json.dumps({"extracted_by": extracted_by}) if extracted_by is not None else None
             )
-            await self._client.execute_write(
+            rows = await self._client.execute_write(
                 create_query,
                 {
                     "id": entity_id,
@@ -1372,6 +1387,13 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
                     "location": None,  # Required for LOCATION entities
                 },
             )
+
+            # Read the id back. When the MERGE matched an existing node --- an
+            # entity adopted from a pre-existing domain graph, or one an
+            # earlier message already created --- that node keeps its own id
+            # and the generated uuid above was never written. Linking on the
+            # uuid would silently match nothing and drop the MENTIONS edge.
+            entity_id = rows[0]["id"] if rows else entity_id
 
             # Store mapping for relation linking
             entity_name_to_id[entity.name.lower().strip()] = entity_id

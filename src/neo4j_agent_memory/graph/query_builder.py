@@ -278,6 +278,7 @@ ON CREATE SET
     e.created_at = datetime(),
     e.metadata = $metadata{location_on_create}
 ON MATCH SET
+    e.id = COALESCE(e.id, $id),
     e.subtype = COALESCE($subtype, e.subtype),
     e.canonical_name = COALESCE($canonical_name, e.canonical_name),
     e.description = COALESCE($description, e.description),
@@ -288,6 +289,10 @@ ON MATCH SET
     if label_set_clause:
         query += f"\n{label_set_clause}"
 
-    query += "\nRETURN e"
+    # ``e.id`` is returned as a named column because a MERGE that matches an
+    # existing node keeps that node's own id, which is not the ``$id`` the
+    # caller generated. Callers must link on the returned id, never on the id
+    # they passed in.
+    query += "\nRETURN e, e.id AS id"
 
     return query

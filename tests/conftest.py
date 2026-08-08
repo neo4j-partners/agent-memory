@@ -67,6 +67,9 @@ def _check_neo4j_env_available() -> dict | None:
 
     username = os.getenv("NEO4J_USERNAME", "neo4j")
     password = os.getenv("NEO4J_PASSWORD", "test-password")
+    # Aura names the database after the instance id rather than "neo4j",
+    # so the default only fits local and GitHub Actions Neo4j.
+    database = os.getenv("NEO4J_DATABASE", "neo4j")
 
     try:
         from neo4j import GraphDatabase
@@ -78,6 +81,7 @@ def _check_neo4j_env_available() -> dict | None:
             "uri": uri,
             "username": username,
             "password": password,
+            "database": database,
         }
     except Exception:
         return None
@@ -421,6 +425,7 @@ def memory_settings(neo4j_connection_info):
             uri=neo4j_connection_info["uri"],
             username=neo4j_connection_info["username"],
             password=SecretStr(neo4j_connection_info["password"]),
+            database=neo4j_connection_info.get("database", "neo4j"),
         )
     )
 
