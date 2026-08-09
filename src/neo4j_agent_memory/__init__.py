@@ -85,6 +85,7 @@ from neo4j_agent_memory.config.settings import (
     LLMProvider,
     MemoryConfig,
     MemorySettings,
+    MemorySubsystem,
     NamsConfig,
     NamsSettings,
     Neo4jConfig,
@@ -267,6 +268,7 @@ __all__ = [
     "ResolverStrategy",
     "GeocodingProvider",
     "EnrichmentProvider",
+    "MemorySubsystem",
     "MessageRole",
     "EntityType",
     "ToolCallStatus",
@@ -509,6 +511,7 @@ class MemoryClient(Generic[_ST, _LT, _RT]):
         self._schema_manager = SchemaManager(
             self._client,
             vector_dimensions=vector_dimensions,
+            skip_subsystems=self._settings.schema_config.skip_subsystems,
         )
         await self._schema_manager.setup_all()
 

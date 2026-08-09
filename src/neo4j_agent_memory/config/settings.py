@@ -61,6 +61,44 @@ class SchemaModel(str, Enum):
     CUSTOM = "custom"  # User-defined schema
 
 
+class MemorySubsystem(str, Enum):
+    """A group of Neo4j schema objects that can be installed or skipped.
+
+    The members partition every constraint and index
+    :class:`~neo4j_agent_memory.graph.schema.SchemaManager` manages, so
+    each schema object belongs to exactly one subsystem. Pass the ones you
+    do not use to ``SchemaConfig.skip_subsystems`` to keep them off the
+    database.
+    """
+
+    SHORT_TERM = "short_term"
+    """``Conversation`` and ``Message`` — short-term memory."""
+
+    ENTITIES = "entities"
+    """``Entity`` — the POLE+O long-term entity graph."""
+
+    PREFERENCES = "preferences"
+    """``Preference`` — long-term preference memory."""
+
+    FACTS = "facts"
+    """``Fact`` — long-term declarative subject/predicate/object memory."""
+
+    REASONING = "reasoning"
+    """``ReasoningTrace``, ``ReasoningStep``, ``Tool`` and ``ToolCall``."""
+
+    USERS = "users"
+    """``User`` — multi-tenant identity."""
+
+    CONSOLIDATION = "consolidation"
+    """``ConsolidationRun`` and ``Conversation.archived`` — hygiene jobs."""
+
+    READ_AUDIT = "read_audit"
+    """``MemoryReadAudit`` — the opt-in record of memory reads."""
+
+    GEOSPATIAL = "geospatial"
+    """``Entity.location`` — the point index behind proximity search."""
+
+
 class ResolverStrategy(str, Enum):
     """Supported entity resolution strategies."""
 
@@ -169,6 +207,17 @@ class SchemaConfig(BaseModel):
     strict_types: bool = Field(default=False, description="Whether to reject unknown entity types")
     custom_schema_path: str | None = Field(
         default=None, description="Path to custom schema definition file (.json or .yaml)"
+    )
+    skip_subsystems: frozenset[MemorySubsystem] = Field(
+        default_factory=frozenset,
+        description=(
+            "Memory subsystems whose constraints and indexes are not created "
+            "on connect. Empty by default, which installs the full schema. "
+            "Naming a subsystem here only removes schema objects — the "
+            "corresponding APIs keep working, minus uniqueness enforcement "
+            "and index-backed search. Use it on constrained databases (e.g. "
+            "AuraDB Free) that never touch a subsystem."
+        ),
     )
 
 

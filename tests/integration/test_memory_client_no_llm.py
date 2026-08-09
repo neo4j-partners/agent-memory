@@ -36,7 +36,7 @@ from neo4j_agent_memory.graph.schema import SchemaManager
 # at 1536 dims (mock embedder / OpenAI default); without dropping them, the
 # 384-dim sentence-transformers configuration used below trips the
 # EmbeddingDimensionMismatchError guard in MemoryClient.connect().
-_MANAGED_VECTOR_INDEX_NAMES = tuple(name for name, _, _ in SchemaManager._MANAGED_VECTOR_INDEXES)
+_MANAGED_VECTOR_INDEX_NAMES = tuple(name for name, _, _, _ in SchemaManager._MANAGED_VECTOR_INDEXES)
 
 
 def _build_settings(neo4j_connection_info) -> MemorySettings:

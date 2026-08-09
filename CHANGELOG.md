@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SchemaConfig.skip_subsystems` — install only the schema you use.** The new
+  `MemorySubsystem` enum (`SHORT_TERM`, `ENTITIES`, `PREFERENCES`, `FACTS`,
+  `REASONING`, `USERS`, `CONSOLIDATION`, `READ_AUDIT`, `GEOSPATIAL`) partitions
+  every constraint and index `SchemaManager` manages; naming a subsystem in
+  `SchemaConfig.skip_subsystems` (or `SchemaManager(..., skip_subsystems=...)`)
+  keeps its objects off the database. The default is an empty set, which
+  installs the full 12 constraints / 33 indexes exactly as before. Skipping
+  removes schema only — writes to a skipped subsystem still succeed, minus
+  uniqueness enforcement and index-backed search.
+  `validate_vector_index_dimensions` now ignores vector indexes belonging to a
+  skipped subsystem, so a leftover from an earlier full setup cannot fail
+  `connect()` with a mismatch the caller no longer controls. Motivated by
+  constrained deployments (e.g. AuraDB Free) that share a database with an
+  unrelated application schema.
 - **Strands SessionManager** (`Neo4jSessionManager`) — automatic conversation
   persistence/restore for AWS Strands agents via `Agent(session_manager=...)`,
   backed by any `MemoryClient` (bolt or NAMS). Includes opt-in long-term

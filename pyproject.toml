@@ -1,6 +1,6 @@
 [project]
 name = "neo4j-agent-memory"
-version = "0.5.1.dev0+mentions"
+version = "0.5.1.dev1+mentions"
 description = "A comprehensive memory system for AI agents using Neo4j"
 readme = "README-pypi.md"
 license = { text = "Apache-2.0" }

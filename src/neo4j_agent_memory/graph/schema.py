@@ -6,6 +6,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any, cast
 
+from neo4j_agent_memory.config.settings import MemorySubsystem
 from neo4j_agent_memory.core.exceptions import SchemaError
 from neo4j_agent_memory.graph import queries
 from neo4j_agent_memory.schema.models import (
@@ -14,6 +15,8 @@ from neo4j_agent_memory.schema.models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from neo4j_agent_memory.graph.client import Neo4jClient
 
 
@@ -60,11 +63,76 @@ class SchemaManager:
     Handles creation of indexes and constraints for all memory types.
     """
 
+    # Unique constraints the library manages, each tagged with the
+    # subsystem it belongs to. Every constraint also creates a backing
+    # index, so a skipped constraint removes two entries from
+    # ``SHOW INDEXES``-style counts: one constraint and one index.
+    _MANAGED_CONSTRAINTS: tuple[tuple[str, str, str, MemorySubsystem], ...] = (
+        # Short-term memory
+        ("conversation_id", "Conversation", "id", MemorySubsystem.SHORT_TERM),
+        ("message_id", "Message", "id", MemorySubsystem.SHORT_TERM),
+        # Long-term memory
+        ("entity_id", "Entity", "id", MemorySubsystem.ENTITIES),
+        ("preference_id", "Preference", "id", MemorySubsystem.PREFERENCES),
+        ("fact_id", "Fact", "id", MemorySubsystem.FACTS),
+        # Reasoning memory
+        ("reasoning_trace_id", "ReasoningTrace", "id", MemorySubsystem.REASONING),
+        ("reasoning_step_id", "ReasoningStep", "id", MemorySubsystem.REASONING),
+        ("tool_name", "Tool", "name", MemorySubsystem.REASONING),
+        ("tool_call_id", "ToolCall", "id", MemorySubsystem.REASONING),
+        # Multi-tenant (v0.4)
+        ("user_identifier", "User", "identifier", MemorySubsystem.USERS),
+        # Hygiene + privacy (v0.5)
+        ("consolidation_run_id", "ConsolidationRun", "id", MemorySubsystem.CONSOLIDATION),
+        ("memory_read_audit_id", "MemoryReadAudit", "id", MemorySubsystem.READ_AUDIT),
+    )
+
+    # Regular property indexes the library manages.
+    _MANAGED_INDEXES: tuple[tuple[str, str, str, MemorySubsystem], ...] = (
+        # Short-term memory
+        ("conversation_session_idx", "Conversation", "session_id", MemorySubsystem.SHORT_TERM),
+        ("message_timestamp_idx", "Message", "timestamp", MemorySubsystem.SHORT_TERM),
+        ("message_role_idx", "Message", "role", MemorySubsystem.SHORT_TERM),
+        # Long-term memory
+        ("entity_type_idx", "Entity", "type", MemorySubsystem.ENTITIES),
+        ("entity_name_idx", "Entity", "name", MemorySubsystem.ENTITIES),
+        ("entity_canonical_idx", "Entity", "canonical_name", MemorySubsystem.ENTITIES),
+        ("preference_category_idx", "Preference", "category", MemorySubsystem.PREFERENCES),
+        # Reasoning memory
+        ("trace_session_idx", "ReasoningTrace", "session_id", MemorySubsystem.REASONING),
+        ("trace_success_idx", "ReasoningTrace", "success", MemorySubsystem.REASONING),
+        ("trace_error_kind_idx", "ReasoningTrace", "error_kind", MemorySubsystem.REASONING),
+        ("tool_call_status_idx", "ToolCall", "status", MemorySubsystem.REASONING),
+        # Hygiene (v0.5)
+        ("conversation_archived_idx", "Conversation", "archived", MemorySubsystem.CONSOLIDATION),
+        ("consolidation_run_kind_idx", "ConsolidationRun", "kind", MemorySubsystem.CONSOLIDATION),
+        ("memory_read_audit_kind_idx", "MemoryReadAudit", "kind", MemorySubsystem.READ_AUDIT),
+    )
+
+    # Vector indexes the library manages. Used by both
+    # :meth:`setup_vector_indexes` and
+    # :meth:`validate_vector_index_dimensions`.
+    _MANAGED_VECTOR_INDEXES: tuple[tuple[str, str, str, MemorySubsystem], ...] = (
+        ("message_embedding_idx", "Message", "embedding", MemorySubsystem.SHORT_TERM),
+        ("entity_embedding_idx", "Entity", "embedding", MemorySubsystem.ENTITIES),
+        ("preference_embedding_idx", "Preference", "embedding", MemorySubsystem.PREFERENCES),
+        ("fact_embedding_idx", "Fact", "embedding", MemorySubsystem.FACTS),
+        ("task_embedding_idx", "ReasoningTrace", "task_embedding", MemorySubsystem.REASONING),
+        ("step_embedding_idx", "ReasoningStep", "embedding", MemorySubsystem.REASONING),
+    )
+
+    # Point indexes the library manages.
+    _MANAGED_POINT_INDEXES: tuple[tuple[str, str, str, MemorySubsystem], ...] = (
+        # Location entities have a 'location' Point property for coordinates
+        ("entity_location_idx", "Entity", "location", MemorySubsystem.GEOSPATIAL),
+    )
+
     def __init__(
         self,
         client: Neo4jClient,
         *,
         vector_dimensions: int = DEFAULT_VECTOR_DIMENSIONS,
+        skip_subsystems: Iterable[MemorySubsystem] = (),
     ):
         """
         Initialize schema manager.
@@ -72,9 +140,24 @@ class SchemaManager:
         Args:
             client: Neo4j client
             vector_dimensions: Dimensions for vector indexes
+            skip_subsystems: Memory subsystems whose constraints and
+                indexes should not be created. Empty by default, which
+                installs the full schema. A skipped subsystem still
+                accepts writes — it just loses uniqueness enforcement and
+                index-backed search for its node types.
         """
         self._client = client
         self._vector_dimensions = vector_dimensions
+        self._skip_subsystems = frozenset(skip_subsystems)
+
+    @property
+    def skipped_subsystems(self) -> frozenset[MemorySubsystem]:
+        """Subsystems this manager will not create schema objects for."""
+        return self._skip_subsystems
+
+    def _is_active(self, subsystem: MemorySubsystem) -> bool:
+        """Whether schema objects for ``subsystem`` should be created."""
+        return subsystem not in self._skip_subsystems
 
     async def setup_all(self) -> None:
         """Set up all indexes and constraints."""
@@ -85,70 +168,23 @@ class SchemaManager:
 
     async def setup_constraints(self) -> None:
         """Create unique constraints for all node types."""
-        constraints = [
-            # Short-term memory
-            ("conversation_id", "Conversation", "id"),
-            ("message_id", "Message", "id"),
-            # Long-term memory
-            ("entity_id", "Entity", "id"),
-            ("preference_id", "Preference", "id"),
-            ("fact_id", "Fact", "id"),
-            # Reasoning memory
-            ("reasoning_trace_id", "ReasoningTrace", "id"),
-            ("reasoning_step_id", "ReasoningStep", "id"),
-            ("tool_name", "Tool", "name"),
-            ("tool_call_id", "ToolCall", "id"),
-            # Multi-tenant (v0.4)
-            ("user_identifier", "User", "identifier"),
-            # Hygiene + privacy (v0.5)
-            ("consolidation_run_id", "ConsolidationRun", "id"),
-            ("memory_read_audit_id", "MemoryReadAudit", "id"),
-        ]
-
-        for constraint_name, label, property_name in constraints:
+        for constraint_name, label, property_name, subsystem in self._MANAGED_CONSTRAINTS:
+            if not self._is_active(subsystem):
+                continue
             await self._create_constraint(constraint_name, label, property_name)
 
     async def setup_indexes(self) -> None:
         """Create regular indexes for common queries."""
-        indexes = [
-            # Short-term memory
-            ("conversation_session_idx", "Conversation", "session_id"),
-            ("message_timestamp_idx", "Message", "timestamp"),
-            ("message_role_idx", "Message", "role"),
-            # Long-term memory
-            ("entity_type_idx", "Entity", "type"),
-            ("entity_name_idx", "Entity", "name"),
-            ("entity_canonical_idx", "Entity", "canonical_name"),
-            ("preference_category_idx", "Preference", "category"),
-            # Reasoning memory
-            ("trace_session_idx", "ReasoningTrace", "session_id"),
-            ("trace_success_idx", "ReasoningTrace", "success"),
-            ("trace_error_kind_idx", "ReasoningTrace", "error_kind"),
-            ("tool_call_status_idx", "ToolCall", "status"),
-            # Hygiene (v0.5)
-            ("conversation_archived_idx", "Conversation", "archived"),
-            ("consolidation_run_kind_idx", "ConsolidationRun", "kind"),
-            ("memory_read_audit_kind_idx", "MemoryReadAudit", "kind"),
-        ]
-
-        for index_name, label, property_name in indexes:
+        for index_name, label, property_name, subsystem in self._MANAGED_INDEXES:
+            if not self._is_active(subsystem):
+                continue
             await self._create_index(index_name, label, property_name)
-
-    # Vector indexes the library manages. Used by both
-    # :meth:`setup_vector_indexes` and
-    # :meth:`validate_vector_index_dimensions`.
-    _MANAGED_VECTOR_INDEXES: tuple[tuple[str, str, str], ...] = (
-        ("message_embedding_idx", "Message", "embedding"),
-        ("entity_embedding_idx", "Entity", "embedding"),
-        ("preference_embedding_idx", "Preference", "embedding"),
-        ("fact_embedding_idx", "Fact", "embedding"),
-        ("task_embedding_idx", "ReasoningTrace", "task_embedding"),
-        ("step_embedding_idx", "ReasoningStep", "embedding"),
-    )
 
     async def setup_vector_indexes(self) -> None:
         """Create vector indexes for semantic search."""
-        for index_name, label, property_name in self._MANAGED_VECTOR_INDEXES:
+        for index_name, label, property_name, subsystem in self._MANAGED_VECTOR_INDEXES:
+            if not self._is_active(subsystem):
+                continue
             await self._create_vector_index(index_name, label, property_name)
 
     async def validate_vector_index_dimensions(self, expected: int) -> None:
@@ -161,7 +197,10 @@ class SchemaManager:
 
         Only indexes the library manages
         (:attr:`_MANAGED_VECTOR_INDEXES`) are checked. User-created vector
-        indexes outside that set are ignored.
+        indexes outside that set are ignored, and so are indexes belonging
+        to a skipped subsystem — this manager did not create those and
+        does not size them, so a leftover from an earlier full setup must
+        not fail the connect.
 
         Args:
             expected: Dimensionality declared by the configured embedder.
@@ -191,7 +230,11 @@ class SchemaManager:
             )
             raise
 
-        managed_names = {name for name, _, _ in self._MANAGED_VECTOR_INDEXES}
+        managed_names = {
+            name
+            for name, _, _, subsystem in self._MANAGED_VECTOR_INDEXES
+            if self._is_active(subsystem)
+        }
         mismatches: list[tuple[str, int, int]] = []
         for row in rows:
             name = row.get("name")
@@ -232,12 +275,9 @@ class SchemaManager:
 
     async def setup_point_indexes(self) -> None:
         """Create point indexes for geospatial queries."""
-        point_indexes = [
-            # Location entities have a 'location' Point property for coordinates
-            ("entity_location_idx", "Entity", "location"),
-        ]
-
-        for index_name, label, property_name in point_indexes:
+        for index_name, label, property_name, subsystem in self._MANAGED_POINT_INDEXES:
+            if not self._is_active(subsystem):
+                continue
             await self._create_point_index(index_name, label, property_name)
 
     async def _create_constraint(

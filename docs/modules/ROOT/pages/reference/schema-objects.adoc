@@ -92,6 +92,69 @@ Created for geospatial queries on Location entities.
 | `entity_location_idx` | `Entity` | `location` | Geospatial proximity queries (`point.distance`, bounding box).
 |===
 
+== Skipping subsystems you do not use
+
+Every object above belongs to exactly one _subsystem_. Name the ones your
+application never touches in `SchemaConfig.skip_subsystems` and the
+library leaves them off the database. The default is an empty set, which
+installs the full schema.
+
+[source,python]
+----
+from neo4j_agent_memory import MemoryClient, MemorySettings, MemorySubsystem
+from neo4j_agent_memory.config.settings import SchemaConfig
+
+settings = MemorySettings(
+    schema_config=SchemaConfig(
+        skip_subsystems={
+            MemorySubsystem.FACTS,
+            MemorySubsystem.CONSOLIDATION,
+            MemorySubsystem.READ_AUDIT,
+            MemorySubsystem.GEOSPATIAL,
+        },
+    ),
+)
+
+async with MemoryClient(settings) as client:
+    ...
+----
+
+[cols="1,2,2"]
+|===
+| Subsystem | Node types | Schema objects
+
+| `SHORT_TERM`    | `Conversation`, `Message` | 2 constraints, 3 indexes, 1 vector index
+| `ENTITIES`      | `Entity`                  | 1 constraint, 3 indexes, 1 vector index
+| `PREFERENCES`   | `Preference`              | 1 constraint, 1 index, 1 vector index
+| `FACTS`         | `Fact`                    | 1 constraint, 1 vector index
+| `REASONING`     | `ReasoningTrace`, `ReasoningStep`, `Tool`, `ToolCall` | 4 constraints, 4 indexes, 2 vector indexes
+| `USERS`         | `User`                    | 1 constraint
+| `CONSOLIDATION` | `ConsolidationRun`, `Conversation.archived` | 1 constraint, 2 indexes
+| `READ_AUDIT`    | `MemoryReadAudit`         | 1 constraint, 1 index
+| `GEOSPATIAL`    | `Entity.location`         | 1 point index
+|===
+
+Skipping a subsystem removes schema objects only. Its APIs keep working:
+writes still succeed, they just lose the uniqueness guarantee the dropped
+constraint gave them, and filters that would have used a dropped index
+fall back to a scan. Two consequences are worth stating plainly:
+
+* **Duplicate ids become possible.** The constraints are the only thing
+  stopping two nodes sharing an `id`. Nothing in the library generates a
+  colliding id, but a concurrent writer or a manual `CREATE` could.
+* **Vector search over a skipped subsystem raises.** With
+  `fact_embedding_idx` absent, `long_term.search_facts(...)` fails the
+  same way it does on a Neo4j older than 5.11.
+  `long_term.add_fact(...)` is unaffected — its deduplication probe
+  already tolerates a missing index and falls through to creation.
+
+The environment-variable form takes a JSON list:
+
+[source,bash]
+----
+NAM_SCHEMA_CONFIG__SKIP_SUBSYSTEMS='["facts","consolidation","read_audit","geospatial"]'
+----
+
 == Removing the schema
 
 `SchemaManager.drop_all()` removes every constraint and index whose name

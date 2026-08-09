@@ -421,8 +421,14 @@ schema_config = SchemaConfig(
     enable_subtypes=True,                  # Track entity subtypes
     strict_types=False,                    # Reject unknown types
     custom_schema_path=None,               # Path to schema file
+    skip_subsystems=frozenset(),           # Subsystems to leave uninstalled
 )
 ----
+
+`skip_subsystems` names the memory subsystems whose constraints and
+indexes are not created on connect. The default installs the full schema.
+See xref:reference/schema-objects.adoc[Schema Objects] for the subsystem
+inventory and what a skip costs.
 
 === Environment Variables
 
@@ -433,6 +439,7 @@ NAM_SCHEMA_CONFIG__ENTITY_TYPES='["PERSON","PRODUCT"]'  # For custom model
 NAM_SCHEMA_CONFIG__ENABLE_SUBTYPES=true
 NAM_SCHEMA_CONFIG__STRICT_TYPES=false
 NAM_SCHEMA_CONFIG__CUSTOM_SCHEMA_PATH=/path/to/schema.json
+NAM_SCHEMA_CONFIG__SKIP_SUBSYSTEMS='["facts","geospatial"]'
 ----
 
 === Schema Models
