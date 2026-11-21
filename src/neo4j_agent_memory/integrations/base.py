@@ -47,6 +47,27 @@ def _cancel_tasks(loop: asyncio.AbstractEventLoop) -> None:
         loop.run_until_complete(asyncio.wait(tasks, timeout=_SHUTDOWN_TIMEOUT_SECONDS))
 
 
+def _shutdown_executor(executor: concurrent.futures.ThreadPoolExecutor) -> None:
+    """Shut down ``executor``, waiting up to ``_SHUTDOWN_TIMEOUT_SECONDS`` for its jobs.
+
+    ``loop.shutdown_default_executor()`` waits for every job. On Python
+    3.11 it takes no timeout and joins its thread even when cancelled, so
+    one hung ``asyncio.to_thread`` job would hang the loop's shutdown. A
+    job still running after the wait is left to finish on its own thread,
+    jobs not yet started are cancelled, and a WARNING says so.
+    """
+    waiter = threading.Thread(target=executor.shutdown, name="asyncbridge-executor", daemon=True)
+    waiter.start()
+    waiter.join(_SHUTDOWN_TIMEOUT_SECONDS)
+    if waiter.is_alive():
+        logger.warning(
+            "An AsyncBridge executor job is still running after %ss. The loop "
+            "closes without waiting for it.",
+            _SHUTDOWN_TIMEOUT_SECONDS,
+        )
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 class AsyncBridge:
     """Persistent background-event-loop bridge for sync code driving async clients.
 
@@ -70,8 +91,9 @@ class AsyncBridge:
 
     When the loop stops, its thread shuts it down the way ``asyncio.run``
     does. It cancels the tasks still pending, gives them
-    ``_SHUTDOWN_TIMEOUT_SECONDS`` to unwind, shuts down async generators and
-    the default executor, and closes the loop. A task can start after the
+    ``_SHUTDOWN_TIMEOUT_SECONDS`` to unwind, and shuts down async
+    generators. It waits up to the same bound for the loop's default
+    executor, which runs ``asyncio.to_thread`` jobs, and closes the loop. A task can start after the
     first cancel, so the tasks still pending are cancelled once more just
     before the loop closes. A caller still waiting on cancelled work gets
     ``RuntimeError`` rather than ``CancelledError``.
@@ -175,16 +197,24 @@ class AsyncBridge:
                 raise RuntimeError(_THREAD_DIED)
             if self._loop is None:
                 self._loop = asyncio.new_event_loop()
+                # The loop thread shuts this executor down itself, with a
+                # bound, so a hung job cannot hang the loop's shutdown.
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    thread_name_prefix="asyncbridge-worker"
+                )
+                self._loop.set_default_executor(executor)
                 self._thread = threading.Thread(
                     target=self._run_loop,
-                    args=(self._loop,),
+                    args=(self._loop, executor),
                     name="neo4j-strands-session-manager",
                     daemon=True,
                 )
                 self._thread.start()
             return self._loop
 
-    def _run_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+    def _run_loop(
+        self, loop: asyncio.AbstractEventLoop, executor: concurrent.futures.ThreadPoolExecutor
+    ) -> None:
         """Loop thread body: run until stopped, then shut down like ``asyncio.run``."""
         asyncio.set_event_loop(loop)
         try:
@@ -198,7 +228,7 @@ class AsyncBridge:
             try:
                 _cancel_tasks(loop)
                 loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.run_until_complete(loop.shutdown_default_executor())
+                _shutdown_executor(executor)
             finally:
                 # Cancel before loop.close(). A cancelled future cancels its
                 # task through this loop, which must still be open.
@@ -337,8 +367,9 @@ class AsyncBridge:
                 return
             with contextlib.suppress(RuntimeError):  # its thread closed it already
                 loop.call_soon_threadsafe(loop.stop)
-            # Shutdown cancels tasks twice, and each time waits up to the bound.
-            thread.join(timeout=2 * _SHUTDOWN_TIMEOUT_SECONDS + 5)
+            # Shutdown cancels tasks twice and waits for the executor, each
+            # time up to the bound.
+            thread.join(timeout=3 * _SHUTDOWN_TIMEOUT_SECONDS + 5)
 
 
 def _get_executor() -> concurrent.futures.ThreadPoolExecutor:

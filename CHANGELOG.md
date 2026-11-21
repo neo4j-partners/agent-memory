@@ -209,7 +209,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanup code runs. The loop thread closes its own loop. A caller still
   waiting on cancelled work gets `RuntimeError`, not a bare
   `CancelledError`, and a `run()` in flight no longer waits for its
-  timeout.
+  timeout. The loop's default executor, which runs `asyncio.to_thread`
+  jobs, gets the same 5 seconds. A job still running then is left to
+  finish on its own thread, and a WARNING says so.
 - A `Neo4jSessionManager` message whose write fails now stays at the head
   of the queue, and the next flush retries it before any later message.
   Before, the failed message was lost. A retry stores the message once.

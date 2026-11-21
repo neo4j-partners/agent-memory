@@ -6,6 +6,7 @@ import asyncio
 import gc
 import inspect
 import logging
+import threading
 from typing import Any
 
 import pytest
@@ -93,6 +94,43 @@ class TestAsyncBridge:
 
         assert calls == ["quick", "stuck"]
         assert "Task 'stuck' ignored cancellation" in caplog.text
+
+    def test_close_does_not_wait_for_a_hung_executor_job(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from neo4j_agent_memory.integrations import base
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        monkeypatch.setattr(base, "_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+        caplog.set_level(logging.WARNING, logger="neo4j_agent_memory.integrations.base")
+        bridge = _AsyncBridge()
+        release = threading.Event()
+        calls: list[str] = []
+
+        async def stubborn() -> None:
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    continue  # ignores every cancel
+
+        async def scenario() -> None:
+            asyncio.get_running_loop().run_in_executor(None, release.wait)
+            stuck = asyncio.create_task(stubborn(), name="stuck")
+            bridge.when_done(stuck, lambda: calls.append("stuck"))
+
+        bridge.run(scenario())
+        thread = bridge._thread
+        assert thread is not None
+        try:
+            bridge.close()
+            thread.join(timeout=2)
+
+            assert not thread.is_alive()
+            assert calls == ["stuck"]
+            assert "executor job is still running" in caplog.text
+        finally:
+            release.set()
 
     def test_run_returns_coroutine_result(self) -> None:
         from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
