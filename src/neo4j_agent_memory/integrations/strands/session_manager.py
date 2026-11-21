@@ -428,15 +428,23 @@ class Neo4jSessionManager(SessionManager):
         Strands fires this from its ``finally``, so it also runs when a
         caller abandons a stream and the generator is finalized after
         ``aclose()``. With nothing buffered there is nothing to lose, so a
-        closed manager returns quietly. It raises only when messages would
-        be dropped.
+        closed manager returns quietly. When messages would be lost,
+        ``"raise"`` raises SessionException. ``"warn"`` logs one ERROR with
+        their number, as for any other write that fails at close.
         """
         if self._closed:
             with self._queue_lock:
-                buffered = self._pending is not None or bool(self._ready)
-            if not buffered:
+                unwritten = int(self._pending is not None) + len(self._ready)
+            if not unwritten:
                 return
-            self._check_open()
+            if self._on_persist_error == "raise":
+                self._check_open()
+            logger.error(
+                "Session %r was closed before its turn ended. %d message(s) were not written.",
+                self.session_id,
+                unwritten,
+            )
+            return
         try:
             await self._aflush_buffer()
         finally:

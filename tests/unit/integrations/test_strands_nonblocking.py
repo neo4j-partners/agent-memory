@@ -793,6 +793,23 @@ class TestHooksAfterClose:
         with pytest.raises(SessionException, match="closed"):
             await getattr(manager, hook)(event)
 
+    async def test_after_invocation_in_warn_mode_logs_what_close_left_unwritten(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, on_persist_error="warn")
+        agent = _buffered(manager, "x")
+        client.short_term.fail_next_add = True
+        with caplog.at_level(logging.ERROR, logger=_LOGGER):
+            manager.close()  # the close-time write fails, so "x" stays queued
+            caplog.clear()
+            await manager._on_after_invocation(SimpleNamespace(agent=agent))  # no raise
+
+        (error,) = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert "sess-1" in error.getMessage()
+        assert "1 message" in error.getMessage()
+        assert _stored(client) == []
+
     async def test_after_invocation_with_nothing_buffered_is_a_noop_after_close(
         self,
     ) -> None:

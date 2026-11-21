@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- With `on_persist_error="warn"`, a `Neo4jSessionManager` turn that
+  ends after a close left messages unwritten no longer raises from the
+  Strands hook. It logs one ERROR with the number of messages lost.
+  `"raise"` still raises `SessionException`.
 - `AsyncBridge.run()` and `AsyncBridge.close()` now raise
   `RuntimeError` when called on the bridge's own loop thread.
   `run()` used to block there until its timeout, and `close()` stopped
