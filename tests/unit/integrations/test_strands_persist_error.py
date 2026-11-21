@@ -26,7 +26,11 @@ from strands.types.exceptions import SessionException  # noqa: E402
 from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E402
     Neo4jSessionManager,
 )
-from tests.unit.integrations.strands_fakes import FakeMemoryClient, turn_ended  # noqa: E402
+from tests.unit.integrations.strands_fakes import (  # noqa: E402
+    AgentNamespace,
+    FakeMemoryClient,
+    turn_ended,
+)
 from tests.unit.integrations.test_strands_nonblocking import (  # noqa: E402
     _agent,
     _buffered,
@@ -391,7 +395,7 @@ class TestWarnMode:
         manager = Neo4jSessionManager("sess-1", memory_client=client, on_persist_error="warn")
         try:
             with pytest.raises(SessionException, match="initialize"):
-                manager.initialize(SimpleNamespace(messages=[], agent_id="a1"))
+                manager.initialize(AgentNamespace(messages=[], agent_id="a1"))
         finally:
             manager.close()
 

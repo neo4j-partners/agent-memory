@@ -33,7 +33,11 @@ from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E
     Neo4jRetrievalConfig,
     Neo4jSessionManager,
 )
-from tests.unit.integrations.strands_fakes import FakeMemoryClient, turn_ended  # noqa: E402
+from tests.unit.integrations.strands_fakes import (  # noqa: E402
+    AgentNamespace,
+    FakeMemoryClient,
+    turn_ended,
+)
 
 _TICK = 0.01
 _LOGGER = "neo4j_agent_memory.integrations.strands.session_manager"
@@ -348,7 +352,7 @@ class TestHooksDoNotBlockTheLoop:
     async def test_aclose_does_not_block_the_loop(self) -> None:
         client = _slow_client(0.3)
         manager = Neo4jSessionManager("sess-1", memory_client=client)
-        agent = SimpleNamespace(messages=[], agent_id="a1")
+        agent = AgentNamespace(messages=[], agent_id="a1")
         manager.initialize(agent)
         manager.append_message({"role": "user", "content": [{"text": "last"}]}, agent)
 
@@ -390,7 +394,7 @@ class TestPersistenceThroughTheAgent:
     def test_append_message_does_no_io(self) -> None:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client)
-        agent = SimpleNamespace(messages=[], agent_id="a1")
+        agent = AgentNamespace(messages=[], agent_id="a1")
         manager.initialize(agent)
 
         def no_io(*args: Any, **kwargs: Any) -> Any:
@@ -458,7 +462,7 @@ def _slowing_client(*delays: float) -> FakeMemoryClient:
 
 def _buffered(manager: Neo4jSessionManager, *texts: str) -> SimpleNamespace:
     """Initialize ``manager`` on a bare agent and buffer user ``texts``."""
-    agent = SimpleNamespace(messages=[], agent_id="a1")
+    agent = AgentNamespace(messages=[], agent_id="a1")
     manager.initialize(agent)
     for text in texts:
         manager.append_message({"role": "user", "content": [{"text": text}]}, agent)
@@ -1296,7 +1300,7 @@ class TestRedactionThroughTheAgent:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client)
         await manager.aopen()
-        agent = SimpleNamespace(
+        agent = AgentNamespace(
             messages=[
                 {"role": "user", "content": [{"text": "seed q"}]},
                 {"role": "user", "content": [{"text": "my SSN is 123-45-6789"}]},
@@ -1354,7 +1358,7 @@ class TestHooksAfterClose:
     async def test_hook_after_close_raises_session_exception(self, hook: str) -> None:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client)
-        agent = SimpleNamespace(messages=[], agent_id="a1")
+        agent = AgentNamespace(messages=[], agent_id="a1")
         manager.initialize(agent)
         manager.append_message({"role": "user", "content": [{"text": "x"}]}, agent)
         client.short_term.fail_next_add = True
@@ -1386,7 +1390,7 @@ class TestHooksAfterClose:
     ) -> None:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client)
-        agent = SimpleNamespace(messages=[], agent_id="a1")
+        agent = AgentNamespace(messages=[], agent_id="a1")
         manager.initialize(agent)
         manager.append_message({"role": "user", "content": [{"text": "x"}]}, agent)
         await manager.aclose()  # writes "x"; nothing is left buffered
@@ -1448,7 +1452,7 @@ class TestHooksAfterClose:
     async def test_aclose_is_idempotent_and_close_after_aclose_is_a_noop(self) -> None:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client)
-        manager.initialize(SimpleNamespace(messages=[], agent_id="a1"))
+        manager.initialize(AgentNamespace(messages=[], agent_id="a1"))
         await manager.aclose()
         await manager.aclose()
         manager.close()

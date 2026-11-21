@@ -50,9 +50,8 @@ def strands_memory_settings(neo4j_connection_info):
 @pytest.mark.integration
 class TestSessionManagerRoundTrip:
     def test_persist_and_restore_across_manager_instances(self, strands_memory_settings) -> None:
-        from types import SimpleNamespace
-
         from neo4j_agent_memory.integrations.strands import Neo4jSessionManager
+        from tests.unit.integrations.strands_fakes import AgentNamespace
 
         session_id = f"strands-it-{uuid.uuid4().hex[:8]}"
 
@@ -60,7 +59,7 @@ class TestSessionManagerRoundTrip:
         with Neo4jSessionManager(
             session_id, settings=strands_memory_settings, extract_entities=False
         ) as m1:
-            agent = SimpleNamespace(messages=[], agent_id="a1")
+            agent = AgentNamespace(messages=[], agent_id="a1")
             m1.initialize(agent)
             m1.append_message({"role": "user", "content": [{"text": "I love Cypher"}]}, agent)
             m1.append_message({"role": "assistant", "content": [{"text": "Noted!"}]}, agent)
@@ -70,7 +69,7 @@ class TestSessionManagerRoundTrip:
         with Neo4jSessionManager(
             session_id, settings=strands_memory_settings, extract_entities=False
         ) as m2:
-            agent2 = SimpleNamespace(messages=[], agent_id="a1")
+            agent2 = AgentNamespace(messages=[], agent_id="a1")
             m2.initialize(agent2)
             assert agent2.messages == [
                 {"role": "user", "content": [{"text": "I love Cypher"}]},
@@ -78,9 +77,8 @@ class TestSessionManagerRoundTrip:
             ]
 
     def test_restore_limit_restores_the_newest_turns(self, strands_memory_settings) -> None:
-        from types import SimpleNamespace
-
         from neo4j_agent_memory.integrations.strands import Neo4jSessionManager
+        from tests.unit.integrations.strands_fakes import AgentNamespace
 
         session_id = f"strands-it-{uuid.uuid4().hex[:8]}"
         texts = ["one", "two", "three", "four", "five", "six"]
@@ -88,7 +86,7 @@ class TestSessionManagerRoundTrip:
         with Neo4jSessionManager(
             session_id, settings=strands_memory_settings, extract_entities=False
         ) as m1:
-            agent = SimpleNamespace(messages=[], agent_id="a1")
+            agent = AgentNamespace(messages=[], agent_id="a1")
             m1.initialize(agent)
             for i, text in enumerate(texts):
                 role = "user" if i % 2 == 0 else "assistant"
@@ -100,7 +98,7 @@ class TestSessionManagerRoundTrip:
             extract_entities=False,
             restore_limit=2,
         ) as m2:
-            agent2 = SimpleNamespace(messages=[], agent_id="a1")
+            agent2 = AgentNamespace(messages=[], agent_id="a1")
             m2.initialize(agent2)
             assert agent2.messages == [
                 {"role": "user", "content": [{"text": "five"}]},
@@ -108,15 +106,14 @@ class TestSessionManagerRoundTrip:
             ]
 
     def test_redaction_before_flush_never_stores_original(self, strands_memory_settings) -> None:
-        from types import SimpleNamespace
-
         from neo4j_agent_memory.integrations.strands import Neo4jSessionManager
+        from tests.unit.integrations.strands_fakes import AgentNamespace
 
         session_id = f"strands-it-{uuid.uuid4().hex[:8]}"
         with Neo4jSessionManager(
             session_id, settings=strands_memory_settings, extract_entities=False
         ) as m:
-            agent = SimpleNamespace(messages=[], agent_id="a1")
+            agent = AgentNamespace(messages=[], agent_id="a1")
             m.initialize(agent)
             m.append_message({"role": "user", "content": [{"text": "SSN 123-45-6789"}]}, agent)
             m.redact_latest_message({"role": "user", "content": [{"text": "[REDACTED]"}]}, agent)
@@ -125,7 +122,7 @@ class TestSessionManagerRoundTrip:
         with Neo4jSessionManager(
             session_id, settings=strands_memory_settings, extract_entities=False
         ) as m2:
-            agent2 = SimpleNamespace(messages=[], agent_id="a1")
+            agent2 = AgentNamespace(messages=[], agent_id="a1")
             m2.initialize(agent2)
             assert agent2.messages == [
                 {"role": "user", "content": [{"text": "[REDACTED]"}]},
@@ -133,15 +130,14 @@ class TestSessionManagerRoundTrip:
             ]
 
     def test_late_redaction_replaces_persisted_message(self, strands_memory_settings) -> None:
-        from types import SimpleNamespace
-
         from neo4j_agent_memory.integrations.strands import Neo4jSessionManager
+        from tests.unit.integrations.strands_fakes import AgentNamespace
 
         session_id = f"strands-it-{uuid.uuid4().hex[:8]}"
         with Neo4jSessionManager(
             session_id, settings=strands_memory_settings, extract_entities=False
         ) as m:
-            agent = SimpleNamespace(messages=[], agent_id="a1")
+            agent = AgentNamespace(messages=[], agent_id="a1")
             m.initialize(agent)
             m.append_message({"role": "user", "content": [{"text": "hello"}]}, agent)
             m.append_message({"role": "assistant", "content": [{"text": "SSN 123"}]}, agent)
@@ -155,7 +151,7 @@ class TestSessionManagerRoundTrip:
         with Neo4jSessionManager(
             session_id, settings=strands_memory_settings, extract_entities=False
         ) as m2:
-            agent2 = SimpleNamespace(messages=[], agent_id="a1")
+            agent2 = AgentNamespace(messages=[], agent_id="a1")
             m2.initialize(agent2)
             assert agent2.messages == [
                 {"role": "user", "content": [{"text": "hello"}]},

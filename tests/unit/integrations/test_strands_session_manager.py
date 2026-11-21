@@ -518,7 +518,9 @@ def _make_manager(nams_mode: bool = False, **kwargs):
 
 
 def _fake_agent():
-    return SimpleNamespace(messages=[], agent_id="agent-1")
+    from tests.unit.integrations.strands_fakes import AgentNamespace
+
+    return AgentNamespace(messages=[], agent_id="agent-1")
 
 
 class TestConstructor:
@@ -618,6 +620,43 @@ class TestInitialize:
             manager.initialize(first)  # the same agent again is allowed
             with pytest.raises(SessionException, match="another Agent"):
                 Agent(model=ScriptedModel(), session_manager=manager, callback_handler=None)
+        finally:
+            manager.close()
+
+    async def test_the_manager_does_not_keep_its_agent_alive(self) -> None:
+        import gc
+        import weakref
+
+        from strands import Agent
+
+        from tests.unit.integrations.test_strands_nonblocking import ScriptedModel
+
+        manager, _ = _make_manager(nams_mode=False)
+        agent = Agent(
+            model=ScriptedModel([{"text": "A"}]), session_manager=manager, callback_handler=None
+        )
+        await agent.invoke_async("Q")
+        await manager.aclose()
+        agent_ref = weakref.ref(agent)
+        gc.disable()
+        try:
+            del agent, manager
+            assert agent_ref() is None  # freed by reference counting alone
+        finally:
+            gc.enable()
+
+    def test_an_agent_can_attach_once_the_previous_one_is_gone(self) -> None:
+        import gc
+
+        from strands import Agent
+
+        from tests.unit.integrations.test_strands_nonblocking import ScriptedModel
+
+        manager, _ = _make_manager(nams_mode=False)
+        try:
+            Agent(model=ScriptedModel(), session_manager=manager, callback_handler=None)
+            gc.collect()  # the first agent is gone
+            Agent(model=ScriptedModel(), session_manager=manager, callback_handler=None)
         finally:
             manager.close()
 

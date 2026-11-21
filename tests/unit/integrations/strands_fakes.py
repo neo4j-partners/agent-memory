@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 from neo4j_agent_memory.memory.short_term import Conversation, Message, MessageRole
@@ -540,6 +541,14 @@ class FakeAgent:
         self.memory_manager = memory_manager
         self.messages: list[Any] = []
         self.state: dict[str, Any] = {}
+
+
+class AgentNamespace(SimpleNamespace):
+    """An Agent stand-in with whatever attributes a test passes.
+
+    The session manager keeps a weak reference to its agent. A plain
+    ``SimpleNamespace`` cannot be weakly referenced, but a subclass can.
+    """
 
 
 ONE_CALL: dict[str, Any] = {}  # the invocation_state of every turn_ended event by default

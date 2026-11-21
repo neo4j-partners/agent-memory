@@ -238,7 +238,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Attaching a second Strands `Agent` to one `Neo4jSessionManager` now
   raises `SessionException`. One manager tracks one agent's turns, so
   a call on the second agent could discard the first agent's turn.
-  Attaching the same agent again is allowed.
+  Attaching the same agent again is allowed. The manager does not keep
+  its agent alive, so once that agent is freed, another can attach.
 - The `[strands]` extra now needs `strands-agents>=1.55`. It needed
   `>=1.52` before. Strands 1.55 is the first release whose
   `stream_async` closes its events when a caller abandons a stream. The
