@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -57,6 +58,11 @@ _DEFAULT_MAX_TOKENS = 4096
 _TOOL_CHOICES = ("tool", "auto")
 
 
+# An optional geography prefix (``us.``, ``us-gov.``, ``global.``), then
+# ``anthropic.``.
+_ANTHROPIC_MODEL_RE = re.compile(r"^(?:[a-z]+(?:-[a-z]+)*\.)?anthropic\.")
+
+
 def _strip_provider_prefix(model: str) -> str:
     if model.startswith("bedrock/"):
         return model[len("bedrock/") :]
@@ -66,10 +72,14 @@ def _strip_provider_prefix(model: str) -> str:
 def _is_anthropic_on_bedrock(bare_model: str) -> bool:
     """Whether ``bare_model`` is an Anthropic model on Bedrock.
 
-    Anthropic-on-Bedrock model ids start with ``anthropic.`` or
-    ``us.anthropic.`` (inference-profile prefixed).
+    Anthropic model ids start with ``anthropic.``. Cross-region inference
+    profiles add a geography prefix, such as ``us.``, ``eu.``, ``apac.``
+    or ``global.``. For an ARN, the id after the last ``/`` is checked.
+
+    An application inference profile ARN does not name its model, so it
+    is not detected. Such a model uses the generic SAP loop.
     """
-    return bare_model.startswith("anthropic.") or bare_model.startswith("us.anthropic.")
+    return _ANTHROPIC_MODEL_RE.match(bare_model.rsplit("/", 1)[-1]) is not None
 
 
 def _translate_bedrock_exception(exc: Exception) -> Exception:

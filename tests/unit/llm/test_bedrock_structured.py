@@ -115,3 +115,49 @@ async def test_auto_reply_shapes(
     assert len(client.calls) == expected_calls
     if retry_text is not None:
         assert _assistant_texts(client.calls[1]) == [retry_text]
+
+
+# ---------------------------------------------------------------------------
+# Anthropic detection across inference-profile prefixes and ARNs
+# ---------------------------------------------------------------------------
+
+_ARN = "arn:aws:bedrock:us-west-2:123456789012"
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("anthropic.claude-3-5-sonnet-20241022-v2:0", True),
+        ("us.anthropic.claude-sonnet-5-5-v1:0", True),
+        ("global.anthropic.claude-sonnet-5-5-v1:0", True),
+        ("eu.anthropic.claude-sonnet-5-5-v1:0", True),
+        ("apac.anthropic.claude-sonnet-5-5-v1:0", True),
+        ("jp.anthropic.claude-sonnet-5-5-v1:0", True),
+        ("au.anthropic.claude-sonnet-5-5-v1:0", True),
+        ("us-gov.anthropic.claude-sonnet-5-5-v1:0", True),
+        (f"{_ARN}:inference-profile/global.anthropic.claude-sonnet-5-5-v1:0", True),
+        (f"{_ARN}::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0", True),
+        ("amazon.titan-text-premier-v1:0", False),
+        ("us.meta.llama3-3-70b-instruct-v1:0", False),
+        ("global.amazon.nova-pro-v1:0", False),
+        ("us.notanthropic.model-v1:0", False),
+        (f"{_ARN}:inference-profile/us.amazon.nova-pro-v1:0", False),
+        (f"{_ARN}:application-inference-profile/abc123", False),
+    ],
+)
+def test_is_anthropic_on_bedrock(model: str, expected: bool) -> None:
+    from neo4j_agent_memory.llm.adapters.bedrock import _is_anthropic_on_bedrock
+
+    assert _is_anthropic_on_bedrock(model) is expected
+
+
+async def test_global_profile_honors_tool_choice() -> None:
+    provider, client = bedrock_provider(
+        "bedrock/global.anthropic.claude-sonnet-5-5-v1:0",
+        converse_text('{"value": "ok"}'),
+        tool_choice="auto",
+    )
+
+    await provider.complete_structured(_MESSAGES, _Extraction)
+
+    assert client.calls[0]["toolConfig"]["toolChoice"] == {"auto": {}}
