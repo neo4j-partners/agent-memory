@@ -1014,6 +1014,32 @@ class TestRedactionDuringAWrite:
         assert _contents(client)[0].startswith("[REDACTED")
         await manager.aclose()
 
+    async def test_a_hung_late_redaction_times_out_and_frees_the_drain(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=client, request_timeout=0.2, extract_entities=False
+        )
+        agent = _buffered(manager, "secret 123")
+        await manager._aflush_buffer()
+
+        async def delete_hangs(*args: Any, **kwargs: Any) -> bool:
+            await asyncio.sleep(3)
+            return True
+
+        client.short_term.delete_message = delete_hangs  # type: ignore[method-assign]
+        redacted = {"role": "user", "content": [{"text": "[REDACTED]"}]}
+        with pytest.raises(SessionException, match="redact"):
+            await asyncio.wait_for(
+                asyncio.to_thread(manager.redact_latest_message, redacted, agent), 1
+            )
+
+        manager.append_message({"role": "user", "content": [{"text": "next"}]}, agent)
+        manager._release_pending()
+        drain = asyncio.wrap_future(manager._submit_drain())
+        await asyncio.wait_for(drain, 1)  # it pops "next" under the released lock
+        assert _contents(client) == ["secret 123", "next"]
+        await manager.aclose()
+
     async def test_a_failed_redaction_is_logged_as_an_error(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:

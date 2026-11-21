@@ -593,6 +593,9 @@ class Neo4jSessionManager(SessionManager):
         read under the redaction lock, so a redaction that waited rewrites
         the message the one before it stored, not a deleted one. See
         ``_aredact_stored`` for what each backend does.
+
+        The rewrite is bounded by ``request_timeout``, so a hung backend
+        cannot hold the lock that every later drain needs.
         """
         async with self._redaction_lock():
             with self._queue_lock:
@@ -600,7 +603,9 @@ class Neo4jSessionManager(SessionManager):
             if stored is None:
                 return False
             try:
-                result = await self._aredact_stored(stored, redacted)
+                result = await asyncio.wait_for(
+                    self._aredact_stored(stored, redacted), self._request_timeout
+                )
             except BaseException:
                 with self._queue_lock:
                     self._last_persisted = None  # its id may be deleted already
