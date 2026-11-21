@@ -207,11 +207,16 @@ RETURN m.id AS id, m.content AS content
 ORDER BY m.timestamp ASC
 """
 
+# Newest $limit messages at or after $since, returned oldest first.
+# A null $since means no lower bound.
 GET_CONVERSATION_MESSAGES = """
 MATCH (c:Conversation {id: $conversation_id})-[:HAS_MESSAGE]->(m:Message)
+WHERE $since IS NULL OR m.timestamp >= $since
+WITH m
+ORDER BY m.timestamp DESC, m.id DESC
+LIMIT $limit
 RETURN m
 ORDER BY m.timestamp ASC, m.id ASC
-LIMIT $limit
 """
 
 SEARCH_MESSAGES_BY_EMBEDDING = """

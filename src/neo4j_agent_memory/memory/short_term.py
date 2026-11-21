@@ -1112,12 +1112,22 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
         Args:
             session_id: Session identifier
             conversation_id: Optional specific conversation ID
-            limit: Maximum number of messages
-            since: Only get messages after this time
+            limit: Maximum number of messages. The newest messages are kept.
+            since: Only get messages at or after this time. Must be
+                timezone-aware.
 
         Returns:
-            Conversation with messages
+            Conversation with messages, oldest first
+
+        Raises:
+            ValueError: If ``since`` is a naive datetime.
         """
+        if since is not None:
+            if since.tzinfo is None:
+                raise ValueError("since must be a timezone-aware datetime")
+            # Send a fixed offset. Neo4j orders a named zone such as pytz's
+            # "UTC" after an equal instant stored with offset "Z".
+            since = since.astimezone(UTC)
         # Get conversation
         if conversation_id:
             conv_id = str(conversation_id) if isinstance(conversation_id, UUID) else conversation_id
@@ -1136,7 +1146,7 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
         # Get messages
         msg_results = await self._client.execute_read(
             queries.GET_CONVERSATION_MESSAGES,
-            {"conversation_id": conv_data["id"], "limit": limit or 1000},
+            {"conversation_id": conv_data["id"], "limit": limit or 1000, "since": since},
         )
 
         messages = []
@@ -1151,8 +1161,7 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
                 created_at=_to_python_datetime(msg_data.get("timestamp")),
                 metadata=_deserialize_metadata(msg_data.get("metadata")),
             )
-            if since is None or msg.created_at >= since:
-                messages.append(msg)
+            messages.append(msg)
 
         return Conversation(
             id=UUID(conv_data["id"]),

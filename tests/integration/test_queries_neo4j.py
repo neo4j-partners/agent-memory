@@ -92,7 +92,7 @@ class TestMessageQueries:
         # Get conversation messages
         results = await neo4j_client.execute_read(
             queries.GET_CONVERSATION_MESSAGES,
-            {"conversation_id": conv_id, "limit": 10},
+            {"conversation_id": conv_id, "limit": 10, "since": None},
         )
         assert len(results) == 1
         assert results[0]["m"]["id"] == msg_id
@@ -140,7 +140,7 @@ class TestMessageQueries:
         # Verify deletion
         results = await neo4j_client.execute_read(
             queries.GET_CONVERSATION_MESSAGES,
-            {"conversation_id": conv_id, "limit": 10},
+            {"conversation_id": conv_id, "limit": 10, "since": None},
         )
         assert len(results) == 0
 

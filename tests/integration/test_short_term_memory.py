@@ -96,6 +96,60 @@ class TestShortTermMemoryBasicOperations:
         assert len(conv.messages) == 5
 
     @pytest.mark.asyncio
+    async def test_get_conversation_limit_keeps_newest_in_order(self, memory_client, session_id):
+        """A limit keeps the newest messages, returned oldest first."""
+        for i in range(10):
+            await memory_client.short_term.add_message(
+                session_id,
+                MessageRole.USER if i % 2 == 0 else MessageRole.ASSISTANT,
+                f"Message {i}",
+                extract_entities=False,
+                generate_embedding=False,
+            )
+
+        conv = await memory_client.short_term.get_conversation(session_id, limit=5)
+
+        assert [m.content for m in conv.messages] == [f"Message {i}" for i in range(5, 10)]
+
+    @pytest.mark.asyncio
+    async def test_get_conversation_since_filters_before_limit(self, memory_client, session_id):
+        """since narrows the candidates first, then the limit keeps the newest."""
+        for i in range(6):
+            await memory_client.short_term.add_message(
+                session_id,
+                MessageRole.USER,
+                f"Message {i}",
+                extract_entities=False,
+                generate_embedding=False,
+            )
+        # Use the server-side timestamp. add_message returns a client-side one.
+        stored = await memory_client.short_term.get_conversation(session_id)
+        cutoff = stored.messages[2].created_at
+
+        conv = await memory_client.short_term.get_conversation(session_id, since=cutoff, limit=3)
+
+        assert [m.content for m in conv.messages] == ["Message 3", "Message 4", "Message 5"]
+
+        everything_since = await memory_client.short_term.get_conversation(session_id, since=cutoff)
+        assert [m.content for m in everything_since.messages] == [
+            f"Message {i}" for i in range(2, 6)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_get_conversation_rejects_naive_since(self, memory_client, session_id):
+        """A naive since cannot be compared with stored timestamps."""
+        await memory_client.short_term.add_message(
+            session_id,
+            MessageRole.USER,
+            "hello",
+            extract_entities=False,
+            generate_embedding=False,
+        )
+
+        with pytest.raises(ValueError, match="timezone-aware"):
+            await memory_client.short_term.get_conversation(session_id, since=datetime(2020, 1, 1))
+
+    @pytest.mark.asyncio
     async def test_get_nonexistent_conversation(self, memory_client):
         """Test retrieving a conversation that doesn't exist."""
         conv = await memory_client.short_term.get_conversation("nonexistent-session-id")

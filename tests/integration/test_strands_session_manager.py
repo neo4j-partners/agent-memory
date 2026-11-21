@@ -77,6 +77,36 @@ class TestSessionManagerRoundTrip:
                 {"role": "assistant", "content": [{"text": "Noted!"}]},
             ]
 
+    def test_restore_limit_restores_the_newest_turns(self, strands_memory_settings) -> None:
+        from types import SimpleNamespace
+
+        from neo4j_agent_memory.integrations.strands import Neo4jSessionManager
+
+        session_id = f"strands-it-{uuid.uuid4().hex[:8]}"
+        texts = ["one", "two", "three", "four", "five", "six"]
+
+        with Neo4jSessionManager(
+            session_id, settings=strands_memory_settings, extract_entities=False
+        ) as m1:
+            agent = SimpleNamespace(messages=[], agent_id="a1")
+            m1.initialize(agent)
+            for i, text in enumerate(texts):
+                role = "user" if i % 2 == 0 else "assistant"
+                m1.append_message({"role": role, "content": [{"text": text}]}, agent)
+
+        with Neo4jSessionManager(
+            session_id,
+            settings=strands_memory_settings,
+            extract_entities=False,
+            restore_limit=2,
+        ) as m2:
+            agent2 = SimpleNamespace(messages=[], agent_id="a1")
+            m2.initialize(agent2)
+            assert agent2.messages == [
+                {"role": "user", "content": [{"text": "five"}]},
+                {"role": "assistant", "content": [{"text": "six"}]},
+            ]
+
     def test_redaction_before_flush_never_stores_original(self, strands_memory_settings) -> None:
         from types import SimpleNamespace
 
