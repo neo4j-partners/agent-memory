@@ -278,7 +278,8 @@ def _check_timeout(timeout: float) -> None:
     """Raise ``ValueError`` unless ``timeout`` is a positive finite number of seconds.
 
     An infinite timeout would pass a plain positive check and then fail as
-    an ``OverflowError`` once the wait was already running.
+    an ``OverflowError`` once the wait was already running. A bool is
+    refused too, although ``True`` counts as 1.
     """
-    if not (math.isfinite(timeout) and timeout > 0):
+    if isinstance(timeout, bool) or not (math.isfinite(timeout) and timeout > 0):
         raise ValueError(f"timeout must be a positive finite number, not {timeout!r}.")

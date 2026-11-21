@@ -303,7 +303,7 @@ class TestClosingWithBackgroundWork:
         assert client.close_calls == 1
         assert _bridge_threads() == threads_before
 
-    @pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan"), float("inf")])
+    @pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan"), float("inf"), True])
     @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
     async def test_a_timeout_that_is_not_positive_and_finite_is_refused(
         self, client: FakeMemoryClient, use_async: bool, timeout: float
