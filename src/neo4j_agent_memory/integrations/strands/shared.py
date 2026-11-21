@@ -14,6 +14,7 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Any
 
+from neo4j_agent_memory.integrations.base import _SHUTDOWN_TIMEOUT_SECONDS as _UNWIND_SECONDS
 from neo4j_agent_memory.integrations.base import AsyncBridge
 from neo4j_agent_memory.integrations.strands.session_manager import Neo4jSessionManager
 
@@ -39,9 +40,10 @@ class SharedMemory:
     Close every manager before closing this object. A manager's close
     leaves its background work running, such as deferred entity
     extraction. ``aclose()`` and ``close()`` wait for every task still
-    running on the loop, up to ``timeout`` seconds. Then they close the
-    client and stop the loop, which cancels the tasks still running. A
-    WARNING gives their number. A second call does nothing.
+    running on the loop, up to ``timeout`` seconds. Then they cancel the
+    tasks still running, and a WARNING gives their number. The cancelled
+    tasks get up to 5 seconds to unwind. Then the client closes and the
+    loop stops. A second call does nothing.
 
     Example::
 
@@ -149,9 +151,7 @@ class SharedMemory:
             return
         try:
             try:
-                await self._bridge.run_async(
-                    self._await_tasks(timeout), timeout + self._request_timeout
-                )
+                await self._bridge.run_async(self._await_tasks(timeout), self._close_wait(timeout))
             finally:
                 if self._client.is_connected:
                     await self._bridge.run_async(self._client.close(), self._request_timeout)
@@ -180,7 +180,7 @@ class SharedMemory:
             return
         try:
             try:
-                self._bridge.run(self._await_tasks(timeout), timeout + self._request_timeout)
+                self._bridge.run(self._await_tasks(timeout), self._close_wait(timeout))
             finally:
                 if self._client.is_connected:
                     self._bridge.run(self._client.close(), self._request_timeout)
@@ -191,8 +191,9 @@ class SharedMemory:
         """Wait up to ``timeout`` for the loop's other tasks. Runs on the loop.
 
         A task can start another while this waits, so the wait looks again
-        until no task is left or the time runs out. A WARNING gives the
-        number still running.
+        until no task is left or the time runs out. The tasks still running
+        then are cancelled, and a WARNING gives their number. They get
+        ``_UNWIND_SECONDS`` to unwind, so they end before the client closes.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -206,8 +207,19 @@ class SharedMemory:
                     len(pending),
                     timeout,
                 )
+                for task in pending:
+                    task.cancel()
+                await asyncio.wait(pending, timeout=_UNWIND_SECONDS)
                 return
             await asyncio.wait(pending, timeout=remaining)
+
+    def _close_wait(self, timeout: float) -> float:
+        """How long close waits on the loop for tasks bounded by ``timeout``.
+
+        It adds the time cancelled tasks get to unwind, and one
+        ``request_timeout`` to cover scheduling.
+        """
+        return timeout + _UNWIND_SECONDS + self._request_timeout
 
 
 def _close_failed_client(client: MemoryClient, bridge: AsyncBridge, timeout: float) -> None:

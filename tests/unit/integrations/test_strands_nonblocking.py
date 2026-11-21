@@ -989,7 +989,7 @@ class TestToolMirroringOutlivesItsWait:
             with contextlib.suppress(asyncio.CancelledError):
                 await waiter
             await asyncio.sleep(0)
-            return manager._tool_records_running
+            return len(manager._live_tool_records)
 
         assert await manager._bridge.run_async(scenario()) == 0
         await manager.aclose()

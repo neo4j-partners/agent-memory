@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID, uuid4
 
+from neo4j_agent_memory.integrations.base import _SHUTDOWN_TIMEOUT_SECONDS as _UNWIND_SECONDS
 from neo4j_agent_memory.integrations.base import AsyncBridge as _AsyncBridge
 from neo4j_agent_memory.integrations.strands._messages import (
     _message_text,
@@ -216,8 +217,9 @@ class Neo4jSessionManager(SessionManager):
     ``request_timeout``, and a failure is logged as a WARNING. A late
     redaction that deletes a message before its extraction starts skips
     that extraction. A manager that owns its bridge waits for the
-    extractions at close, as long as it waits for a drain. Closing the
-    bridge then cancels the rest, and a WARNING gives their number. A
+    extractions at close, as long as it waits for a drain. It then
+    cancels the rest before it closes the client, and a WARNING gives
+    their number. A
     manager on a shared bridge does not wait. ``SharedMemory`` waits for
     them when it closes. NAMS extracts on the server, so the option does
     nothing there.
@@ -323,9 +325,9 @@ class Neo4jSessionManager(SessionManager):
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
         self._tool_record: asyncio.Task[None] | None = None  # latest mirroring; bridge loop only
-        self._tool_records_running = 0  # mirroring tasks not yet finished; bridge loop only
+        self._live_tool_records: set[asyncio.Task[None]] = set()  # unfinished; bridge loop only
         self._extraction: asyncio.Task[None] | None = None  # own latest deferred; bridge loop only
-        self._extractions_running = 0  # deferred extractions not yet finished; bridge loop only
+        self._live_extractions: set[asyncio.Task[None]] = set()  # unfinished; bridge loop only
         self._redacted_ids: set[UUID] = set()  # ids a redaction deleted; bridge loop only
         self._closed = False
         self._closing: concurrent.futures.Future[None] | None = None  # done when close ends
@@ -1426,12 +1428,8 @@ class Neo4jSessionManager(SessionManager):
             ),
         )
         self._extraction = task
-        self._extractions_running += 1
-        task.add_done_callback(self._extraction_done)  # also runs for one never started
-
-    def _extraction_done(self, task: asyncio.Task[None]) -> None:
-        """Count a deferred extraction as finished. Runs on the bridge loop."""
-        self._extractions_running -= 1
+        self._live_extractions.add(task)
+        task.add_done_callback(self._live_extractions.discard)  # also runs for one never started
 
     async def _aextract_after(
         self, previous: asyncio.Task[None] | None, stored: StoredMessage
@@ -1489,13 +1487,9 @@ class Neo4jSessionManager(SessionManager):
         previous = self._tool_record
         task = self._start_background("tool-calls", self._arecord_after(previous, blocks))
         self._tool_record = task
-        self._tool_records_running += 1
-        task.add_done_callback(self._tool_record_done)  # also runs for one never started
+        self._live_tool_records.add(task)
+        task.add_done_callback(self._live_tool_records.discard)  # also runs for one never started
         await asyncio.shield(task)
-
-    def _tool_record_done(self, task: asyncio.Task[None]) -> None:
-        """Count a recording as finished. Runs on the bridge loop."""
-        self._tool_records_running -= 1
 
     async def _arecord_after(
         self, previous: asyncio.Task[None] | None, blocks: list[ToolUse]
@@ -1548,7 +1542,7 @@ class Neo4jSessionManager(SessionManager):
     async def _await_tool_records(self, timeout: float) -> None:
         """Wait up to ``timeout`` for tool-call mirroring. Runs on the bridge loop."""
         await self._await_chain(
-            self._tool_record, lambda: self._tool_records_running, "tool-call recording", timeout
+            self._tool_record, self._live_tool_records, "tool-call recording", timeout
         )
 
     def _extractions_bound(self) -> float | None:
@@ -1566,38 +1560,51 @@ class Neo4jSessionManager(SessionManager):
     async def _await_extractions(self, timeout: float) -> None:
         """Wait up to ``timeout`` for deferred extractions. Runs on the bridge loop."""
         await self._await_chain(
-            self._extraction, lambda: self._extractions_running, "entity extraction", timeout
+            self._extraction, self._live_extractions, "entity extraction", timeout
         )
 
     async def _await_chain(
         self,
         latest: asyncio.Task[None] | None,
-        running: Callable[[], int],
+        live: set[asyncio.Task[None]],
         what: str,
         timeout: float,
     ) -> None:
         """Wait up to ``timeout`` for a chain of background tasks to finish.
 
         Each task in the chain waits for the one before it, so the
-        ``latest`` finishing means all have. Closing the bridge cancels any
-        still running, so a warning names how many.
+        ``latest`` finishing means all have. The tasks still in ``live``
+        after the wait are cancelled, and a warning names how many. They
+        get ``_UNWIND_SECONDS`` to unwind, so they end before the client
+        closes.
 
         A task that is already done is still waited on. Its done callbacks
         run in a later loop iteration. The wait's own callback runs after
-        the one that counts the task finished, so ``running()`` is current
+        the one that drops the task from ``live``, so ``live`` is current
         when the wait returns.
         """
         if latest is not None:
             await asyncio.wait({latest}, timeout=timeout)
-        if count := running():
-            logger.warning(
-                "Closing session %r while %d %s(s) are still running after %ss. "
-                "They are cancelled.",
-                self.session_id,
-                count,
-                what,
-                timeout,
-            )
+        if not (left := set(live)):
+            return
+        logger.warning(
+            "Closing session %r while %d %s(s) are still running after %ss. They are cancelled.",
+            self.session_id,
+            len(left),
+            what,
+            timeout,
+        )
+        for task in left:
+            task.cancel()
+        await asyncio.wait(left, timeout=_UNWIND_SECONDS)
+
+    def _close_wait(self, bound: float) -> float:
+        """How long close waits on the bridge for a chain bounded by ``bound``.
+
+        It adds the time cancelled tasks get to unwind, and one
+        ``request_timeout`` to cover scheduling.
+        """
+        return bound + _UNWIND_SECONDS + self._request_timeout
 
     def _begin_close(self) -> concurrent.futures.Future[None] | None:
         """Mark the manager closed and return the future this close completes.
@@ -1632,14 +1639,14 @@ class Neo4jSessionManager(SessionManager):
             try:
                 if (bound := self._tool_records_bound()) is not None:
                     await self._bridge.run_async(
-                        self._await_tool_records(bound), bound + self._request_timeout
+                        self._await_tool_records(bound), self._close_wait(bound)
                     )
             except BaseException as e:
                 failure = self._first_failure(failure, e, "wait for tool-call mirroring")
             try:
                 if (bound := self._extractions_bound()) is not None:
                     await self._bridge.run_async(
-                        self._await_extractions(bound), bound + self._request_timeout
+                        self._await_extractions(bound), self._close_wait(bound)
                     )
             except BaseException as e:
                 failure = self._first_failure(failure, e, "wait for entity extraction")
@@ -1688,12 +1695,12 @@ class Neo4jSessionManager(SessionManager):
                 failure = e
             try:
                 if (bound := self._tool_records_bound()) is not None:
-                    self._bridge.run(self._await_tool_records(bound), bound + self._request_timeout)
+                    self._bridge.run(self._await_tool_records(bound), self._close_wait(bound))
             except BaseException as e:
                 failure = self._first_failure(failure, e, "wait for tool-call mirroring")
             try:
                 if (bound := self._extractions_bound()) is not None:
-                    self._bridge.run(self._await_extractions(bound), bound + self._request_timeout)
+                    self._bridge.run(self._await_extractions(bound), self._close_wait(bound))
             except BaseException as e:
                 failure = self._first_failure(failure, e, "wait for entity extraction")
             try:

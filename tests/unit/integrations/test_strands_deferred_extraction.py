@@ -61,12 +61,32 @@ class _Gate:
         finally:
             self._running -= 1
 
+    @property
+    def running(self) -> int:
+        """How many extractions are running now."""
+        return self._running
+
 
 async def _eventually(check: Callable[[], bool], timeout: float = 5.0) -> None:
     """Wait until ``check()`` is true, failing after ``timeout`` seconds."""
     async with asyncio.timeout(timeout):
         while not check():
             await asyncio.sleep(0.01)
+
+
+def _record_running_at_close(
+    client: FakeMemoryClient, gate: _Gate, monkeypatch: pytest.MonkeyPatch
+) -> list[int]:
+    """Record how many extractions run when ``client`` closes."""
+    running: list[int] = []
+    close = client.close
+
+    async def recording_close() -> None:
+        running.append(gate.running)
+        await close()
+
+    monkeypatch.setattr(client, "close", recording_close)
+    return running
 
 
 def _deferring(client: FakeMemoryClient, **kwargs: Any) -> Neo4jSessionManager:
@@ -236,6 +256,7 @@ class TestClosingWithDeferredExtractions:
         manager = _deferring(client)
         await _agent(manager, "A1").invoke_async("Q1")
         monkeypatch.setattr(manager, "_drain_timeout", lambda: 0.05)
+        running_at_close = _record_running_at_close(client, gate, monkeypatch)
 
         if use_async:
             await manager.aclose()
@@ -246,6 +267,7 @@ class TestClosingWithDeferredExtractions:
         assert (
             "Closing session 'sess-1' while 2 entity extraction(s) are still running" in caplog.text
         )
+        assert running_at_close == [0]  # cancelled before the client closed
 
     async def test_a_manager_on_a_shared_bridge_does_not_wait(self) -> None:
         client = FakeMemoryClient()

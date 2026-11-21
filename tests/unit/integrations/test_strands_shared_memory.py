@@ -25,7 +25,11 @@ from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E
     SessionException,
 )
 from tests.unit.integrations.strands_fakes import FakeMemoryClient  # noqa: E402
-from tests.unit.integrations.test_strands_deferred_extraction import _Gate, _Hook  # noqa: E402
+from tests.unit.integrations.test_strands_deferred_extraction import (  # noqa: E402
+    _Gate,
+    _Hook,
+    _record_running_at_close,
+)
 from tests.unit.integrations.test_strands_nonblocking import ScriptedModel  # noqa: E402
 
 _SETTINGS: Any = object()  # open() hands it to the patched MemoryClient only
@@ -238,7 +242,11 @@ class TestClosingWithBackgroundWork:
 
     @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
     async def test_tasks_still_running_after_the_timeout_are_cancelled(
-        self, client: FakeMemoryClient, use_async: bool, caplog: pytest.LogCaptureFixture
+        self,
+        client: FakeMemoryClient,
+        use_async: bool,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         caplog.set_level(logging.WARNING, logger="neo4j_agent_memory.integrations.strands.shared")
         gate = _Gate(client)  # never opens
@@ -247,6 +255,7 @@ class TestClosingWithBackgroundWork:
         manager = shared.session_manager("sess-1", defer_extraction=True)
         await _agent(manager, "A1").invoke_async("Q1")
         await manager.aclose()
+        running_at_close = _record_running_at_close(client, gate, monkeypatch)
 
         if use_async:
             await asyncio.wait_for(shared.aclose(timeout=0.1), timeout=5)
@@ -255,6 +264,7 @@ class TestClosingWithBackgroundWork:
 
         assert gate.done == []
         assert "Closing SharedMemory while 2 background task(s) are still running" in caplog.text
+        assert running_at_close == [0]  # cancelled before the client closed
         assert client.close_calls == 1
         assert _bridge_threads() == threads_before
 
