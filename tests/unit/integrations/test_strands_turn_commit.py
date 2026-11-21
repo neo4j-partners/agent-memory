@@ -23,7 +23,7 @@ from pydantic import BaseModel
 pytest.importorskip("strands", reason="strands-agents not installed")
 
 from strands import Agent, ToolContext, tool  # noqa: E402
-from strands.hooks import BeforeInvocationEvent  # noqa: E402
+from strands.hooks import AfterInvocationEvent, BeforeInvocationEvent  # noqa: E402
 from strands.types.agent import ConcurrentInvocationMode  # noqa: E402
 
 from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E402
@@ -84,7 +84,7 @@ def _answer(paused: Any) -> Any:
 
 
 def _once(hook: Any) -> Any:
-    """A BeforeInvocationEvent callback that runs ``hook`` on its first call only."""
+    """A hook callback that runs ``hook`` on its first call only."""
     calls: list[None] = []
 
     def callback(event: BeforeInvocationEvent) -> None:
@@ -452,7 +452,7 @@ class TestAnInterruptedTurn:
 
         assert _stored(client) == _FULL_APPROVAL_TURN
         (warning,) = _records(caplog, "WARNING")
-        assert "2 message" in warning
+        assert "0 message" in warning
 
     @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
     async def test_closing_during_an_interrupt_warns_and_writes_nothing(
@@ -577,23 +577,29 @@ class _HeldModel(ScriptedModel):
         yield {"output": _Summary(text="a summary")}
 
 
-def _held_agent(manager: Neo4jSessionManager, model: _HeldModel) -> Agent:
+def _held_agent(
+    manager: Neo4jSessionManager,
+    model: _HeldModel,
+    mode: ConcurrentInvocationMode = ConcurrentInvocationMode.UNSAFE_REENTRANT,
+) -> Agent:
     return Agent(
         model=model,
         session_manager=manager,
         callback_handler=None,
-        concurrent_invocation_mode=ConcurrentInvocationMode.UNSAFE_REENTRANT,
+        concurrent_invocation_mode=mode,
     )
 
 
 class TestCallsThatOverlap:
+    @pytest.mark.parametrize("mode", list(ConcurrentInvocationMode))
     async def test_structured_output_during_a_call_leaves_its_turn(
-        self, caplog: pytest.LogCaptureFixture
+        self, mode: ConcurrentInvocationMode, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """Structured output takes no invocation lock, so it overlaps in any mode."""
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
         model = _HeldModel([{"text": "A1"}])
-        agent = _held_agent(manager, model)
+        agent = _held_agent(manager, model, mode)
         try:
             call = asyncio.create_task(agent.invoke_async("Q1"))
             await model.started.wait()
@@ -665,6 +671,66 @@ class TestCallsThatOverlap:
         assert _stored(client) == [("user", "Q1"), ("assistant", "A1")]
         (warning,) = _records(caplog, "WARNING")
         assert "before the previous call's turn ended" in warning
+
+
+class TestATurnWhoseEndWasMissed:
+    """A hook raised, so the call's AfterInvocationEvent never reached ours.
+
+    In Strands' default mode a call that reaches its BeforeInvocationEvent
+    holds the invocation lock, so the turn it finds running is left over.
+    These calls run in one task, as a script calling the agent in turn does.
+    """
+
+    async def test_calls_after_a_raising_after_hook_write_their_turns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        model = ScriptedModel([{"text": "A1"}], [{"text": "A2"}], [{"text": "A3"}])
+        agent = Agent(model=model, session_manager=manager, callback_handler=None)
+        agent.hooks.add_callback(AfterInvocationEvent, _once(_crash))  # runs before ours
+        try:
+            with pytest.raises(RuntimeError, match="hook failed"):
+                await agent.invoke_async("Q1")
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await agent.invoke_async("Q2")
+                await agent.invoke_async("Q3")
+        finally:
+            await manager.aclose()
+
+        assert _stored(client) == [
+            ("user", "Q2"),
+            ("assistant", "A2"),
+            ("user", "Q3"),
+            ("assistant", "A3"),
+        ]
+        (warning,) = _records(caplog, "WARNING")
+        assert "sess-1" in warning
+        assert "2 message" in warning
+
+    async def test_a_call_after_a_failed_before_hook_and_a_direct_tool_call_writes_its_turn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        model = ScriptedModel([{"text": "A1"}], [{"text": "A2"}])
+        agent = Agent(model=model, tools=[lookup], session_manager=manager, callback_handler=None)
+        agent.hooks.add_callback(BeforeInvocationEvent, _once(_crash))  # runs after ours
+        try:
+            with pytest.raises(RuntimeError, match="hook failed"):
+                await agent.invoke_async("Q0")
+            agent.tool.lookup(city="Paris")
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await agent.invoke_async("Q1")
+            assert _stored(client) == [("user", "Q1"), ("assistant", "A1")]
+
+            await agent.invoke_async("Q2")
+        finally:
+            await manager.aclose()
+
+        assert _stored(client)[2:] == [("user", "Q2"), ("assistant", "A2")]
+        (warning,) = _records(caplog, "WARNING")
+        assert "sess-1" in warning
 
 
 class TestTheNextCallWritesWhatIsQueued:

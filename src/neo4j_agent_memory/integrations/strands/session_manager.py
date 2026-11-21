@@ -112,6 +112,20 @@ def _cancel_requested(agent: Agent | None) -> bool:
     return isinstance(signal, threading.Event) and signal.is_set()
 
 
+def _holds_invocation_lock(event: BeforeInvocationEvent) -> bool:
+    """True when the call that fired ``event`` holds the agent's invocation lock.
+
+    In Strands' default ``THROW`` mode, ``stream_async`` takes the lock
+    before its BeforeInvocationEvent and passes the call's messages with
+    it. ``structured_output_async`` takes no lock and passes no messages.
+    In ``UNSAFE_REENTRANT`` mode no call takes the lock.
+    """
+    if getattr(event, "messages", None) is None:
+        return False
+    mode = getattr(event.agent, "concurrent_invocation_mode", "throw")
+    return bool(mode != "unsafe_reentrant")
+
+
 def _interrupt_active(agent: Agent | None) -> bool:
     """True while Strands holds an interrupt the next call must answer."""
     state = getattr(agent, "_interrupt_state", None)
@@ -192,6 +206,8 @@ class Neo4jSessionManager(SessionManager):
     log, so the graph never holds a prompt without its reply. An interrupt
     pauses the turn until the call that resumes it. Messages appended
     outside an agent call are written by the next hook or by close. A
+    turn whose AfterInvocationEvent never reached this manager, because a
+    hook raised, is discarded with a warning when the next call starts. A
     process that stops in the middle of a turn loses that turn.
 
     ``on_persist_error`` sets what a failed memory write does. In both
@@ -320,6 +336,7 @@ class Neo4jSessionManager(SessionManager):
         self._owner: dict[str, Any] | None = None
         self._owner_task: asyncio.Task[Any] | None = None
         self._owner_appended = False
+        self._owner_locks = False  # the owner holds the agent's invocation lock
         self._open_calls = 0
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
@@ -581,33 +598,53 @@ class Neo4jSessionManager(SessionManager):
         ``UNSAFE_REENTRANT`` mode. Its messages join the owner's turn with
         a warning, and the owner's result decides that turn.
 
-        A running turn whose owner cannot still be running is left over
-        from a call whose BeforeInvocationEvent hook raised, so no
-        AfterInvocationEvent fired. The owner's task has finished, or this
-        call runs in that task with no message added since. This call
-        takes over the turn with a warning. Its messages stay buffered and
-        are written when this call's turn is.
+        A running turn whose owner cannot still be running is left over.
+        A hook raised, so the owner's AfterInvocationEvent never reached
+        ours, and the owner's caller got the exception. In Strands' default ``THROW``
+        mode, a ``stream_async`` call that reaches this hook holds the
+        invocation lock. A turn owned by another such call is then left
+        over. Otherwise the owner's task has finished, or this call runs in
+        that task with no message added since. This call takes over, and
+        the left-over turn is discarded with a warning, as for any call
+        that raised. A turn paused by an interrupt that Strands still holds
+        keeps its paused messages.
         """
         self._check_open()
+        task = asyncio.current_task()
+        locks = _holds_invocation_lock(event)
+        discarded: int | None = None
         with self._queue_lock:
             state = self._turn_state
+            if state == "running" and self._left_over(task, locks):
+                discarded = self._discard_failed_turn_locked(event.agent)
+                self._owner = None
+                self._owner_task = None
+                self._open_calls = 0
+                state = self._turn_state
             if state == "idle":
                 self._release_turn_locked()
                 self._resume_from = None
             elif state == "paused":
                 self._resume_from = len(self._turn)
+        if discarded is not None:
+            logger.warning(
+                "Session %r: an agent call started before the previous call's "
+                "turn ended. That call raised, so its %d message(s) were not "
+                "written.",
+                self.session_id,
+                discarded,
+            )
         await self._aflush_ready()
-        task = asyncio.current_task()
         with self._queue_lock:
             overlaps = self._turn_state == "running" and self._owner_running(task)
-            left_over = self._turn_state == "running" and not overlaps
             if overlaps:
                 self._open_calls += 1
             else:
                 self._owner = event.invocation_state
                 self._owner_task = task
                 self._owner_appended = False
-                self._open_calls = 1 if left_over else self._open_calls + 1
+                self._owner_locks = locks
+                self._open_calls += 1
             self._turn_state = "running"
             open_turn = len(self._turn)
         if overlaps:
@@ -618,14 +655,14 @@ class Neo4jSessionManager(SessionManager):
                 self.session_id,
                 open_turn,
             )
-        elif left_over:
-            logger.warning(
-                "Session %r: an agent call started before the previous call's "
-                "turn ended. The open turn's %d message(s) stay buffered and "
-                "are written with this call's turn.",
-                self.session_id,
-                open_turn,
-            )
+
+    def _left_over(self, task: asyncio.Task[Any] | None, locks: bool) -> bool:
+        """Whether the running turn is left over. Holds _queue_lock.
+
+        ``locks`` says whether the new call holds the invocation lock. When
+        the owner held it too, the owner has released it, so it has ended.
+        """
+        return (locks and self._owner_locks) or not self._owner_running(task)
 
     def _owner_running(self, task: asyncio.Task[Any] | None) -> bool:
         """Whether the turn's owner may still be running. Holds _queue_lock.
@@ -726,22 +763,32 @@ class Neo4jSessionManager(SessionManager):
             discarded = 0
             if result is not None and result.stop_reason == "interrupt":
                 self._turn_state = "paused"
-            elif failed and self._resume_from is not None and _interrupt_active(agent):
-                # Strands still holds the interrupt, so the turn stays paused
-                # without what the failed resume added.
-                self._turn_state = "paused"
-                discarded = len(self._turn) - self._resume_from
-                del self._turn[self._resume_from :]
+            elif failed:
+                discarded = self._discard_failed_turn_locked(agent)
             else:
                 self._turn_state = "idle"
                 self._resume_from = None
-                if failed:
-                    discarded = len(self._turn)
-                    self._turn.clear()
-                else:
-                    self._release_turn_locked()
+                self._release_turn_locked()
             self._turns_ended += 1  # after the release, which numbers the messages
             return discarded, turn
+
+    def _discard_failed_turn_locked(self, agent: Agent | None) -> int:
+        """Discard a failed turn's messages and return how many. Holds _queue_lock.
+
+        A failed resume of a turn that Strands still holds paused discards
+        only what the resume added, and the turn stays paused. Any other
+        failed turn is discarded whole, and the turn goes idle.
+        """
+        if self._resume_from is not None and _interrupt_active(agent):
+            discarded = len(self._turn) - self._resume_from
+            del self._turn[self._resume_from :]
+            self._turn_state = "paused"
+            return discarded
+        discarded = len(self._turn)
+        self._turn.clear()
+        self._turn_state = "idle"
+        self._resume_from = None
+        return discarded
 
     def _turn_written(self, turn: int) -> None:
         """Mark ``turn``'s end-of-turn drain finished. Any thread."""

@@ -183,6 +183,21 @@ class TestPrivateAttributeCoupling:
             "the interrupt pending."
         )
 
+    def test_agent_still_reports_its_concurrency_mode(self) -> None:
+        """Fails loudly if Agent.concurrent_invocation_mode or its values change."""
+        from strands import Agent
+        from strands.types.agent import ConcurrentInvocationMode
+
+        reentrant = ConcurrentInvocationMode.UNSAFE_REENTRANT
+        default = Agent(callback_handler=None)
+        unlocked = Agent(callback_handler=None, concurrent_invocation_mode=reentrant)
+
+        assert default.concurrent_invocation_mode == "throw", (
+            "Agent.concurrent_invocation_mode changed; _holds_invocation_lock "
+            "in session_manager.py needs a new way to tell a call holds the lock."
+        )
+        assert unlocked.concurrent_invocation_mode == "unsafe_reentrant"
+
     def test_agent_cancel_still_sets_cancel_signal(self) -> None:
         """Fails loudly if agent.cancel() stops setting the signal the manager reads."""
         from strands import Agent

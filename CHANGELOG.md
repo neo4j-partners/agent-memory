@@ -123,6 +123,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overlapping call, the manager keeps counting that call. A later
   `structured_output_async` call then leaves its turn open. The next
   call ends that turn and resets the count.
+- A Strands call whose AfterInvocationEvent never reached the manager no
+  longer keeps its turn open. A hook that raises before the manager's
+  hook skips it, and so does a hook that raises after the manager's
+  `BeforeInvocationEvent` hook. In Strands' default `THROW` mode, the
+  next `invoke_async` or `stream_async` call holds the invocation lock,
+  so the turn it finds running is left over. In `UNSAFE_REENTRANT` mode,
+  a turn is left over once its call's task has finished, or when the
+  next call runs in that task with no message added since. The next call
+  discards the left-over turn with a WARNING that names the session and
+  the number of messages discarded. Messages appended outside a call
+  while the turn was left open, such as a direct `agent.tool` call, are
+  discarded with it. Before, one missed end kept the turn open for the
+  life of the task, and no later turn was written.
 - Strands redactions of a stored message now run one at a time. Before,
   two redactions could rewrite the same message at once, and each stored
   its own redacted copy. Each redaction now waits for the one before it
