@@ -95,7 +95,7 @@ anchor:_get_message[]
 
 === get_conversation
 
-Return a `Conversation` with its messages, oldest first. On Bolt, `limit=None` uses the implementation's 1,000-message cap; pass an explicit larger limit when required. On NAMS the service returns at most the newest 200 messages, so `limit=None` asks for 200 and a larger `limit` is clamped to 200 with a warning; older messages cannot be listed. `since` filters the fetched messages by timestamp, so it does not provide server-side pagination.
+Return a `Conversation` with its messages, oldest first. A limit keeps the newest messages on both backends. On Bolt, `limit=None` uses the implementation's 1,000-message cap; pass an explicit larger limit when required. On NAMS the service returns at most the newest 200 messages, so `limit=None` asks for 200 and a larger `limit` is clamped to 200 with a warning; older messages cannot be listed. On Bolt, `since` keeps messages at or after that time and is applied before the limit. It must be timezone-aware; a naive datetime raises `ValueError`.
 
 // contract: memory/short_term.py:ShortTermMemory.get_conversation
 [source,python]
