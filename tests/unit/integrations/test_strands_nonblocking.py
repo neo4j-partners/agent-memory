@@ -533,6 +533,35 @@ class TestOneStoredCopyPerMessage:
         (conversation,) = client.short_term.conversations.values()
         assert [m.content for m in conversation.messages] == ["[SSN]"]
 
+    async def test_a_nams_retry_that_stored_the_redaction_is_left_as_is(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A NAMS retry stores what it sends, so there is nothing to redact."""
+        client = FakeMemoryClient(nams_mode=True)
+        wire = client.wire
+        original = wire.request
+        refused = False
+
+        async def request(spec: Any, **kwargs: Any) -> Any:
+            nonlocal refused
+            if spec.bridge_method == "add_message" and not refused:
+                refused = True
+                raise ConnectionError("refused before anything was stored")
+            return await original(spec, **kwargs)
+
+        wire.request = request  # type: ignore[method-assign]
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=client, on_persist_error="warn", extract_entities=False
+        )
+        agent = _buffered(manager, "my SSN is 123")
+        manager._release_pending()
+        await manager._aflush_ready()  # fails, and nothing is stored
+        manager.redact_latest_message({"role": "user", "content": [{"text": "[SSN]"}]}, agent)
+        await manager._aflush_ready()  # the retry stores the redacted text
+        await manager.aclose()
+        assert [c.json["content"] for c in wire.calls_for("add_message")] == ["[SSN]"]
+        assert "Cannot redact" not in caplog.text
+
     async def test_a_nams_write_that_replies_late_is_stored_once(self) -> None:
         client = FakeMemoryClient(nams_mode=True)
         wire = client.wire

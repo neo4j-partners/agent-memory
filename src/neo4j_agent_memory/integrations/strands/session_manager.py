@@ -875,7 +875,11 @@ class Neo4jSessionManager(SessionManager):
                     continue
                 async with self._redaction_lock():
                     latest = self._pop_head(stored)
-                    if stored is not None and latest is not written:
+                    if (
+                        stored is not None
+                        and latest is not written
+                        and not self._redacted_on_nams(stored, latest)
+                    ):
                         stored = await self._aredact_written(stored, latest)
                 if stored is not None:
                     await self._aextract(stored)
@@ -912,8 +916,10 @@ class Neo4jSessionManager(SessionManager):
         attempt may have committed. A retry under the same id is then
         skipped, so a redaction made before the retry must still be applied
         to the stored original. If the first attempt never committed, the
-        retry stores the redacted text, and applying the redaction again
-        rewrites it to the same content.
+        retry stores the redacted text. Bolt replies with the content sent
+        whether or not the retry stored anything, so the drain rewrites the
+        message there anyway. A NAMS retry is a new message, so the drain
+        leaves it as is. See ``_redacted_on_nams``.
         """
         task = entry.write
         if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
@@ -942,6 +948,16 @@ class Neo4jSessionManager(SessionManager):
             self._last_persisted = stored
         self._dequeued += 1
         return entry.message
+
+    def _redacted_on_nams(self, stored: StoredMessage, latest: StrandsMessage) -> bool:
+        """Whether a NAMS retry already stored the latest content of its message.
+
+        NAMS assigns a new id to every write, so a retry stores what it
+        sends and replies with it. Bolt skips a retry under the id of a
+        message it already holds, yet replies with the content sent, so
+        its reply cannot show what is stored.
+        """
+        return self._is_nams and stored.content == _message_text(latest)
 
     async def _aredact_written(
         self, stored: StoredMessage, redacted: StrandsMessage
