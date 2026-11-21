@@ -236,6 +236,7 @@ Await writes, check the applicable extraction lifecycle, and apply workspace/dat
 
 * One `Agent` per session manager. Attaching `Neo4jSessionManager` to a Strands Graph, Swarm or `BidiAgent` raises `NotImplementedError` at the first dispatch; use one of Strands' repository-backed managers for those topologies.
 * Text turns are restored; tool-use blocks and `agent.state` are not. Set `record_tool_calls=True` to keep an audit record of tool use.
+* Restored history alternates roles and starts with a user message. Consecutive messages with the same role are merged, and leading assistant messages are dropped. A final user message that never got a reply is left out, with a warning. Stored messages are not changed.
 * Pass `settings=` or an unconnected `memory_client=`. A client already connected on another event loop cannot be driven from the manager's background loop.
 * Guardrail redaction rewrites the latest message before it is stored. After it is stored, Bolt deletes and re-adds the redacted message at the end of the history; NAMS cannot redact a stored message and logs a warning.
 * Hooks for `AfterInvocationEvent` registered after the session manager run before the final turn is stored; read persisted state on the next turn.

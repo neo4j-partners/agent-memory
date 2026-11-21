@@ -1091,3 +1091,127 @@ class TestStrandsBaseClassContract:
         )
 
         assert _DEFAULT_MAX_SEARCH_RESULTS == DEFAULT_MAX_SEARCH_RESULTS
+
+
+def _msg(role: str, text: str) -> dict:
+    return {"role": role, "content": [{"text": text}]}
+
+
+class TestNormalizeHistory:
+    """Fix D: restored text history alternates user, assistant."""
+
+    @staticmethod
+    def _normalize(messages):
+        from neo4j_agent_memory.integrations.strands._messages import _normalize_history
+
+        return _normalize_history(messages)
+
+    def test_empty(self) -> None:
+        assert self._normalize([]) == ([], None)
+
+    def test_valid_history_is_unchanged(self) -> None:
+        history = [_msg("user", "a"), _msg("assistant", "b")]
+        assert self._normalize(list(history)) == (history, None)
+
+    def test_merges_consecutive_assistant_messages(self) -> None:
+        history = [
+            _msg("user", "q"),
+            _msg("assistant", "Let me look that up."),
+            _msg("assistant", "Found it."),
+        ]
+        assert self._normalize(history) == (
+            [_msg("user", "q"), _msg("assistant", "Let me look that up.\n\nFound it.")],
+            None,
+        )
+
+    def test_merges_consecutive_user_messages(self) -> None:
+        history = [_msg("user", "a"), _msg("user", "b"), _msg("assistant", "c")]
+        assert self._normalize(history) == (
+            [_msg("user", "a\n\nb"), _msg("assistant", "c")],
+            None,
+        )
+
+    def test_drops_leading_assistant(self) -> None:
+        history = [
+            _msg("assistant", "x"),
+            _msg("assistant", "y"),
+            _msg("user", "a"),
+            _msg("assistant", "b"),
+        ]
+        assert self._normalize(history) == ([_msg("user", "a"), _msg("assistant", "b")], None)
+
+    def test_drops_and_returns_trailing_user(self) -> None:
+        history = [_msg("user", "a"), _msg("assistant", "b"), _msg("user", "c"), _msg("user", "d")]
+        assert self._normalize(history) == (
+            [_msg("user", "a"), _msg("assistant", "b")],
+            _msg("user", "c\n\nd"),
+        )
+
+    def test_lone_user_message_normalizes_to_empty(self) -> None:
+        assert self._normalize([_msg("user", "a")]) == ([], _msg("user", "a"))
+
+    def test_merge_skips_empty_text(self) -> None:
+        history = [_msg("user", "q"), _msg("assistant", ""), _msg("assistant", "b")]
+        assert self._normalize(history) == ([_msg("user", "q"), _msg("assistant", "b")], None)
+
+
+class TestInitializeNormalizesHistory:
+    """Fix D: initialize() restores alternating roles."""
+
+    @staticmethod
+    def _seed(client, *messages: tuple[str, str]) -> None:
+        import asyncio
+
+        asyncio.run(client.short_term.create_conversation(session_id="sess-1"))
+        for role, text in messages:
+            asyncio.run(client.short_term.add_message("sess-1", role, text))
+
+    def test_restored_tool_turn_alternates_roles(self) -> None:
+        manager, client = _make_manager()
+        try:
+            self._seed(
+                client,
+                ("user", "weather?"),
+                ("assistant", "Let me check."),
+                ("assistant", "Sunny."),
+                ("user", "thanks"),
+                ("assistant", "Any time."),
+            )
+            agent = _fake_agent()
+            manager.initialize(agent)
+            assert agent.messages == [
+                _msg("user", "weather?"),
+                _msg("assistant", "Let me check.\n\nSunny."),
+                _msg("user", "thanks"),
+                _msg("assistant", "Any time."),
+            ]
+        finally:
+            manager.close()
+
+    def test_trailing_user_message_is_dropped_with_warning(self, caplog) -> None:
+        manager, client = _make_manager()
+        try:
+            self._seed(client, ("user", "a"), ("assistant", "b"), ("user", "stale"))
+            agent = _fake_agent()
+            with caplog.at_level("WARNING"):
+                manager.initialize(agent)
+            assert agent.messages == [_msg("user", "a"), _msg("assistant", "b")]
+            assert "no reply" in caplog.text
+            # Stored data is untouched.
+            stored = client.short_term.conversations["sess-1"].messages
+            assert [m.content for m in stored] == ["a", "b", "stale"]
+        finally:
+            manager.close()
+
+    def test_history_that_normalizes_to_empty_does_not_reseed(self) -> None:
+        manager, client = _make_manager()
+        try:
+            self._seed(client, ("user", "stale"))
+            agent = _fake_agent()
+            agent.messages.append(_msg("user", "in memory"))
+            manager.initialize(agent)
+            assert agent.messages == []
+            stored = client.short_term.conversations["sess-1"].messages
+            assert [m.content for m in stored] == ["stale"]
+        finally:
+            manager.close()

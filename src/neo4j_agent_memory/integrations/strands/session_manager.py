@@ -20,6 +20,7 @@ from uuid import UUID
 from neo4j_agent_memory.integrations.base import AsyncBridge as _AsyncBridge
 from neo4j_agent_memory.integrations.strands._messages import (
     _message_text,
+    _normalize_history,
     _to_strands_message,
 )
 from neo4j_agent_memory.integrations.strands._retrieval import (
@@ -272,14 +273,29 @@ class Neo4jSessionManager(SessionManager):
                 )
 
     def initialize(self, agent: Agent, **kwargs: Any) -> None:
-        """Restore the agent's conversation history from the graph."""
+        """Restore the agent's conversation history from the graph.
+
+        Restored history is normalized so roles alternate, starting with a
+        user message. A trailing user message that never got a reply is
+        left out of the agent's history, with a warning. Stored messages
+        are not changed.
+        """
         self._check_open()
         self._check_memory_manager_coexistence(agent)
         try:
-            restored = self._bridge.run(self._ainitialize())
+            stored = self._bridge.run(self._ainitialize())
         except Exception as e:
             raise SessionException(f"Failed to initialize session {self.session_id!r}") from e
-        if restored:
+        if stored:
+            # Normalizing can leave nothing, for example a lone stale user
+            # message. The session still exists, so do not seed it below.
+            restored, dropped = _normalize_history(stored)
+            if dropped is not None:
+                logger.warning(
+                    "Session %r ends with a user message that got no reply; "
+                    "leaving it out of the restored history.",
+                    self.session_id,
+                )
             agent.messages.clear()
             agent.messages.extend(restored)
         elif agent.messages:
