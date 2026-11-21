@@ -363,6 +363,32 @@ async def test_litellm_fallback_drops_bedrock_only_kwargs(
     assert "temperature" not in calls[-1]
 
 
+def test_litellm_fallback_rejects_unknown_tool_choice(monkeypatch: pytest.MonkeyPatch) -> None:
+    from neo4j_agent_memory.llm import factory
+
+    monkeypatch.setattr(factory, "_has", lambda extra: extra == "litellm")
+
+    with pytest.raises(ValueError, match="tool_choice"):
+        factory.from_provider("bedrock/us.anthropic.claude-sonnet-5-5-v1:0", tool_choice="any")
+
+
+def test_litellm_fallback_warns_once_about_dropped_tool_choice(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from neo4j_agent_memory.llm import factory
+
+    monkeypatch.setattr(factory, "_has", lambda extra: extra == "litellm")
+    monkeypatch.setattr(factory, "_tool_choice_drop_warned", False, raising=False)
+
+    with caplog.at_level("WARNING", logger=factory.__name__):
+        for _ in range(2):
+            factory.from_provider("bedrock/us.anthropic.claude-sonnet-5-5-v1:0", tool_choice="auto")
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "tool_choice" in warnings[0].getMessage()
+
+
 async def test_instructor_omits_temperature_by_default() -> None:
     from neo4j_agent_memory.llm.adapters.instructor import InstructorProvider
 

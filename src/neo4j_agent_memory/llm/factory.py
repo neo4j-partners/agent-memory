@@ -39,6 +39,9 @@ _NATIVE_EMBEDDING_PROVIDERS: frozenset[str] = frozenset(
     {"openai", "vertex_ai", "bedrock", "sentence-transformers"}
 )
 
+# The LiteLLM route drops tool_choice. The warning is logged once per process.
+_tool_choice_drop_warned = False
+
 
 def _has(extra: str) -> bool:
     """Return True if the package providing ``extra`` is importable.
@@ -218,11 +221,33 @@ def _resolve_llm(
         logger.debug("from_provider: routing %r to LiteLLMProvider", model)
         # tool_choice only applies to BedrockProvider's native tool call.
         # LiteLLM would forward it to acompletion, so it is dropped here.
-        if kwargs.pop("tool_choice", None) is not None:
-            logger.debug("from_provider: ignoring tool_choice for LiteLLMProvider")
+        _drop_tool_choice(kwargs)
         return LiteLLMProvider(model, **kwargs)
 
     raise ImportError(_install_hint(provider_prefix, "llm"))
+
+
+def _drop_tool_choice(kwargs: dict[str, Any]) -> None:
+    """Validate and remove ``tool_choice`` before routing to LiteLLM.
+
+    Raises:
+        ValueError: ``tool_choice`` is not None, "tool", or "auto".
+    """
+    global _tool_choice_drop_warned
+
+    tool_choice = kwargs.pop("tool_choice", None)
+    if tool_choice is None:
+        return
+    from neo4j_agent_memory.llm.adapters.bedrock import _TOOL_CHOICES
+
+    if tool_choice not in _TOOL_CHOICES:
+        raise ValueError(f"tool_choice must be None, 'tool', or 'auto', not {tool_choice!r}")
+    if not _tool_choice_drop_warned:
+        _tool_choice_drop_warned = True
+        logger.warning(
+            "from_provider: tool_choice=%r has no effect on LiteLLMProvider and was ignored",
+            tool_choice,
+        )
 
 
 def _resolve_embedding(
