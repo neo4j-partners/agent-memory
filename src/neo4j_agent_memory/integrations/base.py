@@ -35,6 +35,15 @@ _ON_LOOP_THREAD = (
 )
 
 
+def _cancel_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel the loop's pending tasks and let them unwind, within a bound."""
+    tasks = asyncio.all_tasks(loop)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        loop.run_until_complete(asyncio.wait(tasks, timeout=_SHUTDOWN_TIMEOUT_SECONDS))
+
+
 class AsyncBridge:
     """Persistent background-event-loop bridge for sync code driving async clients.
 
@@ -59,8 +68,10 @@ class AsyncBridge:
     When the loop stops, its thread shuts it down the way ``asyncio.run``
     does. It cancels the tasks still pending, gives them
     ``_SHUTDOWN_TIMEOUT_SECONDS`` to unwind, shuts down async generators and
-    the default executor, and closes the loop. A caller still waiting on
-    cancelled work gets ``RuntimeError`` rather than ``CancelledError``.
+    the default executor, and closes the loop. A task can start after the
+    first cancel, so the tasks still pending are cancelled once more just
+    before the loop closes. A caller still waiting on cancelled work gets
+    ``RuntimeError`` rather than ``CancelledError``.
 
     ``run()`` and ``close()`` wait on the loop, so they raise
     ``RuntimeError`` when called on the loop thread itself. Without the
@@ -128,11 +139,7 @@ class AsyncBridge:
             with self._futures_lock:
                 self._stopped = True
             try:
-                tasks = asyncio.all_tasks(loop)
-                for task in tasks:
-                    task.cancel()
-                if tasks:
-                    loop.run_until_complete(asyncio.wait(tasks, timeout=_SHUTDOWN_TIMEOUT_SECONDS))
+                _cancel_tasks(loop)
                 loop.run_until_complete(loop.shutdown_asyncgens())
                 loop.run_until_complete(loop.shutdown_default_executor())
             finally:
@@ -142,7 +149,12 @@ class AsyncBridge:
                     stranded = [f for f in self._futures if not f.done()]
                 for future in stranded:
                     future.cancel()
-                loop.close()
+                try:
+                    # A task can start during the steps above. Cancel it now,
+                    # or loop.close() destroys it while it is pending.
+                    _cancel_tasks(loop)
+                finally:
+                    loop.close()
 
     def _forget(self, future: concurrent.futures.Future[Any]) -> None:
         with self._futures_lock:
@@ -265,7 +277,8 @@ class AsyncBridge:
                 return
             with contextlib.suppress(RuntimeError):  # its thread closed it already
                 loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS + 5)
+            # Shutdown cancels tasks twice, and each time waits up to the bound.
+            thread.join(timeout=2 * _SHUTDOWN_TIMEOUT_SECONDS + 5)
 
 
 def _get_executor() -> concurrent.futures.ThreadPoolExecutor:

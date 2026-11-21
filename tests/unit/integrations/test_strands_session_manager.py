@@ -222,6 +222,36 @@ class TestAsyncBridge:
         # The future was cancelled while its loop was open, so no callback failed.
         assert [r for r in caplog.records if r.name == "concurrent.futures"] == []
 
+    def test_a_task_that_starts_during_shutdown_is_cancelled_before_the_loop_closes(
+        self,
+    ) -> None:
+        import time
+
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        bridge = _AsyncBridge()
+        late_unwound: list[bool] = []
+
+        async def late() -> None:
+            try:
+                await asyncio.sleep(10)
+            finally:
+                late_unwound.append(True)
+
+        async def starts_late() -> None:
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                # Not in the shutdown's first snapshot of tasks.
+                asyncio.get_running_loop().create_task(late())
+                raise
+
+        bridge.submit(starts_late())
+        time.sleep(0.1)
+        bridge.close()
+
+        assert late_unwound == [True]
+
     def test_submit_refuses_work_once_the_loop_has_stopped(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
