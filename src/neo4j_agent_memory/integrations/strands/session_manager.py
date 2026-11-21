@@ -84,6 +84,11 @@ class _Queued:
     failed: bool = False  # a write of it has failed
 
 
+def _describe(error: BaseException) -> str:
+    """The error's message, or its type name when it has none (TimeoutError)."""
+    return str(error) or type(error).__name__
+
+
 class _MessageDropped(Exception):
     """A drain dropped a message after its retry failed. Carries that error."""
 
@@ -179,7 +184,7 @@ class Neo4jSessionManager(SessionManager):
         # on the bridge thread, so every access holds this lock.
         self._queue_lock = threading.Lock()
         self._drain_lock: asyncio.Lock | None = None  # bridge loop only; one drain at a time
-        self._inflight: concurrent.futures.Future[None] | None = None  # latest drain
+        self._latest_drain: concurrent.futures.Future[None] | None = None  # under _queue_lock
         self._dequeued = 0  # messages that left _ready, stored or dropped; drain only
         self._turns_ended = 0  # AfterInvocationEvents seen
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
@@ -564,15 +569,16 @@ class Neo4jSessionManager(SessionManager):
 
         For ``close()`` and other sync callers. Hooks await
         ``_aflush_buffer`` instead. A failure is handled by
-        ``on_persist_error`` (see ``_persist_failed``).
+        ``on_persist_error`` (see ``_wait_failed``).
         """
         self._release_pending()
+        future: concurrent.futures.Future[None] | None = None
         try:
             future = self._submit_drain()
             if future is not None:
-                future.result(timeout=self._request_timeout)
+                future.result(timeout=self._drain_timeout())
         except Exception as e:
-            self._persist_failed(e)
+            self._wait_failed(future, e)
 
     async def _aflush_buffer(self) -> None:
         """Persist every buffered message without blocking the caller's loop."""
@@ -582,19 +588,59 @@ class Neo4jSessionManager(SessionManager):
     async def _aflush_ready(self) -> None:
         """Persist the ready queue in order, leaving the latest message buffered.
 
-        The write runs on the bridge and is shielded: cancelling the caller,
-        or a timeout, stops only the wait. The write itself runs to
-        completion, and ``close()`` waits for it.
+        The writes run on the bridge and are shielded: cancelling the
+        caller stops only the wait. The writes run to completion, and
+        ``close()`` waits for them.
 
         A failure is handled by ``on_persist_error`` (see
-        ``_persist_failed``).
+        ``_wait_failed``).
         """
+        future: concurrent.futures.Future[None] | None = None
         try:
             future = self._submit_drain()
             if future is not None:
-                await self._bridge.wait(future, shield=True)
+                await self._bridge.wait(future, self._drain_timeout(), shield=True)
         except Exception as e:
-            self._persist_failed(e)
+            self._wait_failed(future, e)
+
+    def _drain_timeout(self) -> float:
+        """How long a caller waits for a drain.
+
+        Each step of a drain is bounded by ``request_timeout``, so a drain
+        can take that long per step for each queued message. One message
+        more covers a drain that is still finishing a popped message.
+        """
+        steps = 1 + int(self._extract_entities and not self._is_nams) + int(self._record_tool_calls)
+        with self._queue_lock:
+            queued = len(self._ready)
+        return self._request_timeout * steps * (queued + 1)
+
+    def _wait_failed(
+        self, future: concurrent.futures.Future[None] | None, error: Exception
+    ) -> None:
+        """Handle an error from a flush's wait for its drain.
+
+        A drain that is still running means the wait ran out, not a write.
+        The drain goes on. Any other error is a failed flush.
+        """
+        if future is None or future.done():
+            self._persist_failed(error)
+            return
+        with self._queue_lock:
+            unwritten = len(self._ready)
+        if self._closed:
+            logger.error(
+                "Closing session %r before its memory writes finished. "
+                "%d message(s) were not written.",
+                self.session_id,
+                unwritten,
+            )
+        else:
+            logger.warning(
+                "Memory writes for session %r are taking longer than expected. "
+                "They go on in the background.",
+                self.session_id,
+            )
 
     def _persist_failed(self, error: Exception) -> None:
         """Apply ``on_persist_error`` to a failed flush.
@@ -618,17 +664,22 @@ class Neo4jSessionManager(SessionManager):
                 "Failed to persist message for session %r. It stays queued, "
                 "and the next flush retries it: %s",
                 self.session_id,
-                cause,
+                _describe(cause),
             )
 
     def _submit_drain(self) -> concurrent.futures.Future[None] | None:
-        """Start a drain of the ready queue on the bridge, or None if it is empty."""
+        """Start a drain of the ready queue on the bridge.
+
+        Returns None when the queue is empty, unless the manager is
+        closing while a drain still runs. Drains run one at a time, so the
+        drain a close submits also waits for that one.
+        """
         with self._queue_lock:
-            if not self._ready:
+            running = self._latest_drain is not None and not self._latest_drain.done()
+            if not self._ready and not (self._closed and running):
                 return None
-            future = self._bridge.submit(self._adrain())
-            self._inflight = future
-            return future
+            self._latest_drain = self._bridge.submit(self._adrain())
+            return self._latest_drain
 
     async def _adrain(self) -> None:
         """Write the ready queue in order. Runs on the bridge loop.
@@ -647,6 +698,9 @@ class Neo4jSessionManager(SessionManager):
         message. Neither backend lets the caller set a message id, so a
         retry after a write that failed late, for example once the backend
         had stored it, can store the message twice.
+
+        Each step is bounded by ``request_timeout``. A write that times
+        out is a failed write.
 
         A failed write drops its message when the message was queued in an
         earlier turn, or when the manager is closing and the message failed
@@ -668,7 +722,9 @@ class Neo4jSessionManager(SessionManager):
                 stored: StoredMessage | None = None
                 try:
                     if text := _message_text(message):
-                        stored = await self._aadd_message(message["role"], text)
+                        stored = await asyncio.wait_for(
+                            self._aadd_message(message["role"], text), self._request_timeout
+                        )
                 except Exception as e:
                     stale = entry.turn < self._turns_ended
                     if not stale and not (self._closed and entry.failed):
@@ -679,7 +735,7 @@ class Neo4jSessionManager(SessionManager):
                         message.get("role", "unknown"),
                         self._dequeued + 1,
                         self.session_id,
-                        e,
+                        _describe(e),
                     )
                     dropped = _MessageDropped(e)
                     self._pop_head()
@@ -690,9 +746,13 @@ class Neo4jSessionManager(SessionManager):
                     await self._aextract(stored)
                 if blocks := self._tool_uses(message):
                     try:
-                        await self._arecord_tool_uses(blocks)
+                        await asyncio.wait_for(
+                            self._arecord_tool_uses(blocks), self._request_timeout
+                        )
                     except Exception as e:
-                        logger.warning("Failed to mirror tool calls to reasoning memory: %s", e)
+                        logger.warning(
+                            "Failed to mirror tool calls to reasoning memory: %s", _describe(e)
+                        )
         if dropped is not None:
             raise dropped
 
@@ -701,34 +761,6 @@ class Neo4jSessionManager(SessionManager):
         with self._queue_lock:
             self._ready.popleft()
         self._dequeued += 1
-
-    def _wait_for_inflight(self) -> None:
-        """Let the latest drain finish before the client closes. Blocking."""
-        future = self._inflight
-        if future is None:
-            return
-        try:
-            future.result(timeout=self._request_timeout)
-        except TimeoutError:
-            logger.warning(
-                "A memory write for session %r was still running at close.", self.session_id
-            )
-        except Exception:  # noqa: S110 - the flush that started it already reported it
-            pass
-
-    async def _await_inflight(self) -> None:
-        """Like ``_wait_for_inflight``, without blocking the caller's loop."""
-        future = self._inflight
-        if future is None:
-            return
-        try:
-            await self._bridge.wait(future, shield=True)
-        except TimeoutError:
-            logger.warning(
-                "A memory write for session %r was still running at close.", self.session_id
-            )
-        except Exception:  # noqa: S110 - the flush that started it already reported it
-            pass
 
     def _tool_uses(self, message: StrandsMessage) -> list[ToolUse]:
         """The toolUse blocks to mirror into reasoning memory, if enabled.
@@ -774,15 +806,18 @@ class Neo4jSessionManager(SessionManager):
             return
         bolt_short_term = cast("ShortTermMemory", self._client.short_term)
         try:
-            await bolt_short_term.extract_entities_from_message(
-                stored, user_identifier=self._user_id
+            await asyncio.wait_for(
+                bolt_short_term.extract_entities_from_message(
+                    stored, user_identifier=self._user_id
+                ),
+                self._request_timeout,
             )
         except Exception as e:
             logger.warning(
                 "Entity extraction failed for a stored message of session %r. "
                 "The message is stored without entities: %s",
                 self.session_id,
-                e,
+                _describe(e),
             )
 
     async def _arecord_tool_uses(self, blocks: list[ToolUse]) -> None:
@@ -828,7 +863,6 @@ class Neo4jSessionManager(SessionManager):
             await self._aflush_buffer()
         finally:
             try:
-                await self._await_inflight()
                 if self._should_close_client and self._client.is_connected:
                     await self._bridge.run_async(self._client.close())
             finally:
@@ -850,7 +884,6 @@ class Neo4jSessionManager(SessionManager):
             self._flush_buffer()
         finally:
             try:
-                self._wait_for_inflight()
                 if self._should_close_client and self._client.is_connected:
                     self._bridge.run(self._client.close())
             finally:

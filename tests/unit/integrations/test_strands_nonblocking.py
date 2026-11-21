@@ -36,6 +36,7 @@ from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E
 from tests.unit.integrations.strands_fakes import FakeMemoryClient  # noqa: E402
 
 _TICK = 0.01
+_LOGGER = "neo4j_agent_memory.integrations.strands.session_manager"
 
 
 class ScriptedModel(Model):
@@ -479,32 +480,42 @@ class TestWritesRunToCompletion:
 
         assert _stored(client) == [("user", "hi"), ("assistant", "A1")]
 
-    async def test_a_timeout_does_not_cut_off_extraction(self) -> None:
+    async def test_a_batch_longer_than_the_timeout_does_not_fail(self) -> None:
+        client = _slow_client(0.2)  # each write fits in the timeout; all four do not
+        manager = Neo4jSessionManager("sess-1", memory_client=client, request_timeout=0.5)
+        _buffered(manager, "a", "b", "c", "d")
+        try:
+            await manager._on_after_invocation(SimpleNamespace(agent=None))
+            assert _stored(client) == [("user", t) for t in "abcd"]
+        finally:
+            await manager.aclose()
+
+    async def test_a_wait_that_runs_out_leaves_the_write_running(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         client = FakeMemoryClient()
         original = client.short_term.add_message
-        steps: list[str] = []
 
-        async def store_then_extract(*args: Any, **kwargs: Any) -> Any:
-            stored = await original(*args, **kwargs)
-            steps.append("stored")
-            await asyncio.sleep(0.5)  # inline entity extraction
-            steps.append("extracted")
-            return stored
+        async def ignores_cancel(*args: Any, **kwargs: Any) -> Any:
+            try:
+                await asyncio.sleep(0.6)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.6)  # a client that finishes its request anyway
+            return await original(*args, **kwargs)
 
-        client.short_term.add_message = store_then_extract  # type: ignore[method-assign]
+        client.short_term.add_message = ignores_cancel  # type: ignore[method-assign]
         manager = Neo4jSessionManager("sess-1", memory_client=client, request_timeout=0.2)
-        agent = _agent(manager, [{"text": "A1"}])
+        _buffered(manager, "one")
         try:
-            with pytest.raises(Exception, match="(?s).*"):
-                await agent.invoke_async("hi")
-            deadline = time.monotonic() + 3
-            while len(steps) < 4 and time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
-            assert steps == ["stored", "extracted", "stored", "extracted"]
-            assert _stored(client) == [("user", "hi"), ("assistant", "A1")]
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await manager._on_after_invocation(SimpleNamespace(agent=None))  # no raise
+            (warning,) = [r for r in caplog.records if r.name == _LOGGER]
+            assert "sess-1" in warning.getMessage()
+            assert "background" in warning.getMessage()
+            assert _stored(client) == []
         finally:
-            with contextlib.suppress(SessionException):
-                await manager.aclose()
+            await manager.aclose()
+        assert _stored(client) == [("user", "one")]
 
     async def test_concurrent_drains_write_in_order(self) -> None:
         client = _slowing_client(0.3)  # the first write is the slowest

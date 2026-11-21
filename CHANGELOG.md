@@ -48,10 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   background loop. A slow write no longer stalls other sessions that share
   the loop. `append_message` now only buffers, and the next hook writes.
 - `Neo4jSessionManager` memory writes now run to completion. Cancelling
-  the agent call, or hitting `request_timeout`, stops only the wait. A
-  turn is no longer cut off mid-write. `close()` and `aclose()` wait for
-  a write that is still
-  running. Writes from hooks, `aclose()`, and a `close()` on another
+  the agent call stops only the wait, so a turn is no longer cut off
+  mid-write. `request_timeout` bounds each backend call of a write. A
+  write that times out is a failed write under `on_persist_error`. A
+  hook waits as long as its batch of writes can take, so a slow backend
+  no longer fails the agent call. If that wait runs out, the writes go
+  on in the background, and a warning is logged. `close()` and
+  `aclose()` wait for writes that are still running. If a close cannot
+  wait for them, it logs an ERROR with the number of messages left
+  unwritten. Writes from hooks, `aclose()`, and a `close()` on another
   thread run one at a time and keep the message order.
 - A failed entity extraction no longer fails a `Neo4jSessionManager`
   write. On bolt, the manager now writes each message without extraction

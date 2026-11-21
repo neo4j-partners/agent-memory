@@ -200,6 +200,32 @@ class TestRetryBound:
         await manager.aclose()
         assert _stored(client) == [("user", "u4"), ("assistant", "a4")]
 
+    async def test_a_hung_write_times_out_and_is_dropped(
+        self, mode: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+
+        async def hang(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.Event().wait()
+
+        client.short_term.add_message = hang  # type: ignore[method-assign]
+        manager = Neo4jSessionManager(
+            "sess-1",
+            memory_client=client,
+            request_timeout=0.2,
+            on_persist_error=mode,  # type: ignore[arg-type]
+        )
+        agent = _buffered(manager)
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            for turn in range(3):
+                manager.append_message({"role": "user", "content": [{"text": f"u{turn}"}]}, agent)
+                await _expect_failure(_end_turn(manager), mode)
+            await _expect_failure(manager.aclose(), mode)
+        dropped = [r.getMessage() for r in _records(caplog, "ERROR")]
+        assert len(dropped) == 3  # u0 and u1 in later turns, u2 at close
+        assert all("TimeoutError" in text for text in dropped)
+        assert list(manager._ready) == []
+
     async def test_a_success_resets_the_retry(
         self, mode: str, caplog: pytest.LogCaptureFixture
     ) -> None:
