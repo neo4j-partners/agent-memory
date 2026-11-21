@@ -259,6 +259,9 @@ _BEDROCK_TOOL_CHOICE_MESSAGE = 'tool_choice: type "tool" and "any" are not suppo
         (_BEDROCK_TOOL_CHOICE_MESSAGE, True),
         (_TOOL_CHOICE_REJECTION, True),
         ("The tool choice is not supported for this model.", True),
+        ("The tool-choice field is not supported for this model.", True),
+        ('type "tool" and "any" are not supported for this model', True),
+        ("The tool returned no choices.", False),
         ("Input is too long for requested model.", False),
     ],
 )
