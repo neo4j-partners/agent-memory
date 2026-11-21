@@ -671,6 +671,11 @@ class Neo4jSessionManager(SessionManager):
         Each step of a drain is bounded by ``request_timeout``, so a drain
         can take that long per step for each queued message. One message
         more covers a drain that is still finishing a popped message.
+
+        A redaction that lands while its message is being written adds one
+        more step, and it is not counted. Strands redacts before the hook
+        drains, so this is rare. If the wait runs out first, the drain goes
+        on in the background, and the caller logs a warning.
         """
         steps = 1 + int(self._extract_entities and not self._is_nams) + int(self._record_tool_calls)
         with self._queue_lock:
