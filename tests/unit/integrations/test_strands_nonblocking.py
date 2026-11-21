@@ -500,10 +500,14 @@ class TestWritesRunToCompletion:
             try:
                 await asyncio.sleep(0.6)
             except asyncio.CancelledError:
-                await asyncio.sleep(0.6)  # a client that finishes its request anyway
+                await asyncio.sleep(1.0)  # a client that finishes its request anyway
             return await original(*args, **kwargs)
 
         client.short_term.add_message = ignores_cancel  # type: ignore[method-assign]
+        # Each message takes two steps, the write and its extraction. So the
+        # hook waits 0.2 * 2 * 2 = 0.8 s, and the wait of aclose runs out near
+        # 1.6 s. The write times out at 0.2 s and ends anyway at 1.2 s, which
+        # leaves 0.4 s on each side.
         manager = Neo4jSessionManager("sess-1", memory_client=client, request_timeout=0.2)
         _buffered(manager, "one")
         try:
