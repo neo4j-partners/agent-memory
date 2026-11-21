@@ -646,7 +646,20 @@ class TestWritesRunToCompletion:
             await manager.aclose()
 
     async def test_aclose_during_a_turn_keeps_order(self) -> None:
-        client = _slow_client(0.3)
+        # Only the first write is slow. Writes that ran side by side would
+        # store "A1" before "hi".
+        client = FakeMemoryClient()
+        original = client.short_term.add_message
+        calls = 0
+
+        async def first_write_slow(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await asyncio.sleep(0.3)
+            return await original(*args, **kwargs)
+
+        client.short_term.add_message = first_write_slow  # type: ignore[method-assign]
         manager = Neo4jSessionManager("sess-1", memory_client=client)
         agent = _agent(manager, [{"text": "A1"}])
         task = asyncio.create_task(agent.invoke_async("hi"))
