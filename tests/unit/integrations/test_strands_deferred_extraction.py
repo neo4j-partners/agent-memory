@@ -230,3 +230,134 @@ class TestClosingWithDeferredExtractions:
             await _eventually(lambda: gate.done == ["Q1", "A1"])
         finally:
             await asyncio.to_thread(bridge.close)
+
+
+class _Hook:
+    """A ``background_hook`` that records each start and done with a serial number."""
+
+    def __init__(self, *, fail_start: bool = False, fail_done: bool = False) -> None:
+        self.events: list[tuple[str, str, int]] = []
+        self._fail_start = fail_start
+        self._fail_done = fail_done
+
+    def __call__(self, name: str) -> Callable[[], None]:
+        serial = sum(kind == "start" for kind, _, _ in self.events)
+        self.events.append(("start", name, serial))
+        if self._fail_start:
+            raise RuntimeError("tracker down")
+
+        def done() -> None:
+            self.events.append(("done", name, serial))
+            if self._fail_done:
+                raise RuntimeError("tracker down")
+
+        return done
+
+    def names(self, kind: str) -> list[str]:
+        return [name for k, name, _ in self.events if k == kind]
+
+    def assert_paired(self) -> None:
+        """Every start has exactly one done, and nothing else is done."""
+        starts = [n for kind, _, n in self.events if kind == "start"]
+        dones = [n for kind, _, n in self.events if kind == "done"]
+        assert sorted(dones) == starts
+
+
+class TestBackgroundHook:
+    async def test_each_deferred_extraction_starts_and_ends_once(self) -> None:
+        client = FakeMemoryClient()
+        _Gate(client).opened.set()
+        hook = _Hook()
+        manager = _deferring(client, background_hook=hook)
+
+        await _agent(manager, "A1").invoke_async("Q1")
+        await manager.aclose()
+
+        assert hook.names("start") == ["extract:sess-1", "extract:sess-1"]
+        hook.assert_paired()
+
+    async def test_each_tool_call_recording_starts_and_ends_once(self) -> None:
+        client = FakeMemoryClient()
+        hook = _Hook()
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=client, record_tool_calls=True, background_hook=hook
+        )
+        blocks: Any = [{"toolUseId": "t1", "name": "lookup", "input": {}}]
+
+        manager._bridge.run(manager._arecord_tool_uses(blocks))
+        await manager.aclose()
+
+        assert hook.names("start") == ["tool-calls:sess-1"]
+        hook.assert_paired()
+
+    async def test_a_failed_extraction_ends_once(self) -> None:
+        client = FakeMemoryClient()
+        gate = _Gate(client)
+        gate.fail = {"Q1", "A1"}
+        gate.opened.set()
+        hook = _Hook()
+        manager = _deferring(client, background_hook=hook)
+
+        await _agent(manager, "A1").invoke_async("Q1")
+        await manager.aclose()
+
+        assert len(hook.names("start")) == 2
+        hook.assert_paired()
+
+    @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
+    async def test_an_extraction_cancelled_at_close_ends_once(
+        self, use_async: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = FakeMemoryClient()
+        gate = _Gate(client)  # never opens
+        hook = _Hook()
+        manager = _deferring(client, background_hook=hook)
+        await _agent(manager, "A1").invoke_async("Q1")
+        monkeypatch.setattr(manager, "_drain_timeout", lambda: 0.05)
+
+        if use_async:
+            await manager.aclose()
+        else:
+            await asyncio.to_thread(manager.close)
+
+        assert gate.done == []
+        assert len(hook.names("start")) == 2
+        hook.assert_paired()
+
+    async def test_a_hook_that_raises_is_logged_and_the_work_goes_on(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        client = FakeMemoryClient()
+        gate = _Gate(client)
+        gate.opened.set()
+        hook = _Hook(fail_start=True)
+        manager = _deferring(client, background_hook=hook)
+
+        await _agent(manager, "A1").invoke_async("Q1")
+        await manager.aclose()
+
+        assert _contents(client) == ["Q1", "A1"]
+        assert gate.done == ["Q1", "A1"]
+        assert hook.names("done") == []  # it returned no done function
+        assert "background_hook failed for task 'extract:sess-1': tracker down" in caplog.text
+
+    async def test_a_done_function_that_raises_is_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        client = FakeMemoryClient()
+        gate = _Gate(client)
+        gate.opened.set()
+        hook = _Hook(fail_done=True)
+        manager = _deferring(client, background_hook=hook)
+
+        await _agent(manager, "A1").invoke_async("Q1")
+        await manager.aclose()
+
+        assert gate.done == ["Q1", "A1"]
+        hook.assert_paired()
+        assert (
+            "The done function background_hook returned for task 'extract:sess-1' failed"
+            in caplog.text
+        )

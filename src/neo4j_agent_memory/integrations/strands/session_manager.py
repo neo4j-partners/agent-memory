@@ -49,7 +49,7 @@ except ImportError as import_error:  # pragma: no cover - exercised via package 
     ) from import_error
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Coroutine
     from types import TracebackType
 
     from strands import Agent
@@ -120,6 +120,18 @@ def _interrupt_active(agent: Agent | None) -> bool:
 def _describe(error: BaseException) -> str:
     """The error's message, or its type name when it has none (TimeoutError)."""
     return str(error) or type(error).__name__
+
+
+def _report_done(name: str, done: Callable[[], None]) -> None:
+    """Call the done function ``background_hook`` returned, logging an error."""
+    try:
+        done()
+    except Exception as e:
+        logger.warning(
+            "The done function background_hook returned for task %r failed: %s",
+            name,
+            _describe(e),
+        )
 
 
 def _copy_outcome(
@@ -208,6 +220,15 @@ class Neo4jSessionManager(SessionManager):
     manager on a shared bridge does not wait. ``SharedMemory`` waits for
     them when it closes. NAMS extracts on the server, so the option does
     nothing there.
+
+    ``background_hook`` reports the work that outlives a write. It is
+    called with a short name, such as ``"extract:<session_id>"``, when a
+    deferred extraction or a tool-call recording starts. It returns a
+    function that runs once when that task ends, whether it succeeded,
+    failed, or was cancelled. Both run on the bridge thread, so they must
+    be thread-safe and fast. An error from either is logged as a WARNING
+    and never fails a write. ``SharedMemory`` passes its own hook to the
+    managers it builds.
     """
 
     def __init__(
@@ -225,6 +246,7 @@ class Neo4jSessionManager(SessionManager):
         restore_limit: int | None = None,
         on_persist_error: Literal["raise", "warn"] = "raise",
         bridge: _AsyncBridge | None = None,
+        background_hook: Callable[[str], Callable[[], None]] | None = None,
     ) -> None:
         if (memory_client is None) == (settings is None):
             raise ValueError(
@@ -245,6 +267,7 @@ class Neo4jSessionManager(SessionManager):
         self._retrieval_config = retrieval_config
         self._extract_entities = extract_entities
         self._defer_extraction = defer_extraction
+        self._background_hook = background_hook
         self._record_tool_calls = record_tool_calls
         self._restore_limit = restore_limit
         self._request_timeout = request_timeout
@@ -1312,7 +1335,7 @@ class Neo4jSessionManager(SessionManager):
         """
         if not self._extract_entities or self._is_nams:
             return
-        task = asyncio.ensure_future(self._aextract_after(self._extraction, stored))
+        task = self._start_background("extract", self._aextract_after(self._extraction, stored))
         self._extraction = task
         self._extractions_running += 1
         task.add_done_callback(self._extraction_done)  # also runs for one never started
@@ -1345,6 +1368,26 @@ class Neo4jSessionManager(SessionManager):
                 return
         await self._aextract(stored)
 
+    def _start_background(self, kind: str, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+        """Run ``coro`` as a task on the bridge loop and report it to the hook.
+
+        The hook gets ``"<kind>:<session_id>"``. Its done function runs from
+        the task's done callback, so it runs once however the task ends,
+        even when the task is cancelled before it starts. An error from
+        either is logged, and the task runs anyway.
+        """
+        task = asyncio.ensure_future(coro)
+        if (hook := self._background_hook) is None:
+            return task
+        name = f"{kind}:{self.session_id}"
+        try:
+            done = hook(name)
+        except Exception as e:
+            logger.warning("background_hook failed for task %r: %s", name, _describe(e))
+            return task
+        task.add_done_callback(lambda _: _report_done(name, done))
+        return task
+
     async def _arecord_tool_uses(self, blocks: list[ToolUse]) -> None:
         """Mirror toolUse blocks into reasoning memory. Runs on the bridge loop.
 
@@ -1355,7 +1398,7 @@ class Neo4jSessionManager(SessionManager):
         their order. A failure is logged by the task and never raised.
         """
         previous = self._tool_record
-        task = asyncio.ensure_future(self._arecord_after(previous, blocks))
+        task = self._start_background("tool-calls", self._arecord_after(previous, blocks))
         self._tool_record = task
         self._tool_records_running += 1
         task.add_done_callback(self._tool_record_done)  # also runs for one never started

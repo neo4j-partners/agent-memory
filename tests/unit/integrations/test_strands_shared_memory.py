@@ -25,7 +25,7 @@ from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E
     SessionException,
 )
 from tests.unit.integrations.strands_fakes import FakeMemoryClient  # noqa: E402
-from tests.unit.integrations.test_strands_deferred_extraction import _Gate  # noqa: E402
+from tests.unit.integrations.test_strands_deferred_extraction import _Gate, _Hook  # noqa: E402
 from tests.unit.integrations.test_strands_nonblocking import ScriptedModel  # noqa: E402
 
 _SETTINGS: Any = object()  # open() hands it to the patched MemoryClient only
@@ -254,3 +254,47 @@ class TestAManagerOnASharedBridge:
             await manager.aclose()
         finally:
             await asyncio.to_thread(bridge.close)
+
+
+class TestTheBackgroundHook:
+    async def test_every_manager_reports_its_background_tasks(
+        self, client: FakeMemoryClient
+    ) -> None:
+        _Gate(client).opened.set()
+        hook = _Hook()
+        shared = SharedMemory.open(_SETTINGS, background_hook=hook)
+        first = shared.session_manager("sess-1", defer_extraction=True)
+        second = shared.session_manager("sess-2", defer_extraction=True)
+        try:
+            await _agent(first, "A1").invoke_async("Q1")
+            await _agent(second, "B1").invoke_async("P1")
+            await first.aclose()
+            await second.aclose()
+        finally:
+            await shared.aclose()
+
+        assert sorted(hook.names("start")) == ["extract:sess-1"] * 2 + ["extract:sess-2"] * 2
+        hook.assert_paired()
+
+    async def test_a_task_cancelled_when_the_loop_stops_ends_once(
+        self, client: FakeMemoryClient
+    ) -> None:
+        _Gate(client)  # never opens
+        hook = _Hook()
+        shared = SharedMemory.open(_SETTINGS, background_hook=hook)
+        manager = shared.session_manager("sess-1", defer_extraction=True)
+        await _agent(manager, "A1").invoke_async("Q1")
+        await manager.aclose()
+
+        await shared.aclose(timeout=0.05)
+
+        assert len(hook.names("start")) == 2
+        hook.assert_paired()
+
+    async def test_a_manager_cannot_be_given_its_own_hook(self, client: FakeMemoryClient) -> None:
+        shared = SharedMemory.open(_SETTINGS)
+        try:
+            with pytest.raises(TypeError, match="background_hook"):
+                shared.session_manager("sess-1", background_hook=_Hook())
+        finally:
+            await shared.aclose()

@@ -18,6 +18,8 @@ from neo4j_agent_memory.integrations.base import AsyncBridge
 from neo4j_agent_memory.integrations.strands.session_manager import Neo4jSessionManager
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from neo4j_agent_memory import MemoryClient, MemorySettings
 
 __all__ = ["SharedMemory"]
@@ -51,21 +53,40 @@ class SharedMemory:
         await shared.aclose()
     """
 
-    def __init__(self, client: MemoryClient, bridge: AsyncBridge, request_timeout: float) -> None:
+    def __init__(
+        self,
+        client: MemoryClient,
+        bridge: AsyncBridge,
+        request_timeout: float,
+        background_hook: Callable[[str], Callable[[], None]] | None = None,
+    ) -> None:
         """Wrap a client connected on ``bridge``. Use ``open`` instead."""
         self._client = client
         self._bridge = bridge
         self._request_timeout = request_timeout
+        self._background_hook = background_hook
         self._lock = threading.Lock()
         self._closed = False
 
     @classmethod
-    def open(cls, settings: MemorySettings, *, request_timeout: float = 30.0) -> SharedMemory:
+    def open(
+        cls,
+        settings: MemorySettings,
+        *,
+        request_timeout: float = 30.0,
+        background_hook: Callable[[str], Callable[[], None]] | None = None,
+    ) -> SharedMemory:
         """Build a client from ``settings`` and connect it on a new loop.
 
         Blocks until the client is connected. ``request_timeout`` bounds the
         connect and closing the client. It is also the default
         ``request_timeout`` of each manager this object builds.
+
+        ``background_hook`` goes to every manager this object builds. It
+        is called with a short name when a deferred extraction or a
+        tool-call recording starts, and the function it returns runs once
+        when that task ends. Both run on the loop thread, so they must be
+        thread-safe and fast. See ``Neo4jSessionManager``.
 
         Raises:
             Exception: Connecting failed. The loop is stopped before the
@@ -80,7 +101,7 @@ class SharedMemory:
         except BaseException:
             bridge.close()
             raise
-        return cls(client, bridge, request_timeout)
+        return cls(client, bridge, request_timeout, background_hook)
 
     @property
     def client(self) -> MemoryClient:
@@ -96,8 +117,8 @@ class SharedMemory:
         """Return a manager for ``session_id`` on the shared client and loop.
 
         ``kwargs`` go to ``Neo4jSessionManager``. ``request_timeout``
-        defaults to this object's. Passing ``settings``, ``memory_client``
-        or ``bridge`` raises ``TypeError``.
+        defaults to this object's. Passing ``settings``, ``memory_client``,
+        ``bridge`` or ``background_hook`` raises ``TypeError``.
 
         Raises:
             RuntimeError: This object is closed.
@@ -106,7 +127,11 @@ class SharedMemory:
             raise RuntimeError("SharedMemory is closed")
         kwargs.setdefault("request_timeout", self._request_timeout)
         return Neo4jSessionManager(
-            session_id, memory_client=self._client, bridge=self._bridge, **kwargs
+            session_id,
+            memory_client=self._client,
+            bridge=self._bridge,
+            background_hook=self._background_hook,
+            **kwargs,
         )
 
     def _begin_close(self) -> bool:

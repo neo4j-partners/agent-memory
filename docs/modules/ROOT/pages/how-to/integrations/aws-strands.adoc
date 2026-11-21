@@ -115,6 +115,7 @@ anchor:_constructor_reference[]
 |`restore_limit` |`None` |Maximum messages restored into the agent. `None` uses the backend default; Bolt returns up to 1000.
 |`on_persist_error` |`"raise"` |What a failed memory write does. `"raise"` raises `SessionException` to the agent call. `"warn"` logs a warning, and the agent call goes on. In both modes the message stays queued. The next agent call retries it before it starts, ahead of any later message. A message is dropped if that retry fails too. At close, a message whose write already failed is dropped if it fails again. A dropped message gets an ERROR log that names its session, role, and position. So after a failed flush, only messages from the current turn stay queued. A failure at close leaves messages unwritten for good, so in both modes it is logged as an ERROR with their number. With `"raise"`, each agent call raises while the backend stays down. That stops when the backend recovers or the manager closes. Failures to restore history always raise.
 |`bridge` |`None` |The background loop to run memory I/O on. It needs `memory_client=`, connected on that loop or not connected. A manager given a bridge closes neither the bridge nor the client. `SharedMemory` passes it for you.
+|`background_hook` |`None` |Called with a short name, such as `"extract:<session_id>"`, when a deferred extraction or a tool-call recording starts. It returns a function that runs once when that task ends, whether it succeeded, failed, or was cancelled. Both run on the background thread, so they must be thread-safe and fast. An error from either is logged as a warning and never fails a write. `SharedMemory` passes its own.
 |===
 
 `Neo4jSessionManager.for_nams(session_id, **kwargs)` builds a manager for the hosted service from `MEMORY_API_KEY` and optional `MEMORY_ENDPOINT`; `Neo4jMemoryStore.for_nams(config)` does the same for a store. The Bolt program above uses settings instead.
@@ -164,6 +165,21 @@ await shared.aclose()
 ----
 
 `session_manager()` passes its keyword arguments to `Neo4jSessionManager`. Its `request_timeout` defaults to the one given to `open()`. A manager's `close()` or `aclose()` writes its own messages and returns. It leaves the client connected and the loop running for the other sessions. `SharedMemory.aclose()` or `close()` first waits for the tasks still running on the loop, such as deferred extractions. Its `timeout` argument bounds that wait. It defaults to 30 seconds and must be positive. It then closes the client and stops the loop, which cancels the tasks still running. A warning gives their number. A second call does nothing. Close every manager first, because closing the loop cancels a write still running.
+
+A host that stops idle sessions needs to know about work that outlives the agent call. Deferred extraction is one example. Pass `background_hook` to `open()`, and every manager reports its background tasks to it. On Amazon Bedrock AgentCore Runtime, `BedrockAgentCoreApp` tracks them, so the session reports busy until they end:
+
+[source,python]
+----
+def track(name: str):
+    task_id = app.add_async_task(name)
+    return lambda: app.complete_async_task(task_id)
+
+
+shared = SharedMemory.open(settings, background_hook=track)
+manager = shared.session_manager(session_id, defer_extraction=True)
+----
+
+The hook and the function it returns run on the background thread. Keep them thread-safe and fast. A manager built by `SharedMemory` takes its hook, so passing `background_hook` to `session_manager()` raises `TypeError`.
 
 === Inject retrieved context per turn
 
