@@ -540,3 +540,15 @@ class FakeAgent:
         self.memory_manager = memory_manager
         self.messages: list[Any] = []
         self.state: dict[str, Any] = {}
+
+
+def turn_ended(agent: Any = None, stop_reason: str | None = "end_turn") -> Any:
+    """An AfterInvocationEvent stand-in for a turn that ended this way.
+
+    ``stop_reason=None`` is a call that raised or was cancelled, which
+    Strands reports with no result.
+    """
+    from types import SimpleNamespace
+
+    result = None if stop_reason is None else SimpleNamespace(stop_reason=stop_reason)
+    return SimpleNamespace(agent=agent, result=result)

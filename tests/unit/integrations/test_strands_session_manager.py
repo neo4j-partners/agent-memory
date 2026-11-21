@@ -483,7 +483,9 @@ class TestInitialize:
 
 
 class TestAppendAndBuffer:
-    def test_append_buffers_and_the_message_hook_writes_older_messages(self) -> None:
+    def test_append_buffers_until_the_turn_ends(self) -> None:
+        from tests.unit.integrations.strands_fakes import turn_ended
+
         manager, client = _make_manager()
         try:
             agent = _fake_agent()
@@ -493,9 +495,11 @@ class TestAppendAndBuffer:
             manager.append_message({"role": "assistant", "content": [{"text": "two"}]}, agent)
             assert client.short_term.add_message_calls == []  # buffered, not stored
 
-            # The MessageAddedEvent hook writes all but the latest message.
-            asyncio.run(manager._on_message_flush(SimpleNamespace(agent=agent)))
-            assert [c["content"] for c in client.short_term.add_message_calls] == ["one"]
+            asyncio.run(manager._on_after_invocation(turn_ended(agent)))
+            assert [c["content"] for c in client.short_term.add_message_calls] == [
+                "one",
+                "two",
+            ]
         finally:
             manager.close()
 
@@ -965,7 +969,9 @@ class TestRetrievalInjection:
 
 class TestRegisterHooks:
     def test_registers_flush_after_base_hooks(self) -> None:
-        from strands.hooks import AfterInvocationEvent
+        from strands.hooks import AfterInvocationEvent, BeforeInvocationEvent
+
+        from tests.unit.integrations.strands_fakes import turn_ended
 
         manager, client = _make_manager()
         try:
@@ -973,12 +979,13 @@ class TestRegisterHooks:
             manager.register_hooks(registry)
             event_types = [et for et, _ in registry.callbacks]
             assert AfterInvocationEvent in event_types
+            assert BeforeInvocationEvent in event_types
             # Our flush callback is the LAST AfterInvocationEvent registration.
             flush_cb = [cb for et, cb in registry.callbacks if et is AfterInvocationEvent][-1]
             agent = _fake_agent()
             manager.initialize(agent)
             manager.append_message({"role": "user", "content": [{"text": "x"}]}, agent)
-            asyncio.run(flush_cb(SimpleNamespace(agent=agent)))
+            asyncio.run(flush_cb(turn_ended(agent)))
             assert [c["content"] for c in client.short_term.add_message_calls] == ["x"]
         finally:
             manager.close()

@@ -83,7 +83,7 @@ anchor:_performance_tips[]
 anchor:_reduce_latency[]
 anchor:_reduce_costs[]
 
-Confirm account/region/model access separately from authentication. `BedrockModel` accepts a deployment-specific model ID; aliases do not authorize it. Use a database whose vector dimensions match Titan V2's 1024 dimensions. Close the session manager to flush its buffered final message, and retain the state file when restarting. Remove the dedicated example database and local `strands-tutorial-session.txt` only when inspection is complete.
+Confirm account/region/model access separately from authentication. `BedrockModel` accepts a deployment-specific model ID; aliases do not authorize it. Use a database whose vector dimensions match Titan V2's 1024 dimensions. Close the session manager to write any messages still queued, and retain the state file when restarting. Remove the dedicated example database and local `strands-tutorial-session.txt` only when inspection is complete.
 
 == Choose retrieval and sharing behavior
 
@@ -112,7 +112,7 @@ anchor:_constructor_reference[]
 |`record_tool_calls` |`False` |Records observed tool-use blocks in reasoning memory for audit.
 |`request_timeout` |`30.0` |Seconds to wait for each backend call. Writing a message takes up to three calls: the write, its entity extraction, and its tool-call record. A write that times out is a failed write, handled by `on_persist_error`. It keeps running, and the retry takes its result instead of writing again, so the message is stored once. A hook waits as long as its batch of writes can take. If that wait runs out, the writes go on in the background, and a warning is logged.
 |`restore_limit` |`None` |Maximum messages restored into the agent. `None` uses the backend default; Bolt returns up to 1000.
-|`on_persist_error` |`"raise"` |What a failed memory write does. `"raise"` raises `SessionException` to the agent call. `"warn"` logs a warning, and the agent call goes on. In both modes the message stays queued, and the next flush retries it before any later message. Failures in the turn that queued the message do not count. A message queued in an earlier turn is dropped if its write fails. At close, a message whose write already failed is dropped if it fails again. A dropped message gets an ERROR log that names its session, role, and position. So after a failed flush, only messages from the current turn stay queued. A failure at close leaves messages unwritten for good, so in both modes it is logged as an ERROR with their number. Failures to restore history always raise.
+|`on_persist_error` |`"raise"` |What a failed memory write does. `"raise"` raises `SessionException` to the agent call. `"warn"` logs a warning, and the agent call goes on. In both modes the message stays queued. The next agent call retries it before it starts, ahead of any later message. A message is dropped if that retry fails too. At close, a message whose write already failed is dropped if it fails again. A dropped message gets an ERROR log that names its session, role, and position. So after a failed flush, only messages from the current turn stay queued. A failure at close leaves messages unwritten for good, so in both modes it is logged as an ERROR with their number. Failures to restore history always raise.
 |===
 
 `Neo4jSessionManager.for_nams(session_id, **kwargs)` builds a manager for the hosted service from `MEMORY_API_KEY` and optional `MEMORY_ENDPOINT`; `Neo4jMemoryStore.for_nams(config)` does the same for a store. The Bolt program above uses settings instead.
@@ -259,7 +259,8 @@ Await writes, check the applicable extraction lifecycle, and apply workspace/dat
 * Restored history alternates roles and starts with a user message. Consecutive assistant messages are merged, and leading assistant messages are dropped. User messages that never got a reply are left out, with a warning. This covers an earlier prompt in a run of user messages and a final user message. Stored messages are not changed.
 * Pass `settings=` or an unconnected `memory_client=`. A client already connected on another event loop cannot be driven from the manager's background loop.
 * Guardrail redaction rewrites the latest message before it is stored. A redaction that lands while the message is being written is applied once the write finishes. After the message is stored, Bolt deletes it and re-adds the redacted message at the end of the history. NAMS cannot redact a stored message, so it logs a warning. A redaction that fails on a stored message is logged as an ERROR.
-* Hooks for `AfterInvocationEvent` registered after the session manager run before the final turn is stored; read persisted state on the next turn.
+* The session manager writes a turn's messages when the agent call returns a result. A call that raises or is cancelled stores none of its messages, and an INFO log gives their number. A turn paused by an interrupt is written when the call that resumes it returns. A process that stops mid-turn loses that turn.
+* Hooks for `AfterInvocationEvent` registered after the session manager run before the turn is stored; read persisted state on the next turn.
 
 == See also
 

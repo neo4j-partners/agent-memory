@@ -36,6 +36,7 @@ from neo4j_agent_memory.integrations.strands._retrieval import (
 try:
     from strands.hooks import (
         AfterInvocationEvent,
+        BeforeInvocationEvent,
         HookRegistry,
         MessageAddedEvent,
     )
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from strands import Agent
+    from strands.agent import AgentResult
     from strands.types.content import Message as StrandsMessage
     from strands.types.tools import ToolUse
 
@@ -73,6 +75,10 @@ _COEXISTENCE_HINT = (
 __all__ = ["Neo4jRetrievalConfig", "Neo4jSessionManager"]
 
 _PERSIST_ERROR_POLICIES = ("raise", "warn")
+
+#: Where the agent is in its turn. "running" lasts from BeforeInvocationEvent
+#: to AfterInvocationEvent. "paused" is a turn stopped by an interrupt.
+_TurnState = Literal["idle", "running", "paused"]
 
 
 @dataclass(slots=True)
@@ -139,22 +145,30 @@ class Neo4jSessionManager(SessionManager):
     the "shared brain" pattern this manager is built for is N independent
     ``Agent`` instances, each with its own manager, over one graph.
 
+    Messages are written a turn at a time. A turn runs from Strands'
+    ``BeforeInvocationEvent`` to its ``AfterInvocationEvent``, and its
+    messages stay buffered until it ends. A turn that succeeds is written
+    in order. A turn that raises or is cancelled is discarded with an INFO
+    log, so the graph never holds a prompt without its reply. An interrupt
+    pauses the turn until the call that resumes it. Messages appended
+    outside an agent call are written by the next hook or by close. A
+    process that stops in the middle of a turn loses that turn.
+
     ``on_persist_error`` sets what a failed memory write does. In both
-    modes the failed message stays at the head of the write queue, and
-    the next flush retries it before any later message. A turn flushes
-    several times, so failures in the turn that queued the message do not
-    count. A message queued in an earlier turn is dropped if its write
-    fails. At close, a message whose write already failed once is dropped
-    if it fails again. A dropped message gets an ERROR log that names it
-    by session, role, and position, and the later messages are written.
-    So after a failed flush, only messages from the current turn stay
-    queued. A failure at close leaves messages unwritten for good, so it
-    is logged as an ERROR with their number in both modes. With
-    ``"raise"`` (the default) each failure
-    raises ``SessionException`` to the caller, which fails the agent call
-    when it happens in a hook. With ``"warn"`` each failure is logged and
-    the agent call goes on. Failures to restore history always raise, and
-    failures to retrieve context are always warnings.
+    modes the failed message stays at the head of the write queue, and the
+    next flush retries it before any later message. The next flush runs at
+    the start of the next agent call, or at close. A message queued in an
+    earlier turn is dropped if its write fails. At close, a message whose
+    write already failed once is dropped if it fails again. A dropped
+    message gets an ERROR log that names it by session, role, and
+    position, and the later messages are written. So after a failed flush,
+    only messages from the current turn stay queued. A failure at close
+    leaves messages unwritten for good, so it is logged as an ERROR with
+    their number in both modes. With ``"raise"`` (the default) each
+    failure raises ``SessionException`` to the caller, which fails the
+    agent call when it happens in a hook. With ``"warn"`` each failure is
+    logged and the agent call goes on. Failures to restore history always
+    raise, and failures to retrieve context are always warnings.
     """
 
     def __init__(
@@ -200,10 +214,11 @@ class Neo4jSessionManager(SessionManager):
             assert memory_client is not None  # guaranteed by the XOR check above
             self._client = memory_client
         self._conversation_key: str | None = None
-        self._pending: StrandsMessage | None = None  # latest message, still redactable
-        self._ready: deque[_Queued] = deque()  # older messages waiting for a hook to write
-        # _pending and _ready are read and changed on the agent's thread and
-        # on the bridge thread, so every access holds this lock.
+        self._turn: list[StrandsMessage] = []  # the current turn, written when it succeeds
+        self._turn_state: _TurnState = "idle"
+        self._ready: deque[_Queued] = deque()  # messages waiting for a hook to write
+        # _turn, _turn_state and _ready are read and changed on the agent's
+        # thread and on the bridge thread, so every access holds this lock.
         self._queue_lock = threading.Lock()
         self._drain_lock: asyncio.Lock | None = None  # bridge loop only; one drain at a time
         self._redact_lock: asyncio.Lock | None = None  # bridge loop only; one redaction at a time
@@ -409,21 +424,26 @@ class Neo4jSessionManager(SessionManager):
                 self.append_message(message, agent)
             if preloaded:
                 # aopen() promised no I/O here; the first hook writes these.
-                self._release_pending()
+                self._release_turn()
             else:
                 self._flush_buffer()
 
     def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
-        """Wire base persistence hooks, then our flush + injection hooks.
+        """Wire base persistence hooks, then our turn and injection hooks.
 
         Our hooks are coroutines. Strands awaits them on the agent's loop,
         and they await memory I/O on the bridge loop, so the agent's loop
         keeps running other tasks meanwhile.
 
+        ``BeforeInvocationEvent`` opens a turn, and ``AfterInvocationEvent``
+        ends it. The base class buffers each message in the turn from its
+        ``MessageAddedEvent`` hook (``append_message``). The turn's messages
+        are written only when the turn succeeds.
+
         Order matters: Strands fires ``MessageAddedEvent`` callbacks in
         registration order, so buffering (base ``MessageAddedEvent`` ->
-        append_message) always runs before the write of older messages and
-        before context injection.
+        append_message) copies a user message before context injection
+        changes it.
         AfterInvocationEvent dispatches in reverse registration order, so our
         flush runs before the base no-op sync_agent. That same reverse ordering
         means any user hooks registered after this manager run BEFORE our flush,
@@ -440,24 +460,56 @@ class Neo4jSessionManager(SessionManager):
         or ``SDK_LAST`` can still straddle our flush.
         """
         super().register_hooks(registry, **kwargs)
+        registry.add_callback(BeforeInvocationEvent, self._on_before_invocation)
         registry.add_callback(AfterInvocationEvent, self._on_after_invocation)
-        registry.add_callback(MessageAddedEvent, self._on_message_flush)
         if self._retrieval_config is not None:
             registry.add_callback(MessageAddedEvent, self._on_message_added)
 
+    async def _on_before_invocation(self, event: BeforeInvocationEvent) -> None:
+        """Open a turn, first writing what earlier turns left queued.
+
+        Messages appended outside an agent call, such as a direct tool
+        call, are written here as their own batch. A call that resumes a
+        turn paused by an interrupt keeps that turn's messages buffered.
+        A message whose write failed in an earlier turn is retried here,
+        before the turn adds its own.
+        """
+        self._check_open()
+        with self._queue_lock:
+            if self._turn_state != "paused":
+                self._release_turn_locked()
+        await self._aflush_ready()
+        with self._queue_lock:
+            self._turn_state = "running"
+
     async def _on_after_invocation(self, event: AfterInvocationEvent) -> None:
-        """Write the rest of the turn.
+        """End the turn, and write it if it succeeded.
+
+        A result with stop reason ``"interrupt"`` pauses the turn. Its
+        messages stay buffered for the call that resumes it. Any other
+        result means the turn succeeded, so its messages are written in
+        order. No result means the agent call raised or a hook cancelled
+        it. The turn's messages are then discarded with an INFO log, so a
+        failed turn never stores a prompt without its reply. Strands owns
+        ``agent.messages``, so this leaves it alone.
 
         Strands fires this from its ``finally``, so it also runs when a
         caller abandons a stream and the generator is finalized after
-        ``aclose()``. With nothing buffered there is nothing to lose, so a
-        closed manager returns quietly. When messages would be lost,
+        ``aclose()``. With nothing left to write there is nothing to lose,
+        so a closed manager returns quietly. When messages would be lost,
         ``"raise"`` raises SessionException. ``"warn"`` logs one ERROR with
         their number, as for any other write that fails at close.
         """
+        if discarded := self._end_turn(event.result):
+            logger.info(
+                "Session %r: the agent call ended without a result, so its "
+                "turn's %d message(s) were not written.",
+                self.session_id,
+                discarded,
+            )
         if self._closed:
             with self._queue_lock:
-                unwritten = int(self._pending is not None) + len(self._ready)
+                unwritten = len(self._ready) + len(self._turn)
             if not unwritten:
                 return
             if self._on_persist_error == "raise":
@@ -469,14 +521,26 @@ class Neo4jSessionManager(SessionManager):
             )
             return
         try:
-            await self._aflush_buffer()
+            await self._aflush_ready()
         finally:
             self._turns_ended += 1  # messages queued before now are dropped if they fail
 
-    async def _on_message_flush(self, event: MessageAddedEvent) -> None:
-        """Write the messages ``append_message`` moved out of the slot."""
-        self._check_open()
-        await self._aflush_ready()
+    def _end_turn(self, result: AgentResult | None) -> int:
+        """Queue, keep, or discard the turn by its result.
+
+        Returns how many messages were discarded.
+        """
+        with self._queue_lock:
+            if result is not None and result.stop_reason == "interrupt":
+                self._turn_state = "paused"
+                return 0
+            self._turn_state = "idle"
+            if result is not None:
+                self._release_turn_locked()
+                return 0
+            discarded = len(self._turn)
+            self._turn.clear()
+            return discarded
 
     async def _on_message_added(self, event: MessageAddedEvent) -> None:
         await self._inject_context(event.message)
@@ -519,36 +583,57 @@ class Neo4jSessionManager(SessionManager):
             target["text"] = f"{block}\n{target['text']}"
 
     def append_message(self, message: StrandsMessage, agent: Agent, **kwargs: Any) -> None:
-        """Buffer the new message. Does no I/O.
+        """Buffer the new message in the current turn. Does no I/O.
 
-        The latest message waits in a one-slot buffer so guardrail
-        redaction can rewrite it before it ever reaches the backend (NAMS
-        has no message update/delete endpoint). The message it replaces
-        moves to the ready queue, which the next hook writes.
+        The turn's messages wait until the turn ends. Guardrail redaction
+        can then rewrite a message before it ever reaches the backend. NAMS
+        has no endpoint to update or delete a message. A turn that fails
+        stores none of its messages. See ``_on_after_invocation``.
         """
         self._check_open()
         latest = copy.deepcopy(message)
         with self._queue_lock:
-            self._release_pending_locked()
-            self._pending = latest
+            self._turn.append(latest)
 
-    def _release_pending(self) -> None:
-        """Move the slot's message to the ready queue."""
+    def _release_turn(self) -> None:
+        """Move the buffered messages to the ready queue."""
         with self._queue_lock:
-            self._release_pending_locked()
+            self._release_turn_locked()
 
-    def _release_pending_locked(self) -> None:
-        if self._pending is not None:
-            self._ready.append(_Queued(self._pending, self._turns_ended))
-            self._pending = None
+    def _release_turn_locked(self) -> None:
+        self._ready.extend(_Queued(message, self._turns_ended) for message in self._turn)
+        self._turn.clear()
+
+    def _release_idle_turn(self, *, closing: bool) -> None:
+        """Move messages appended outside an agent call to the ready queue.
+
+        A turn that is running or paused is left buffered, since only its
+        end decides whether it is written. A close during a paused turn
+        leaves that turn unwritten for good, so it logs a warning. A turn
+        still running when the manager closes is reported by its
+        after-invocation hook.
+        """
+        with self._queue_lock:
+            state = self._turn_state
+            if state == "idle":
+                self._release_turn_locked()
+                return
+            unfinished = len(self._turn)
+        if closing and state == "paused" and unfinished:
+            logger.warning(
+                "Closing session %r while its turn waits on an interrupt. "
+                "The turn's %d message(s) are not written.",
+                self.session_id,
+                unfinished,
+            )
 
     def redact_latest_message(
         self, redact_message: StrandsMessage, agent: Agent, **kwargs: Any
     ) -> None:
         """Replace the latest message with redacted content.
 
-        Normal path: the latest message is still queued, so the queue is
-        rewritten and the original never reaches the backend. A message
+        Normal path: the latest message is still buffered or queued, so it
+        is rewritten there and the original never reaches the backend. A message
         stays queued while its write runs, so a redaction that lands then
         also rewrites the queue, and the drain applies it once the write
         finishes. Late path: the message is already stored. The Strands
@@ -558,8 +643,8 @@ class Neo4jSessionManager(SessionManager):
         self._check_open()
         redacted = copy.deepcopy(redact_message)
         with self._queue_lock:
-            if self._pending is not None:
-                self._pending = redacted
+            if self._turn:
+                self._turn[-1] = redacted
                 return
             if self._ready:
                 self._ready[-1].message = redacted
@@ -645,14 +730,17 @@ class Neo4jSessionManager(SessionManager):
         return None
 
     def _flush_buffer(self, *, closing: bool = False) -> None:
-        """Persist every buffered message, blocking until done.
+        """Persist every queued message, blocking until done.
 
-        For ``close()`` and other sync callers. Hooks await
+        Messages buffered outside a turn are queued first. A turn that is
+        running or paused stays buffered. See ``_release_idle_turn``.
+
+        For ``close()`` and other sync callers. ``aclose()`` awaits
         ``_aflush_buffer`` instead. A failure is handled by
         ``on_persist_error`` (see ``_wait_failed``). ``closing`` is True
         only for the flush of ``close()`` itself.
         """
-        self._release_pending()
+        self._release_idle_turn(closing=closing)
         future: concurrent.futures.Future[None] | None = None
         try:
             future = self._submit_drain()
@@ -662,12 +750,12 @@ class Neo4jSessionManager(SessionManager):
             self._wait_failed(future, e, closing=closing)
 
     async def _aflush_buffer(self, *, closing: bool = False) -> None:
-        """Persist every buffered message without blocking the caller's loop."""
-        self._release_pending()
+        """Like ``_flush_buffer``, without blocking the caller's loop."""
+        self._release_idle_turn(closing=closing)
         await self._aflush_ready(closing=closing)
 
     async def _aflush_ready(self, *, closing: bool = False) -> None:
-        """Persist the ready queue in order, leaving the latest message buffered.
+        """Persist the ready queue in order, leaving the current turn buffered.
 
         The writes run on the bridge and are shielded: cancelling the
         caller stops only the wait. The writes run to completion, and

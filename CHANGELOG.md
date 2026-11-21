@@ -37,10 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Neo4jSessionManager(on_persist_error=...)`. With `"raise"`, the
   default, a failed memory write raises `SessionException` as before.
   With `"warn"`, it logs a warning and the agent call goes on. In both
-  modes the failed message stays queued, and the next flush retries it.
-  Failures in the turn that queued the message do not count. A message
-  queued in an earlier turn is dropped if its write fails. At close, a
-  message whose write already failed is dropped if it fails again. A
+  modes the failed message stays queued. The next agent call retries it
+  before it starts, ahead of any later message. A message is dropped if
+  that retry fails too. At close, a message whose write already failed
+  is dropped if it fails again. A
   dropped message gets an ERROR log that names its session, role, and
   position, and the later messages are written. After a failed flush,
   only messages from the current turn stay queued. A failure at close
@@ -101,7 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Neo4jSessionManager` no longer blocks the agent's event loop. Its
   Strands hooks are now coroutines that await memory I/O on the manager's
   background loop. A slow write no longer stalls other sessions that share
-  the loop. `append_message` now only buffers, and the next hook writes.
+  the loop. `append_message` now only buffers, and a later hook writes.
 - `Neo4jSessionManager` memory writes now run to completion. Cancelling
   the agent call stops only the wait, so a turn is no longer cut off
   mid-write. `request_timeout` bounds each backend call of a write. A
@@ -143,6 +143,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Behavior change:** `Neo4jSessionManager` now writes a turn's messages
+  in order when the agent call returns a result. Earlier releases wrote
+  each message once the next one arrived. An agent call that raises or
+  is cancelled now stores none of its messages, so the backend never
+  holds a prompt without its reply. An INFO log gives the number of
+  messages discarded. A turn paused by an interrupt stays buffered, and
+  the call that resumes it writes the whole turn. Messages appended
+  outside an agent call are written when the next call starts, or at
+  close. A process that stops mid-turn loses that turn.
 - **Behavior change:** LLM extraction, summarization, and every provider
   adapter now send no temperature by default, so each model uses its own
   default. Earlier releases sent `temperature=0.0`. Pass `temperature=0.0`

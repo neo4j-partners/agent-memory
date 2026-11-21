@@ -26,7 +26,7 @@ from strands.types.exceptions import SessionException  # noqa: E402
 from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E402
     Neo4jSessionManager,
 )
-from tests.unit.integrations.strands_fakes import FakeMemoryClient  # noqa: E402
+from tests.unit.integrations.strands_fakes import FakeMemoryClient, turn_ended  # noqa: E402
 from tests.unit.integrations.test_strands_nonblocking import (  # noqa: E402
     _agent,
     _buffered,
@@ -61,7 +61,7 @@ def _records(caplog: pytest.LogCaptureFixture, level: str) -> list[logging.LogRe
 
 async def _end_turn(manager: Neo4jSessionManager) -> None:
     """The end-of-turn flush, as Strands fires it after each agent call."""
-    await manager._on_after_invocation(SimpleNamespace(agent=None))
+    await manager._on_after_invocation(turn_ended(None))
 
 
 async def _expect_failure(work: Awaitable[None], mode: str) -> None:
@@ -208,7 +208,7 @@ class TestRetryBound:
         try:
             with caplog.at_level(logging.WARNING, logger=_LOGGER):
                 switch.down = True
-                for _ in range(3):  # message hooks flush several times per turn
+                for _ in range(3):  # flushes before the turn ends
                     await _expect_failure(manager._aflush_buffer(), mode)
                 await _expect_failure(_end_turn(manager), mode)
 
@@ -293,7 +293,6 @@ class TestRetryBound:
             for turn in range(5):
                 for role, text in (("user", f"u{turn}"), ("assistant", f"a{turn}")):
                     manager.append_message({"role": role, "content": [{"text": text}]}, agent)
-                await _expect_failure(manager._on_message_flush(None), mode)  # writes u
                 await _expect_failure(_end_turn(manager), mode)  # writes u, a
         dropped = [r.getMessage() for r in _records(caplog, "ERROR")]
         assert len(dropped) == 8  # u0 to a3, each dropped once

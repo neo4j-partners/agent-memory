@@ -33,7 +33,7 @@ from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E
     Neo4jRetrievalConfig,
     Neo4jSessionManager,
 )
-from tests.unit.integrations.strands_fakes import FakeMemoryClient  # noqa: E402
+from tests.unit.integrations.strands_fakes import FakeMemoryClient, turn_ended  # noqa: E402
 
 _TICK = 0.01
 _LOGGER = "neo4j_agent_memory.integrations.strands.session_manager"
@@ -496,7 +496,7 @@ class TestOneStoredCopyPerMessage:
             "sess-1", memory_client=client, request_timeout=0.2, on_persist_error="warn"
         )
         _buffered(manager, "one")
-        manager._release_pending()
+        manager._release_turn()
         await manager._aflush_ready()  # the wait runs out at 0.2 s
         await asyncio.sleep(0.3)  # the write replies at 0.4 s
         await manager._aflush_ready()  # takes that reply instead of writing again
@@ -508,7 +508,7 @@ class TestOneStoredCopyPerMessage:
         _stores_then(client, fail=True)
         manager = Neo4jSessionManager("sess-1", memory_client=client, on_persist_error="warn")
         _buffered(manager, "one")
-        manager._release_pending()
+        manager._release_turn()
         await manager._aflush_ready()  # fails after the message was stored
         await manager._aflush_ready()  # the retry carries the same id
         await manager.aclose()
@@ -525,7 +525,7 @@ class TestOneStoredCopyPerMessage:
         _stores_then(client, fail=True)
         manager = Neo4jSessionManager("sess-1", memory_client=client, on_persist_error="warn")
         agent = _buffered(manager, "my SSN is 123")
-        manager._release_pending()
+        manager._release_turn()
         await manager._aflush_ready()  # fails after the original was stored
         manager.redact_latest_message({"role": "user", "content": [{"text": "[SSN]"}]}, agent)
         await manager._aflush_ready()  # the retry carries the id the original took
@@ -554,7 +554,7 @@ class TestOneStoredCopyPerMessage:
             "sess-1", memory_client=client, on_persist_error="warn", extract_entities=False
         )
         agent = _buffered(manager, "my SSN is 123")
-        manager._release_pending()
+        manager._release_turn()
         await manager._aflush_ready()  # fails, and nothing is stored
         manager.redact_latest_message({"role": "user", "content": [{"text": "[SSN]"}]}, agent)
         await manager._aflush_ready()  # the retry stores the redacted text
@@ -583,7 +583,7 @@ class TestOneStoredCopyPerMessage:
             "sess-1", memory_client=client, on_persist_error="warn", extract_entities=False
         )
         agent = _buffered(manager, "my SSN is 123")
-        manager._release_pending()
+        manager._release_turn()
         await manager._aflush_ready()  # fails after the original was stored
         manager.redact_latest_message({"role": "user", "content": [{"text": "[SSN]"}]}, agent)
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
@@ -614,7 +614,7 @@ class TestOneStoredCopyPerMessage:
             extract_entities=False,
         )
         _buffered(manager, "one")
-        manager._release_pending()
+        manager._release_turn()
         await manager._aflush_ready()  # the wait runs out at 0.2 s
         await asyncio.sleep(0.3)  # the write replies at 0.4 s
         await manager._aflush_ready()  # takes that reply instead of writing again
@@ -642,7 +642,7 @@ class TestWritesRunToCompletion:
         manager = Neo4jSessionManager("sess-1", memory_client=client, request_timeout=0.5)
         _buffered(manager, "a", "b", "c", "d")
         try:
-            await manager._on_after_invocation(SimpleNamespace(agent=None))
+            await manager._on_after_invocation(turn_ended(None))
             assert _stored(client) == [("user", t) for t in "abcd"]
         finally:
             await manager.aclose()
@@ -651,9 +651,9 @@ class TestWritesRunToCompletion:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         # Each write takes 0.2 s, inside request_timeout. The hook waits
-        # 0.5 * (1 + 1) = 1.0 s for its one message. Seven more messages
-        # arrive while its drain runs, and the drain writes them too. So the
-        # drain needs 1.6 s, and the hook's wait runs out near 1.0 s.
+        # 0.5 * (1 + 1) = 1.0 s for its one message. Eight more messages
+        # join the queue while its drain runs, and the drain writes them too.
+        # So the drain needs 1.8 s, and the hook's wait runs out near 1.0 s.
         client = _slow_client(0.2)
         manager = Neo4jSessionManager(
             "sess-1", memory_client=client, request_timeout=0.5, extract_entities=False
@@ -662,12 +662,11 @@ class TestWritesRunToCompletion:
         texts = ["two", "three", "four", "five", "six", "seven", "eight", "nine"]
         try:
             with caplog.at_level(logging.WARNING, logger=_LOGGER):
-                hook = asyncio.create_task(
-                    manager._on_after_invocation(SimpleNamespace(agent=None))
-                )
+                hook = asyncio.create_task(manager._on_after_invocation(turn_ended(None)))
                 await asyncio.sleep(0.05)  # the drain is writing "one"
-                for text in texts:  # "two" to "eight" join the queue; "nine" stays buffered
+                for text in texts:
                     manager.append_message({"role": "user", "content": [{"text": text}]}, agent)
+                    manager._release_turn()
                 await hook  # no raise
             (warning,) = [r for r in caplog.records if r.name == _LOGGER]
             assert "sess-1" in warning.getMessage()
@@ -867,7 +866,7 @@ def _uses_tools(manager: Neo4jSessionManager, agent: SimpleNamespace, *names: st
     content: list[dict[str, Any]] = [{"text": "calling tools"}]
     content += [{"toolUse": {"toolUseId": n, "name": n, "input": {}}} for n in names]
     manager.append_message({"role": "assistant", "content": content}, agent)
-    manager._release_pending()
+    manager._release_turn()
 
 
 class TestToolMirroringOutlivesItsWait:
@@ -1030,11 +1029,11 @@ class TestDrainCoalescing:
         client = _slow_client(0.2)
         manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
         agent = _buffered(manager, "one")
-        manager._release_pending()
+        manager._release_turn()
         first = manager._submit_drain()
         await asyncio.sleep(0.05)  # the drain is writing "one"
         manager.append_message({"role": "user", "content": [{"text": "two"}]}, agent)
-        manager._release_pending()
+        manager._release_turn()
 
         assert manager._submit_drain() is first
         await asyncio.wrap_future(first)
@@ -1064,6 +1063,7 @@ class TestDrainCoalescing:
             "sess-1", memory_client=client, request_timeout=0.3, extract_entities=False
         )
         _buffered(manager, "one", "two")
+        manager._release_turn()
         manager._submit_drain()  # a hook's drain, writing "one"
         await asyncio.sleep(0.05)
         await (manager.aclose() if how == "aclose" else asyncio.to_thread(manager.close))
@@ -1096,6 +1096,7 @@ class TestDrainCoalescing:
             on_persist_error=mode,
         )
         _buffered(manager, "one", "two")
+        manager._release_turn()
         hook = asyncio.ensure_future(manager._aflush_ready())  # waits on the drain writing "one"
         await asyncio.sleep(0.05)
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
@@ -1110,11 +1111,11 @@ class TestDrainCoalescing:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
         agent = _buffered(manager, "one")
-        manager._release_pending()
+        manager._release_turn()
         first = manager._submit_drain()
         await asyncio.wrap_future(first)
         manager.append_message({"role": "user", "content": [{"text": "two"}]}, agent)
-        manager._release_pending()
+        manager._release_turn()
 
         second = manager._submit_drain()
         assert second is not None and second is not first
@@ -1127,7 +1128,7 @@ class TestDrainCoalescing:
     ) -> None:
         manager = Neo4jSessionManager("sess-1", memory_client=FakeMemoryClient())
         _buffered(manager, "one")
-        manager._release_pending()
+        manager._release_turn()
 
         def refuse(coro: Any) -> Any:
             coro.close()
@@ -1150,7 +1151,7 @@ class TestRedactionDuringAWrite:
         client = _slow_client(0.3)
         manager = Neo4jSessionManager("sess-1", memory_client=client)
         agent = _buffered(manager, "secret 123")
-        manager._release_pending()
+        manager._release_turn()
         drain = asyncio.wrap_future(manager._submit_drain())
         await asyncio.sleep(0.1)  # the write of "secret 123" is in flight
 
@@ -1181,7 +1182,7 @@ class TestRedactionDuringAWrite:
 
             client.short_term.add_message = lost_fails  # type: ignore[method-assign]
             manager.append_message({"role": "user", "content": [{"text": "lost"}]}, agent)
-        manager._release_pending()
+        manager._release_turn()
         await manager._aflush_ready()  # writes "kept"; a write of "lost" fails
         if latest == "dropped":
             manager._turns_ended += 1  # "lost" is now from an earlier turn
@@ -1202,7 +1203,7 @@ class TestRedactionDuringAWrite:
         client = _slow_client(0.3)
         manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
         agent = _buffered(manager, "secret 123")
-        manager._release_pending()
+        manager._release_turn()
         drain = asyncio.wrap_future(manager._submit_drain())
         await asyncio.sleep(0.1)  # the write of "secret 123" is in flight
         first = {"role": "user", "content": [{"text": "[REDACTED 1]"}]}
@@ -1258,7 +1259,7 @@ class TestRedactionDuringAWrite:
             )
 
         manager.append_message({"role": "user", "content": [{"text": "next"}]}, agent)
-        manager._release_pending()
+        manager._release_turn()
         drain = asyncio.wrap_future(manager._submit_drain())
         await asyncio.wait_for(drain, 1)  # it pops "next" under the released lock
         assert _contents(client) == ["secret 123", "next"]
@@ -1275,7 +1276,7 @@ class TestRedactionDuringAWrite:
         client.short_term.delete_message = delete_fails  # type: ignore[method-assign]
         manager = Neo4jSessionManager("sess-1", memory_client=client)
         agent = _buffered(manager, "secret 123")
-        manager._release_pending()
+        manager._release_turn()
         drain = asyncio.wrap_future(manager._submit_drain())
         await asyncio.sleep(0.1)
 
@@ -1349,7 +1350,7 @@ class TestRedactionThroughTheAgent:
 
 
 class TestHooksAfterClose:
-    @pytest.mark.parametrize("hook", ["_on_after_invocation", "_on_message_flush"])
+    @pytest.mark.parametrize("hook", ["_on_after_invocation", "_on_before_invocation"])
     async def test_hook_after_close_raises_session_exception(self, hook: str) -> None:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client)
@@ -1360,9 +1361,8 @@ class TestHooksAfterClose:
         with pytest.raises(SessionException):
             manager.close()  # the close-time write fails
 
-        event = SimpleNamespace(agent=agent, message={"role": "user", "content": []})
         with pytest.raises(SessionException, match="closed"):
-            await getattr(manager, hook)(event)
+            await getattr(manager, hook)(turn_ended(agent))
 
     async def test_after_invocation_in_warn_mode_logs_what_close_left_unwritten(
         self, caplog: pytest.LogCaptureFixture
@@ -1374,7 +1374,7 @@ class TestHooksAfterClose:
         with caplog.at_level(logging.ERROR, logger=_LOGGER):
             manager.close()  # the close-time write fails, so "x" stays queued
             caplog.clear()
-            await manager._on_after_invocation(SimpleNamespace(agent=agent))  # no raise
+            await manager._on_after_invocation(turn_ended(agent))  # no raise
 
         (error,) = [r for r in caplog.records if r.levelname == "ERROR"]
         assert "sess-1" in error.getMessage()
@@ -1391,7 +1391,7 @@ class TestHooksAfterClose:
         manager.append_message({"role": "user", "content": [{"text": "x"}]}, agent)
         await manager.aclose()  # writes "x"; nothing is left buffered
 
-        await manager._on_after_invocation(SimpleNamespace(agent=agent))
+        await manager._on_after_invocation(turn_ended(agent))
         assert _stored(client) == [("user", "x")]
 
     async def test_abandoned_stream_finalizes_cleanly_after_aclose(self) -> None:
@@ -1402,11 +1402,12 @@ class TestHooksAfterClose:
         async for _ in stream:
             if agent.messages:
                 break  # the caller walks away mid-turn
-        await manager.aclose()  # writes "hi"; nothing is left buffered
+        await manager.aclose()  # the turn is still running, so "hi" stays buffered
 
-        # Strands fires AfterInvocationEvent from the generator's finally.
+        # Strands fires AfterInvocationEvent from the generator's finally,
+        # with no result. The unfinished turn is discarded without an error.
         await stream.aclose()
-        assert _stored(client) == [("user", "hi")]
+        assert _stored(client) == []
 
     async def test_a_second_aclose_waits_for_the_first(self) -> None:
         client = _slow_client(0.2)
