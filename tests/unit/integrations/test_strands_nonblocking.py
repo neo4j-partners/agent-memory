@@ -562,6 +562,38 @@ class TestOneStoredCopyPerMessage:
         assert [c.json["content"] for c in wire.calls_for("add_message")] == ["[SSN]"]
         assert "Cannot redact" not in caplog.text
 
+    async def test_a_nams_retry_warns_that_the_failed_first_write_may_have_stored_the_original(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient(nams_mode=True)
+        wire = client.wire
+        original = wire.request
+        lost = False
+
+        async def request(spec: Any, **kwargs: Any) -> Any:
+            nonlocal lost
+            reply = await original(spec, **kwargs)  # the service has stored it
+            if spec.bridge_method == "add_message" and not lost:
+                lost = True
+                raise ConnectionError("reply lost after the commit")
+            return reply
+
+        wire.request = request  # type: ignore[method-assign]
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=client, on_persist_error="warn", extract_entities=False
+        )
+        agent = _buffered(manager, "my SSN is 123")
+        manager._release_pending()
+        await manager._aflush_ready()  # fails after the original was stored
+        manager.redact_latest_message({"role": "user", "content": [{"text": "[SSN]"}]}, agent)
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            await manager._aflush_ready()  # the retry stores the redacted text as a new message
+        await manager.aclose()
+
+        sent = [c.json["content"] for c in wire.calls_for("add_message")]
+        assert sent == ["my SSN is 123", "[SSN]"]
+        assert "may have stored the original text" in caplog.text
+
     async def test_a_nams_write_that_replies_late_is_stored_once(self) -> None:
         client = FakeMemoryClient(nams_mode=True)
         wire = client.wire
