@@ -142,6 +142,20 @@ class TestClosingSharedMemory:
         with pytest.raises(RuntimeError, match="closed"):
             shared.session_manager("sess-1")
 
+    def test_close_on_the_loop_thread_raises_and_stays_open(self, client: FakeMemoryClient) -> None:
+        shared = SharedMemory.open(_SETTINGS)
+
+        async def close_on_the_loop() -> None:
+            shared.close()
+
+        with pytest.raises(RuntimeError, match="loop thread"):
+            shared._bridge.run(close_on_the_loop())
+        assert not shared.closed
+        assert client.is_connected
+
+        shared.close()
+        assert client.close_calls == 1
+
     def test_a_failed_connect_stops_the_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = FakeMemoryClient()
 

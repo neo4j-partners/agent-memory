@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wait for the tasks still running on the loop, such as deferred
   extractions. The timeout must be positive. The tasks still running
   after it are cancelled, and a WARNING gives their number.
+  `close()` called on the loop thread raises `RuntimeError` and leaves
+  the object open.
 - `Neo4jSessionManager(bridge=...)`. The manager runs its memory I/O on
   that background loop and needs `memory_client=`. It closes neither the
   loop nor the client. Each manager keeps its own `request_timeout` on a

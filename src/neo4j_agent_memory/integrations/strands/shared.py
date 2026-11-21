@@ -167,8 +167,15 @@ class SharedMemory:
 
         Raises:
             ValueError: ``timeout`` is not positive. The object stays open.
+            RuntimeError: The caller runs on the loop thread, where waiting
+                for the loop's tasks would block them. The object stays
+                open.
         """
         _check_timeout(timeout)
+        if self._bridge.on_loop_thread:
+            raise RuntimeError(
+                "SharedMemory.close() cannot run on its loop thread. Call it from another thread."
+            )
         if not self._begin_close():
             return
         try:
