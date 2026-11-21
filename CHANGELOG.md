@@ -62,7 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run one at a time, in write order, and each is bounded by
   `request_timeout`. A failed extraction is logged as a WARNING, as
   before. A late redaction that deletes a message before its extraction
-  starts skips that extraction. The backlog of extractions has no cap.
+  starts skips that extraction. If that delete fails, the message stays
+  stored and is never extracted. The backlog of extractions has no cap.
   Extractions slower than the message rate let it grow for as long as
   the manager lives. A manager that owns its background loop
   waits for its extractions at close, as long as it waits for a drain.
