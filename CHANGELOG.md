@@ -18,9 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   held its own client, connection pool, and thread.
   `SharedMemory.aclose(timeout=30.0)` and `close(timeout=30.0)` first
   wait for the tasks still running on the loop, such as deferred
-  extractions. The timeout must be positive. The tasks still running
-  after it are cancelled, and a WARNING gives their number. They get up
-  to 5 seconds to unwind before the client closes.
+  extractions. The timeout must be a positive finite number. The tasks
+  still running after it are cancelled, and a WARNING gives their
+  number. They get up to 5 seconds to unwind before the client closes.
   `close()` called on the loop thread raises `RuntimeError` and leaves
   the object open.
   When `SharedMemory.open()` fails to connect, it closes the client and

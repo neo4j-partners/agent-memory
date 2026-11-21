@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -166,7 +167,8 @@ class SharedMemory:
         which bounds closing the client.
 
         Raises:
-            ValueError: ``timeout`` is not positive. The object stays open.
+            ValueError: ``timeout`` is not a positive finite number. The
+                object stays open.
             RuntimeError: The caller runs on the loop thread, where waiting
                 for the loop's tasks would block them. The object stays
                 open.
@@ -238,6 +240,10 @@ def _close_failed_client(client: MemoryClient, bridge: AsyncBridge, timeout: flo
 
 
 def _check_timeout(timeout: float) -> None:
-    """Raise ``ValueError`` unless ``timeout`` is a positive number of seconds."""
-    if not timeout > 0:
-        raise ValueError(f"timeout must be positive, not {timeout!r}.")
+    """Raise ``ValueError`` unless ``timeout`` is a positive finite number of seconds.
+
+    An infinite timeout would pass a plain positive check and then fail as
+    an ``OverflowError`` once the wait was already running.
+    """
+    if not (math.isfinite(timeout) and timeout > 0):
+        raise ValueError(f"timeout must be a positive finite number, not {timeout!r}.")
