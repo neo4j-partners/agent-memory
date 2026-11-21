@@ -756,6 +756,85 @@ def _contents(client: FakeMemoryClient) -> list[str]:
     return [m.content for c in client.short_term.conversations.values() for m in c.messages]
 
 
+def _commits_then_waits(target: Any, method: str, delay: float) -> None:
+    """Make the first ``method`` call on ``target`` commit, then reply late."""
+    original = getattr(target, method)
+    calls = 0
+
+    async def late(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        result = await original(*args, **kwargs)
+        if calls == 1:
+            await asyncio.sleep(delay)
+        return result
+
+    setattr(target, method, late)
+
+
+def _uses_tools(manager: Neo4jSessionManager, agent: SimpleNamespace, *names: str) -> None:
+    """Queue an assistant message that calls the tools ``names``."""
+    content: list[dict[str, Any]] = [{"text": "calling tools"}]
+    content += [{"toolUse": {"toolUseId": n, "name": n, "input": {}}} for n in names]
+    manager.append_message({"role": "assistant", "content": content}, agent)
+    manager._release_pending()
+
+
+class TestToolMirroringOutlivesItsWait:
+    """A wait that runs out never cuts tool-call mirroring short."""
+
+    async def test_a_trace_that_starts_late_is_started_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        _commits_then_waits(client.reasoning, "start_trace", 0.3)
+        manager = Neo4jSessionManager(
+            "sess-1",
+            memory_client=client,
+            request_timeout=0.2,
+            extract_entities=False,
+            record_tool_calls=True,
+        )
+        agent = _buffered(manager)
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            _uses_tools(manager, agent, "lookup")
+            await manager._aflush_ready()  # the wait runs out at 0.2 s
+        await asyncio.sleep(0.2)  # the trace start replies at 0.3 s
+        _uses_tools(manager, agent, "search")
+        await manager._aflush_ready()
+        await manager.aclose()
+
+        reasoning = client.reasoning
+        (trace,) = reasoning.traces
+        assert [(s["trace_id"], s["action"]) for s in reasoning.steps] == [
+            (trace["id"], "lookup"),
+            (trace["id"], "search"),
+        ]
+        assert len(reasoning.tool_calls) == 2
+        assert any("background" in r.getMessage() for r in caplog.records)
+
+    async def test_a_late_step_gets_its_tool_call_and_keeps_its_place(self) -> None:
+        client = FakeMemoryClient()
+        _commits_then_waits(client.reasoning, "add_step", 0.3)
+        manager = Neo4jSessionManager(
+            "sess-1",
+            memory_client=client,
+            request_timeout=0.2,
+            extract_entities=False,
+            record_tool_calls=True,
+        )
+        agent = _buffered(manager)
+        _uses_tools(manager, agent, "lookup", "fetch")
+        await manager._aflush_ready()  # the wait runs out while "lookup" replies
+        _uses_tools(manager, agent, "search")
+        await manager._aflush_ready()  # waits for "lookup" and "fetch" first
+        await manager.aclose()
+
+        reasoning = client.reasoning
+        assert [s["action"] for s in reasoning.steps] == ["lookup", "fetch", "search"]
+        assert [c["step_id"] for c in reasoning.tool_calls] == [s["id"] for s in reasoning.steps]
+
+
 class TestRedactionDuringAWrite:
     async def test_the_redacted_text_replaces_the_written_message(self) -> None:
         client = _slow_client(0.3)

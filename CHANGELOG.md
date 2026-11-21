@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Strands tool-call mirroring now completes when its wait runs out.
+  Before, the timeout cancelled it. A trace that had started was not
+  remembered, so the next message started a second trace. A step could
+  be left without its tool call. The recording now goes on in the
+  background, a warning says so, and later recordings wait for it, so
+  steps keep their order.
 - A late Strands redaction no longer rewrites an earlier message. When
   the latest message had no text, or its write failed and it was
   dropped, the redaction replaced the message stored before it.

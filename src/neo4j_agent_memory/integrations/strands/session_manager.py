@@ -200,6 +200,7 @@ class Neo4jSessionManager(SessionManager):
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
+        self._tool_record: asyncio.Task[None] | None = None  # latest mirroring; bridge loop only
         self._closed = False
         self._closing: concurrent.futures.Future[None] | None = None  # done when close ends
         self._warned_double_injection = False
@@ -791,9 +792,13 @@ class Neo4jSessionManager(SessionManager):
                         await asyncio.wait_for(
                             self._arecord_tool_uses(blocks), self._request_timeout
                         )
-                    except Exception as e:
+                    except TimeoutError:
                         logger.warning(
-                            "Failed to mirror tool calls to reasoning memory: %s", _describe(e)
+                            "Tool calls of session %r are still being mirrored to "
+                            "reasoning memory after %ss. The recording goes on in "
+                            "the background.",
+                            self.session_id,
+                            self._request_timeout,
                         )
         if dropped is not None:
             raise dropped
@@ -924,13 +929,40 @@ class Neo4jSessionManager(SessionManager):
             )
 
     async def _arecord_tool_uses(self, blocks: list[ToolUse]) -> None:
-        """Mirror toolUse blocks into reasoning memory. Runs on the bridge loop."""
-        key = await self._aresolve_key()
+        """Mirror toolUse blocks into reasoning memory. Runs on the bridge loop.
+
+        The recording runs as a shielded task, so a wait that runs out does
+        not cancel it. A started trace always has its id kept, so the next
+        message does not start a second trace. Every step gets its tool
+        call. Each recording waits for the one before it, so steps keep
+        their order. A failure is logged by the task and never raised.
+        """
+        previous = self._tool_record
+        task = asyncio.ensure_future(self._arecord_after(previous, blocks))
+        self._tool_record = task
+        await asyncio.shield(task)
+
+    async def _arecord_after(
+        self, previous: asyncio.Task[None] | None, blocks: list[ToolUse]
+    ) -> None:
+        """Wait for the ``previous`` recording, then record ``blocks``.
+
+        The error is logged here, since the waiter may have stopped waiting.
+        """
+        if previous is not None:
+            await asyncio.wait({previous})
+        try:
+            await self._arecord_blocks(blocks)
+        except Exception as e:
+            logger.warning("Failed to mirror tool calls to reasoning memory: %s", _describe(e))
+
+    async def _arecord_blocks(self, blocks: list[ToolUse]) -> None:
+        """Record each block as a step and its tool call, starting the trace once."""
         trace_id = self._trace_id
         if trace_id is None:
+            key = await self._aresolve_key()
             trace = await self._client.reasoning.start_trace(key, task="Strands agent session")
-            trace_id = trace.id
-            self._trace_id = trace_id
+            trace_id = self._trace_id = trace.id
         for block in blocks:
             name = block.get("name") or "unknown"
             step = await self._client.reasoning.add_step(
