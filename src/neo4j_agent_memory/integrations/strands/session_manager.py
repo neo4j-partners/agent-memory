@@ -514,14 +514,29 @@ class Neo4jSessionManager(SessionManager):
         turn paused by an interrupt keeps that turn's messages buffered.
         A message whose write failed in an earlier turn is retried here,
         before the turn adds its own.
+
+        A turn still running means another call has not ended. That is a
+        concurrent call, or a call whose BeforeInvocationEvent hook raised,
+        so no AfterInvocationEvent fired. Its messages stay buffered with
+        a warning, and they are written when this call's turn is.
         """
         self._check_open()
         with self._queue_lock:
-            if self._turn_state == "paused":
-                self._resume_from = len(self._turn)
-            else:
+            state = self._turn_state
+            if state == "idle":
                 self._release_turn_locked()
                 self._resume_from = None
+            elif state == "paused":
+                self._resume_from = len(self._turn)
+            open_turn = len(self._turn)
+        if state == "running":
+            logger.warning(
+                "Session %r: an agent call started before the previous call's "
+                "turn ended. The open turn's %d message(s) stay buffered and "
+                "are written with this call's turn.",
+                self.session_id,
+                open_turn,
+            )
         await self._aflush_ready()
         with self._queue_lock:
             self._turn_state = "running"

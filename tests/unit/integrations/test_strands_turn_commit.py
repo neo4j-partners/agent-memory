@@ -91,6 +91,10 @@ def _deny(event: BeforeInvocationEvent) -> None:
     event.cancel = "denied"
 
 
+def _crash(event: BeforeInvocationEvent) -> None:
+    raise RuntimeError("hook failed")
+
+
 _FULL_APPROVAL_TURN = [
     ("user", "delete the file"),
     ("assistant", "Asking for approval."),
@@ -322,6 +326,27 @@ class TestAnInterruptedTurn:
             await manager.aclose()
         assert _stored(client) == _FULL_APPROVAL_TURN
 
+    async def test_a_resume_after_a_failed_before_hook_writes_the_whole_turn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _approval_agent(manager)
+        try:
+            paused = await agent.invoke_async("delete the file")
+            agent.hooks.add_callback(BeforeInvocationEvent, _once(_crash))
+            with pytest.raises(RuntimeError, match="hook failed"):
+                await agent.invoke_async(_answer(paused))  # no AfterInvocationEvent fires
+
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await agent.invoke_async(_answer(paused))
+        finally:
+            await manager.aclose()
+
+        assert _stored(client) == _FULL_APPROVAL_TURN
+        (warning,) = _records(caplog, "WARNING")
+        assert "2 message" in warning
+
     @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
     async def test_closing_during_an_interrupt_warns_and_writes_nothing(
         self, use_async: bool, caplog: pytest.LogCaptureFixture
@@ -343,6 +368,31 @@ class TestAnInterruptedTurn:
         (warning,) = _records(caplog, "WARNING")
         assert "sess-1" in warning
         assert "interrupt" in warning
+        assert "1 message" in warning
+
+
+class TestACallThatStartsWhileATurnRuns:
+    async def test_it_warns_and_keeps_the_open_turn_buffered(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _buffered(manager)
+        try:
+            await manager._on_before_invocation(turn_ended(agent))
+            manager.append_message({"role": "user", "content": [{"text": "Q1"}]}, agent)
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await manager._on_before_invocation(turn_ended(agent))
+            assert _stored(client) == []
+
+            manager.append_message({"role": "user", "content": [{"text": "Q2"}]}, agent)
+            await manager._on_after_invocation(turn_ended(agent))
+        finally:
+            await manager.aclose()
+
+        assert _stored(client) == [("user", "Q1"), ("user", "Q2")]
+        (warning,) = _records(caplog, "WARNING")
+        assert "sess-1" in warning
         assert "1 message" in warning
 
 
