@@ -104,16 +104,17 @@ class SharedMemory:
 
         bridge = AsyncBridge(timeout=request_timeout)
         client = MemoryClient(settings)
+        connection = _Connection(client)
         future: concurrent.futures.Future[None] | None = None
         try:
-            future = bridge.submit(_connect(client, request_timeout))
-            # _connect bounds itself. The outer bound adds the unwind and
+            future = bridge.submit(connection.connect(request_timeout))
+            # connect bounds itself. The outer bound adds the unwind and
             # one request_timeout to cover scheduling, as close does.
             future.result(timeout=2 * request_timeout + _UNWIND_SECONDS)
         except BaseException:
             if future is not None:
-                future.cancel()  # so the connect stops before the client closes
-            _close_failed_client(client, bridge, request_timeout)
+                future.cancel()  # a connect that has not started never starts
+            _close_failed_client(connection, bridge, request_timeout)
             raise
         return cls(client, bridge, request_timeout, background_hook)
 
@@ -249,37 +250,55 @@ class SharedMemory:
         return timeout + _UNWIND_SECONDS + self._request_timeout
 
 
-async def _connect(client: MemoryClient, timeout: float) -> None:
-    """Connect ``client`` within ``timeout`` seconds. Runs on the loop.
+class _Connection:
+    """The connect ``SharedMemory.open`` runs, and the close after it fails.
 
-    A connect that runs out of time is cancelled and gets
-    ``_UNWIND_SECONDS`` to unwind, so it ends before the client closes.
-    When ``_connect`` itself is cancelled, the connect is cancelled the
-    same way.
+    Both run on the loop. ``stop_and_close`` stops a connect still running
+    before it closes the client, in one coroutine, so the connect has
+    ended before the close starts.
     """
-    task = asyncio.ensure_future(client.connect())
-    timed_out = False
-    try:
-        done, _ = await asyncio.wait({task}, timeout=timeout)
-        timed_out = not done
-    finally:
-        if not task.done():
+
+    def __init__(self, client: MemoryClient) -> None:
+        self._client = client
+        self._task: asyncio.Task[None] | None = None
+
+    async def connect(self, timeout: float) -> None:
+        """Connect the client within ``timeout`` seconds.
+
+        A connect that runs out of time, or whose wait is cancelled, keeps
+        running until ``stop_and_close`` stops it.
+
+        Raises:
+            TimeoutError: Connecting took longer than ``timeout``.
+        """
+        self._task = asyncio.ensure_future(self._client.connect())
+        done, _ = await asyncio.wait({self._task}, timeout=timeout)
+        if not done:
+            raise TimeoutError(f"Connecting the memory client took longer than {timeout}s.")
+        self._task.result()
+
+    async def stop_and_close(self) -> None:
+        """Stop a connect still running, then close the client.
+
+        The connect is cancelled and gets ``_UNWIND_SECONDS`` to unwind.
+        """
+        task = self._task
+        if task is not None and not task.done():
             task.cancel()
             await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
-    if timed_out:
-        raise TimeoutError(f"Connecting the memory client took longer than {timeout}s.")
-    task.result()
+        await self._client.close()
 
 
-def _close_failed_client(client: MemoryClient, bridge: AsyncBridge, timeout: float) -> None:
+def _close_failed_client(connection: _Connection, bridge: AsyncBridge, timeout: float) -> None:
     """Close a client whose connect failed, then stop the loop.
 
     A connect can fail after it opened the driver, so the client is closed
-    anyway. An error from that close is logged as a WARNING, so the
-    connect error is the one that propagates.
+    anyway. A connect still running is stopped first. An error from that
+    close is logged as a WARNING, so the connect error is the one that
+    propagates.
     """
     try:
-        bridge.run(client.close(), timeout)
+        bridge.run(connection.stop_and_close(), timeout + _UNWIND_SECONDS)
     except Exception as e:
         logger.warning("Closing the memory client after a failed connect failed: %s", e)
     finally:

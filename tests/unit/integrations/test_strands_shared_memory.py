@@ -230,12 +230,13 @@ class TestClosingSharedMemory:
         assert not fake.is_connected
         assert _bridge_threads() == threads_before
 
-    async def test_a_cancelled_connect_cancels_the_client_connect(self) -> None:
-        from neo4j_agent_memory.integrations.strands.shared import _connect
-
+    def test_an_interrupted_open_stops_the_connect_before_the_client_closes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         fake = FakeMemoryClient()
-        started = asyncio.Event()
         order: list[str] = []
+        started = threading.Event()
+        close = fake.close
 
         async def hang() -> None:
             started.set()
@@ -244,40 +245,35 @@ class TestClosingSharedMemory:
             finally:
                 order.append("connect ended")
 
-        fake.connect = hang  # type: ignore[method-assign]
-        task = asyncio.create_task(_connect(fake, 30))  # type: ignore[arg-type]
-        await started.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert order == ["connect ended"]
-
-    def test_open_stops_a_connect_past_its_bound_before_the_client_closes(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        fake = FakeMemoryClient()
-        order: list[str] = []
-        close = fake.close
-
-        async def stuck(_client: Any, _timeout: float) -> None:
-            try:
-                await asyncio.sleep(30)
-            finally:
-                order.append("connect ended")
-
         async def record_close() -> None:
-            order.append("close")
+            order.append("close started")
             await close()
 
-        shared = sys.modules[SharedMemory.__module__]
-        monkeypatch.setattr(shared, "_connect", stuck)
-        monkeypatch.setattr(shared, "_UNWIND_SECONDS", 0.1)
+        class InterruptedBridge(AsyncBridge):
+            """A bridge whose first wait gets Ctrl-C once the connect starts."""
+
+            def submit(self, coro: Any) -> Any:
+                future = super().submit(coro)
+                if not hasattr(self, "_interrupted"):
+                    self._interrupted = True
+
+                    def interrupted(timeout: float | None = None) -> None:
+                        started.wait(5)
+                        raise KeyboardInterrupt
+
+                    future.result = interrupted  # type: ignore[method-assign]
+                return future
+
+        monkeypatch.setattr(sys.modules[SharedMemory.__module__], "AsyncBridge", InterruptedBridge)
+        monkeypatch.setattr(fake, "connect", hang)
         monkeypatch.setattr(fake, "close", record_close)
         monkeypatch.setattr("neo4j_agent_memory.MemoryClient", lambda _settings: fake)
+        threads_before = _bridge_threads()
 
-        with pytest.raises(TimeoutError):
-            SharedMemory.open(_SETTINGS, request_timeout=0.1)
-        assert order == ["connect ended", "close"]
+        with pytest.raises(KeyboardInterrupt):
+            SharedMemory.open(_SETTINGS)
+        assert order == ["connect ended", "close started"]
+        assert _bridge_threads() == threads_before
 
     def test_a_close_that_fails_after_a_failed_connect_is_logged(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
