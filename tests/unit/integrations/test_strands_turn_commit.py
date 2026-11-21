@@ -732,6 +732,26 @@ class TestATurnWhoseEndWasMissed:
         (warning,) = _records(caplog, "WARNING")
         assert "sess-1" in warning
 
+    async def test_a_resume_after_an_interrupt_whose_end_was_missed_writes_the_whole_turn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _approval_agent(manager)
+        agent.hooks.add_callback(AfterInvocationEvent, _once(_crash))  # runs before ours
+        try:
+            with pytest.raises(RuntimeError, match="hook failed"):
+                await agent.invoke_async("delete the file")  # stops at the interrupt
+            paused = SimpleNamespace(interrupts=list(agent._interrupt_state.interrupts.values()))
+
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await agent.invoke_async(_answer(paused))
+        finally:
+            await manager.aclose()
+
+        assert _stored(client) == _FULL_APPROVAL_TURN
+        assert _records(caplog, "WARNING") == []
+
 
 class TestTheNextCallWritesWhatIsQueued:
     async def test_messages_appended_outside_a_call_are_written_when_the_next_starts(

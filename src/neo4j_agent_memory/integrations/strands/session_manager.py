@@ -607,7 +607,9 @@ class Neo4jSessionManager(SessionManager):
         that task with no message added since. This call takes over, and
         the left-over turn is discarded with a warning, as for any call
         that raised. A turn paused by an interrupt that Strands still holds
-        keeps its paused messages.
+        keeps its paused messages. A left-over turn that is not a resume
+        and stopped at an interrupt Strands still holds is paused instead,
+        so the call that resumes it writes the whole turn.
         """
         self._check_open()
         task = asyncio.current_task()
@@ -616,7 +618,10 @@ class Neo4jSessionManager(SessionManager):
         with self._queue_lock:
             state = self._turn_state
             if state == "running" and self._left_over(task, locks):
-                discarded = self._discard_failed_turn_locked(event.agent)
+                if self._resume_from is None and _interrupt_active(event.agent):
+                    self._turn_state = "paused"  # the owner stopped at an interrupt
+                else:
+                    discarded = self._discard_failed_turn_locked(event.agent)
                 self._owner = None
                 self._owner_task = None
                 self._open_calls = 0
