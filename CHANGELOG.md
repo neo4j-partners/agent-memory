@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `SharedMemory` in `neo4j_agent_memory.integrations.strands`. Build it
+  once with `SharedMemory.open(settings)`, then call
+  `session_manager(session_id)` for each session. All of its managers
+  share one memory client and one background thread. A manager's close
+  writes its own messages and leaves the client connected.
+  `SharedMemory.aclose()` closes the client once. Before, each manager
+  held its own client, connection pool, and thread.
+- `Neo4jSessionManager(bridge=...)`. The manager runs its memory I/O on
+  that background loop and needs `memory_client=`. It closes neither the
+  loop nor the client. Each manager keeps its own `request_timeout` on a
+  shared loop.
 - `Neo4jSessionManager.aopen()` and `aclose()`. Await `aopen()` before
   building the `Agent`, so restoring history does no blocking I/O. Await
   `aclose()` to write the last turn and close the client from async code.

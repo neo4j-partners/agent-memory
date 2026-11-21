@@ -134,6 +134,13 @@ class Neo4jSessionManager(SessionManager):
     close unless we connected it) or ``settings`` (a client is
     constructed and owned by the manager).
 
+    ``bridge`` runs the manager's memory I/O on a loop it does not own,
+    and it needs ``memory_client``. The client must be connected on that
+    bridge's loop, or not connected at all. A manager given a bridge
+    closes neither the bridge nor the client. Its ``close()`` writes its
+    own messages and returns. ``SharedMemory`` builds managers this way,
+    so many sessions share one client and one loop.
+
     Single-``Agent`` scope. The base class registers multi-agent
     (``MultiAgentInitializedEvent`` / ``AfterNodeCallEvent`` /
     ``AfterMultiAgentInvocationEvent``) and bidirectional-agent hooks
@@ -184,10 +191,16 @@ class Neo4jSessionManager(SessionManager):
         request_timeout: float = 30.0,
         restore_limit: int | None = None,
         on_persist_error: Literal["raise", "warn"] = "raise",
+        bridge: _AsyncBridge | None = None,
     ) -> None:
         if (memory_client is None) == (settings is None):
             raise ValueError(
                 "Provide exactly one of memory_client= or settings= to Neo4jSessionManager."
+            )
+        if bridge is not None and memory_client is None:
+            raise ValueError(
+                "bridge= needs memory_client=. A client built from settings= "
+                "connects on the manager's own bridge."
             )
         if on_persist_error not in _PERSIST_ERROR_POLICIES:
             raise ValueError(
@@ -201,7 +214,9 @@ class Neo4jSessionManager(SessionManager):
         self._record_tool_calls = record_tool_calls
         self._restore_limit = restore_limit
         self._request_timeout = request_timeout
-        self._bridge = _AsyncBridge(timeout=request_timeout)
+        # A shared bridge belongs to its creator, who closes it and the client.
+        self._owns_bridge = bridge is None
+        self._bridge = _AsyncBridge(timeout=request_timeout) if bridge is None else bridge
         # True when this manager owns the client lifecycle (settings-constructed
         # client, or when we performed the connect on an externally-supplied client).
         self._should_close_client: bool = settings is not None
@@ -269,7 +284,7 @@ class Neo4jSessionManager(SessionManager):
     async def _aconnect(self) -> None:
         if not self._client.is_connected:
             await self._client.connect()
-            self._should_close_client = True
+            self._should_close_client = self._owns_bridge
 
     async def _aresolve_conversation(self) -> str:
         """Return the backend session key for short_term calls.
@@ -331,7 +346,9 @@ class Neo4jSessionManager(SessionManager):
         """
         self._check_open()
         try:
-            self._restored = await self._bridge.run_async(self._ainitialize())
+            self._restored = await self._bridge.run_async(
+                self._ainitialize(), self._request_timeout
+            )
         except Exception as e:
             raise SessionException(f"Failed to initialize session {self.session_id!r}") from e
 
@@ -402,7 +419,7 @@ class Neo4jSessionManager(SessionManager):
             stored, self._restored = self._restored, None
         else:
             try:
-                stored = self._bridge.run(self._ainitialize())
+                stored = self._bridge.run(self._ainitialize(), self._request_timeout)
             except Exception as e:
                 raise SessionException(f"Failed to initialize session {self.session_id!r}") from e
         if stored:
@@ -570,7 +587,8 @@ class Neo4jSessionManager(SessionManager):
                     cfg,
                     nams=self._is_nams,
                     user_id=self._user_id,
-                )
+                ),
+                self._request_timeout,
             )
         except Exception as e:
             logger.warning(
@@ -650,7 +668,9 @@ class Neo4jSessionManager(SessionManager):
                 self._ready[-1].message = redacted
                 return
         try:
-            redacted_stored = self._bridge.run(self._aredact_latest(redacted))
+            redacted_stored = self._bridge.run(
+                self._aredact_latest(redacted), self._request_timeout
+            )
         except Exception as e:
             raise SessionException(
                 f"Failed to redact latest message for session {self.session_id!r}"
@@ -1301,11 +1321,12 @@ class Neo4jSessionManager(SessionManager):
                 failure = self._first_failure(failure, e, "wait for tool-call mirroring")
             try:
                 if self._should_close_client and self._client.is_connected:
-                    await self._bridge.run_async(self._client.close())
+                    await self._bridge.run_async(self._client.close(), self._request_timeout)
             except BaseException as e:
                 failure = self._first_failure(failure, e, "close the memory client")
             try:
-                await asyncio.to_thread(self._bridge.close)
+                if self._owns_bridge:
+                    await asyncio.to_thread(self._bridge.close)
             except BaseException as e:
                 failure = self._first_failure(failure, e, "stop the bridge")
         finally:
@@ -1315,6 +1336,9 @@ class Neo4jSessionManager(SessionManager):
 
     def close(self) -> None:
         """Flush, release the client (if owned/connected by us), stop the bridge.
+
+        A manager given a shared ``bridge`` leaves the bridge and the client
+        running.
 
         A call made while another close is running returns at once. Waiting
         here could block the event loop that close is running on.
@@ -1345,11 +1369,12 @@ class Neo4jSessionManager(SessionManager):
                 failure = self._first_failure(failure, e, "wait for tool-call mirroring")
             try:
                 if self._should_close_client and self._client.is_connected:
-                    self._bridge.run(self._client.close())
+                    self._bridge.run(self._client.close(), self._request_timeout)
             except BaseException as e:
                 failure = self._first_failure(failure, e, "close the memory client")
             try:
-                self._bridge.close()
+                if self._owns_bridge:
+                    self._bridge.close()
             except BaseException as e:
                 failure = self._first_failure(failure, e, "stop the bridge")
         finally:

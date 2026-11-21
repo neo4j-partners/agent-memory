@@ -113,6 +113,7 @@ anchor:_constructor_reference[]
 |`request_timeout` |`30.0` |Seconds to wait for each backend call. Writing a message takes up to three calls: the write, its entity extraction, and its tool-call record. A write that times out is a failed write, handled by `on_persist_error`. It keeps running, and the retry takes its result instead of writing again, so the message is stored once. A hook waits as long as its batch of writes can take. If that wait runs out, the writes go on in the background, and a warning is logged.
 |`restore_limit` |`None` |Maximum messages restored into the agent. `None` uses the backend default; Bolt returns up to 1000.
 |`on_persist_error` |`"raise"` |What a failed memory write does. `"raise"` raises `SessionException` to the agent call. `"warn"` logs a warning, and the agent call goes on. In both modes the message stays queued. The next agent call retries it before it starts, ahead of any later message. A message is dropped if that retry fails too. At close, a message whose write already failed is dropped if it fails again. A dropped message gets an ERROR log that names its session, role, and position. So after a failed flush, only messages from the current turn stay queued. A failure at close leaves messages unwritten for good, so in both modes it is logged as an ERROR with their number. Failures to restore history always raise.
+|`bridge` |`None` |The background loop to run memory I/O on. It needs `memory_client=`, connected on that loop or not connected. A manager given a bridge closes neither the bridge nor the client. `SharedMemory` passes it for you.
 |===
 
 `Neo4jSessionManager.for_nams(session_id, **kwargs)` builds a manager for the hosted service from `MEMORY_API_KEY` and optional `MEMORY_ENDPOINT`; `Neo4jMemoryStore.for_nams(config)` does the same for a store. The Bolt program above uses settings instead.
@@ -135,6 +136,33 @@ try:
 finally:
     await manager.aclose()
 ----
+
+=== Serve many sessions from one client
+
+A manager built from `settings=` owns a client and a background thread. A server that runs many sessions at once would then hold one connection pool and one thread per session. Build one `SharedMemory` at startup instead, and ask it for a manager per session. Every manager it builds runs on one client and one background thread.
+
+[source,python]
+----
+from neo4j_agent_memory.integrations.strands import SharedMemory
+
+shared = SharedMemory.open(settings)  # connects once, blocking
+
+
+async def handle(session_id: str, user_id: str, prompt: str) -> str:
+    manager = shared.session_manager(session_id, user_id=user_id)
+    await manager.aopen()
+    try:
+        agent = Agent(model=model, session_manager=manager)
+        return str(await agent.invoke_async(prompt))
+    finally:
+        await manager.aclose()
+
+
+# at shutdown, after every session has closed
+await shared.aclose()
+----
+
+`session_manager()` passes its keyword arguments to `Neo4jSessionManager`. Its `request_timeout` defaults to the one given to `open()`. A manager's `close()` or `aclose()` writes its own messages and returns. It leaves the client connected and the loop running for the other sessions. `SharedMemory.aclose()` or `close()` closes the client and stops the loop. A second call does nothing. Close every manager first, because closing the loop cancels a write still running.
 
 === Inject retrieved context per turn
 

@@ -74,6 +74,7 @@ try:
         Neo4jRetrievalConfig,
         Neo4jSessionManager,
     )
+    from neo4j_agent_memory.integrations.strands.shared import SharedMemory
     from neo4j_agent_memory.integrations.strands.tools import (
         clear_client_cache,
         context_graph_tools,
@@ -93,6 +94,7 @@ try:
         "llm_provider_from_strands",
         "Neo4jSessionManager",
         "Neo4jRetrievalConfig",
+        "SharedMemory",
         "Neo4jMemoryStore",
         "Neo4jMemoryStoreConfig",
     ]
