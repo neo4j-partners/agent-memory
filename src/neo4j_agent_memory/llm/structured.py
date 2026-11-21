@@ -81,6 +81,7 @@ async def schema_aligned_extract(
     temperature: float | None = None,
     max_retries: int = 2,
     timeout: float | None = None,
+    first_reply: str | None = None,
 ) -> T:
     """Extract a validated Pydantic model from an LLM via retry-with-feedback.
 
@@ -94,6 +95,10 @@ async def schema_aligned_extract(
         max_retries: Maximum retry attempts after the initial attempt. The
             total number of LLM calls is ``max_retries + 1``.
         timeout: Per-call timeout in seconds.
+        first_reply: A reply the model already gave to ``messages``, such
+            as the text of a native structured-output call. It is validated
+            before any provider call and counts as the first of the
+            ``max_retries + 1`` attempts.
 
     Returns:
         A validated instance of ``response_model``.
@@ -113,11 +118,15 @@ async def schema_aligned_extract(
 
     last_exception: Exception | None = None
     for attempt in range(max_retries + 1):
-        completion = await provider.complete(convo, temperature=temperature, timeout=timeout)
-        attempts.append(completion.content)
+        if attempt == 0 and first_reply is not None:
+            content = first_reply
+        else:
+            completion = await provider.complete(convo, temperature=temperature, timeout=timeout)
+            content = completion.content
+        attempts.append(content)
 
         try:
-            payload = _tolerant_json_parse(completion.content)
+            payload = _tolerant_json_parse(content)
             return response_model.model_validate(payload)
         except (json.JSONDecodeError, ValidationError) as exc:
             last_exception = exc
@@ -140,7 +149,7 @@ async def schema_aligned_extract(
             # asking the model to correct it. Some providers, such as
             # Bedrock Converse, reject a blank text block, so a blank reply
             # is replaced with a placeholder.
-            reply = completion.content if completion.content.strip() else _EMPTY_REPLY_PLACEHOLDER
+            reply = content if content.strip() else _EMPTY_REPLY_PLACEHOLDER
             convo = [
                 *convo,
                 ChatMessage(role="assistant", content=reply),

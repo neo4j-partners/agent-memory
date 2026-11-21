@@ -23,6 +23,7 @@ Install with::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
@@ -150,7 +151,9 @@ class BedrockProvider:
     * ``tool_choice``: Controls ``complete_structured`` on Anthropic
       models. ``None`` or ``"tool"`` forces the ``submit_extraction``
       tool. ``"auto"`` lets the model choose. If the model answers in
-      text instead, the provider falls back to ``schema_aligned_extract``.
+      text instead, the provider parses that text as JSON. When it does
+      not validate, ``schema_aligned_extract`` retries, and the first
+      reply counts toward ``max_retries``.
 
     Claude Sonnet 5.5 and similar models reject both a temperature and a
     forced tool choice. Configure them like this::
@@ -289,7 +292,9 @@ class BedrockProvider:
         through Converse. For Titan and Llama models we delegate to the
         generic SAP retry loop. When the model replies without a valid
         ``submit_extraction`` call, which ``tool_choice="auto"`` allows,
-        the SAP loop takes over.
+        the SAP loop takes over. SAP first validates that reply, either
+        the reply text or the tool input. It counts as the first of the
+        ``max_retries + 1`` attempts.
         """
         if not _is_anthropic_on_bedrock(self._bare_model):
             return await schema_aligned_extract(
@@ -338,17 +343,21 @@ class BedrockProvider:
             raise translated from exc
 
         content = response.get("output", {}).get("message", {}).get("content", [])
-        for block in content:
-            if "toolUse" in block:
-                tool_input = block["toolUse"].get("input", {})
-                try:
-                    return response_model.model_validate(tool_input)
-                except ValidationError as exc:
-                    logger.debug(
-                        "Bedrock tool-use response failed validation; falling back to SAP: %s",
-                        exc,
-                    )
-                    break
+        tool_uses = [block["toolUse"] for block in content if "toolUse" in block]
+        if tool_uses:
+            tool_input = tool_uses[0].get("input", {})
+            try:
+                return response_model.model_validate(tool_input)
+            except ValidationError as exc:
+                logger.debug(
+                    "Bedrock tool-use response failed validation; retrying with SAP: %s",
+                    exc,
+                )
+            first_reply = json.dumps(tool_input)
+        else:
+            # tool_choice="auto" lets the model answer in text. SAP checks
+            # that text first, so a valid answer costs no second request.
+            first_reply = "".join(block.get("text", "") for block in content if "text" in block)
 
         return await schema_aligned_extract(
             self,
@@ -357,6 +366,7 @@ class BedrockProvider:
             temperature=temperature,
             max_retries=max_retries,
             timeout=timeout,
+            first_reply=first_reply,
         )
 
 
