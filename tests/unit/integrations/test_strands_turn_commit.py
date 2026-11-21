@@ -395,6 +395,30 @@ class TestACallThatStartsWhileATurnRuns:
         assert "sess-1" in warning
         assert "1 message" in warning
 
+    @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
+    async def test_closing_during_it_logs_an_error(
+        self, use_async: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _buffered(manager)
+        await manager._on_before_invocation(turn_ended(agent))
+        manager.append_message({"role": "user", "content": [{"text": "Q1"}]}, agent)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            if use_async:
+                await manager.aclose()
+            else:
+                manager.close()
+            (error,) = _records(caplog, "ERROR")
+            assert "sess-1" in error
+            assert "1 message" in error
+
+            await manager._on_after_invocation(turn_ended(agent))  # the call ends late
+
+        assert _stored(client) == []
+        assert len(_records(caplog, "ERROR")) == 1
+
 
 class TestTheNextCallWritesWhatIsQueued:
     async def test_messages_appended_outside_a_call_are_written_when_the_next_starts(

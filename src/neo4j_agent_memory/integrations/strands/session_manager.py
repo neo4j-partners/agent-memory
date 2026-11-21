@@ -693,9 +693,10 @@ class Neo4jSessionManager(SessionManager):
 
         A turn that is running or paused is left buffered, since only its
         end decides whether it is written. A close during a paused turn
-        leaves that turn unwritten for good, so it logs a warning. A turn
-        still running when the manager closes is reported by its
-        after-invocation hook.
+        leaves that turn unwritten for good, so it logs a warning. A close
+        during a running turn logs an ERROR and drops the turn. That turn's
+        call may never end, because a BeforeInvocationEvent hook raised. If
+        it does end, its after-invocation hook finds nothing left to report.
         """
         with self._queue_lock:
             state = self._turn_state
@@ -703,9 +704,20 @@ class Neo4jSessionManager(SessionManager):
                 self._release_turn_locked()
                 return
             unfinished = len(self._turn)
-        if closing and state == "paused" and unfinished:
+            if closing and state == "running":
+                self._turn.clear()
+        if not (closing and unfinished):
+            return
+        if state == "paused":
             logger.warning(
                 "Closing session %r while its turn waits on an interrupt. "
+                "The turn's %d message(s) are not written.",
+                self.session_id,
+                unfinished,
+            )
+        else:
+            logger.error(
+                "Closing session %r while an agent call's turn is still open. "
                 "The turn's %d message(s) are not written.",
                 self.session_id,
                 unfinished,
