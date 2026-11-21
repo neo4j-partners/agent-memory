@@ -517,6 +517,22 @@ class TestOneStoredCopyPerMessage:
         (conversation,) = client.short_term.conversations.values()
         assert [m.content for m in conversation.messages] == ["one"]
 
+    async def test_a_redaction_before_the_retry_of_a_committed_write_is_applied(
+        self,
+    ) -> None:
+        """The retry is skipped, so the drain must still rewrite the original."""
+        client = FakeMemoryClient()
+        _stores_then(client, fail=True)
+        manager = Neo4jSessionManager("sess-1", memory_client=client, on_persist_error="warn")
+        agent = _buffered(manager, "my SSN is 123")
+        manager._release_pending()
+        await manager._aflush_ready()  # fails after the original was stored
+        manager.redact_latest_message({"role": "user", "content": [{"text": "[SSN]"}]}, agent)
+        await manager._aflush_ready()  # the retry carries the id the original took
+        await manager.aclose()
+        (conversation,) = client.short_term.conversations.values()
+        assert [m.content for m in conversation.messages] == ["[SSN]"]
+
     async def test_a_nams_write_that_replies_late_is_stored_once(self) -> None:
         client = FakeMemoryClient(nams_mode=True)
         wire = client.wire

@@ -85,9 +85,9 @@ class _Queued:
     # Stable across retries, so Bolt stores the message once however often
     # its write is retried.
     id: str = field(default_factory=lambda: str(uuid4()))
-    # The latest write and the content it writes. Bridge loop only. A drain
-    # that stops waiting leaves the write running, and the next drain
-    # awaits it instead of writing again.
+    # The latest write, and the content the first write sent. Bridge loop
+    # only. A drain that stops waiting leaves the write running, and the
+    # next drain awaits it instead of writing again.
     write: asyncio.Task[StoredMessage] | None = None
     written: StrandsMessage | None = None
 
@@ -894,6 +894,13 @@ class Neo4jSessionManager(SessionManager):
         server, so this is what keeps a slow write from being stored twice
         there. Bolt also stores the message under the entry's id, so a
         write that failed after it committed is not stored twice either.
+
+        The content returned is what the first attempt sent, since that
+        attempt may have committed. A retry under the same id is then
+        skipped, so a redaction made before the retry must still be applied
+        to the stored original. If the first attempt never committed, the
+        retry stores the redacted text, and applying the redaction again
+        rewrites it to the same content.
         """
         task = entry.write
         if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
@@ -901,7 +908,9 @@ class Neo4jSessionManager(SessionManager):
             if not (text := _message_text(message)):
                 return message, None
             task = asyncio.ensure_future(self._aadd_message(message["role"], text, entry.id))
-            entry.write, entry.written = task, message
+            entry.write = task
+            if entry.written is None:
+                entry.written = message
         written = cast("StrandsMessage", entry.written)
         return written, await asyncio.wait_for(asyncio.shield(task), self._request_timeout)
 
