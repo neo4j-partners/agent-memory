@@ -168,16 +168,15 @@ def _tool_reply(tool_input: Any) -> dict[str, Any]:
     return converse_response({"toolUse": use}, stop="tool_use")
 
 
-async def test_non_json_tool_input_is_serialized_for_sap() -> None:
-    """A Decimal in the tool input must not crash the hand-off to SAP."""
-    from decimal import Decimal
-
-    provider, client = _sonnet(_tool_reply({"value": Decimal("1.5")}))
+async def test_wrong_type_tool_input_seeds_the_sap_retry_as_json() -> None:
+    """A tool input that fails validation is handed to SAP as its JSON text."""
+    provider, client = _sonnet(_tool_reply({"value": 123}), converse_text('{"value": "ok"}'))
 
     result = await provider.complete_structured(_MESSAGES, _Extraction)
 
-    assert result.value == "1.5"
-    assert len(client.calls) == 1
+    assert result.value == "ok"
+    assert len(client.calls) == 2
+    assert _assistant_texts(client.calls[1]) == ['{"value": 123}']
 
 
 async def test_string_tool_input_costs_no_extra_retry() -> None:

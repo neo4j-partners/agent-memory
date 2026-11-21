@@ -387,11 +387,9 @@ class BedrockProvider:
                     "Bedrock tool-use response failed validation; retrying with SAP: %s",
                     exc,
                 )
-            # A string input is already the reply text. Otherwise default=str
-            # covers values JSON cannot encode, such as Decimal.
-            first_reply = (
-                tool_input if isinstance(tool_input, str) else json.dumps(tool_input, default=str)
-            )
+            # A string input is already the reply text. botocore decodes any
+            # other input from JSON, so it encodes back as is.
+            first_reply = tool_input if isinstance(tool_input, str) else json.dumps(tool_input)
         else:
             # tool_choice="auto" lets the model answer in text. SAP checks
             # that text first, so a valid answer costs no second request.
