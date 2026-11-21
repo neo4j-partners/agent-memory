@@ -17,6 +17,7 @@ from neo4j_agent_memory.core.memory import BaseMemory, MemoryEntry
 from neo4j_agent_memory.core.protocols import ShortTermProtocol
 from neo4j_agent_memory.extraction.base import ExtractedEntity, ExtractionResult
 from neo4j_agent_memory.graph import queries
+from neo4j_agent_memory.graph._temporal import as_neo4j_utc
 from neo4j_agent_memory.graph.query_builder import (
     build_add_ontology_label_query,
     build_create_entity_query,
@@ -673,6 +674,8 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
                 content = msg_dict["content"]
                 metadata = msg_dict.get("metadata", {})
                 timestamp = msg_dict.get("timestamp")
+                if isinstance(timestamp, datetime):
+                    timestamp = as_neo4j_utc(timestamp)
 
                 batch_data.append(
                     {
@@ -1133,9 +1136,7 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
         if since is not None:
             if since.tzinfo is None:
                 raise ValueError("since must be a timezone-aware datetime")
-            # Send a fixed offset. Neo4j orders a named zone such as pytz's
-            # "UTC" after an equal instant stored with offset "Z".
-            since = since.astimezone(UTC)
+            since = as_neo4j_utc(since)
         # Get conversation
         if conversation_id:
             conv_id = str(conversation_id) if isinstance(conversation_id, UUID) else conversation_id

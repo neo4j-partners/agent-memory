@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `add_messages_batch` now stores a timestamp in a named UTC zone at
+  offset UTC, so batch messages read back in the right order.
 - Strands redactions of a stored message now run one at a time. Before,
   two redactions could rewrite the same message at once, and each stored
   its own redacted copy. Each redaction now waits for the one before it

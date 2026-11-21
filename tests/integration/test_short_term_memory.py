@@ -2,7 +2,8 @@
 
 import asyncio
 import random
-from datetime import datetime
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -845,6 +846,33 @@ class TestBatchMessageOrdering:
         assert [m.content for m in conversation.messages] == ["early", "late"]
         assert conversation.messages[0].created_at.minute == 0
         assert conversation.messages[1].created_at.minute == 5
+
+    @pytest.mark.asyncio
+    async def test_named_utc_timestamps_are_stored_at_a_fixed_offset(
+        self, memory_client, session_id
+    ):
+        # Neo4j stores a named zone such as ZoneInfo("UTC") with the value. It
+        # compared unequal to the same instant at offset Z and sorted after
+        # it, so the message in the named zone always read back last. Equal
+        # instants now tie, and get_conversation orders a tie by id.
+        instant = datetime(2024, 1, 1, 10, 0, tzinfo=UTC)
+        batch = [
+            {"role": "user", "content": "named", "timestamp": instant.astimezone(ZoneInfo("UTC"))},
+            {"role": "assistant", "content": "offset", "timestamp": instant},
+        ]
+        stored = await memory_client.short_term.add_messages_batch(
+            session_id, batch, generate_embeddings=False, extract_entities=False
+        )
+
+        rows = await memory_client._client.execute_read(
+            "MATCH (:Conversation {session_id: $session_id})-[:HAS_MESSAGE]->(m:Message) "
+            "RETURN toString(m.timestamp) AS stored",
+            {"session_id": session_id},
+        )
+        assert [row["stored"] for row in rows] == ["2024-01-01T10:00:00Z"] * 2
+
+        conversation = await memory_client.short_term.get_conversation(session_id)
+        assert [m.id for m in conversation.messages] == sorted((m.id for m in stored), key=str)
 
     @pytest.mark.asyncio
     async def test_concurrent_batch_and_single_appends_keep_one_chain(
