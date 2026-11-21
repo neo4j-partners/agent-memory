@@ -238,7 +238,6 @@ class MemoryObserver:
         try:
             completion = await self._llm_provider.complete(
                 [system, user],
-                temperature=0.0,
                 max_tokens=400,
             )
         except Exception as exc:  # pragma: no cover - provider errors logged

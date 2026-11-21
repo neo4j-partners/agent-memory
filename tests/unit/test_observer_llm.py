@@ -142,3 +142,24 @@ async def test_observer_falls_back_to_keywords_on_provider_error():
     # falls through to the keyword summarizer.
     assert obs["reflections"]
     assert "Session summary" in obs["reflections"][0]
+
+
+async def test_observer_summarization_sends_no_temperature():
+    """The reflection call leaves temperature to the model's default."""
+    from tests.unit.llm.test_optional_temperature import _bedrock, _text_response
+
+    messages = [_FakeMessage(role="user", content=f"history line {i}") for i in range(40)]
+    provider, converse = _bedrock(
+        "bedrock/us.anthropic.claude-sonnet-5-5-v1:0", _text_response("Compressed.")
+    )
+    observer = MemoryObserver(
+        _FakeClient(messages),  # type: ignore[arg-type]
+        threshold_tokens=200,
+        recent_message_window=20,
+        llm_provider=provider,
+    )
+
+    await _push_until_threshold(observer, "s4")
+
+    assert len(converse.calls) == 1
+    assert "temperature" not in converse.calls[0]["inferenceConfig"]
