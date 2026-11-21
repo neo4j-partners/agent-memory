@@ -76,8 +76,11 @@ class AsyncBridge:
         self._broken = False
         # Futures from submit() that are not done yet. Shutdown cancels any
         # whose task never started, so no caller waits on them forever.
+        # Once the loop stops, _stopped makes submit() refuse new work, so
+        # no future is added after that sweep.
         self._futures: set[concurrent.futures.Future[Any]] = set()
         self._futures_lock = threading.Lock()
+        self._stopped = False  # under _futures_lock
 
     @property
     def closed(self) -> bool:
@@ -122,6 +125,8 @@ class AsyncBridge:
             if not self._closed:
                 # Not lock-guarded: close() holds _lock while it joins us.
                 self._broken = True
+            with self._futures_lock:
+                self._stopped = True
             try:
                 tasks = asyncio.all_tasks(loop)
                 for task in tasks:
@@ -131,11 +136,13 @@ class AsyncBridge:
                 loop.run_until_complete(loop.shutdown_asyncgens())
                 loop.run_until_complete(loop.shutdown_default_executor())
             finally:
-                loop.close()
+                # Cancel before loop.close(). A cancelled future cancels its
+                # task through this loop, which must still be open.
                 with self._futures_lock:
                     stranded = [f for f in self._futures if not f.done()]
                 for future in stranded:
                     future.cancel()
+                loop.close()
 
     def _forget(self, future: concurrent.futures.Future[Any]) -> None:
         with self._futures_lock:
@@ -145,7 +152,9 @@ class AsyncBridge:
         """Schedule ``coro`` on the background loop and return its future.
 
         Raises:
-            RuntimeError: The bridge is closed. ``coro`` is closed unscheduled.
+            RuntimeError: The bridge is closed. ``coro`` is closed unscheduled,
+                unless the loop stopped after it was handed over. Then its
+                future is cancelled, and so is its task if it starts.
         """
         try:
             loop = self._ensure_loop()
@@ -158,7 +167,12 @@ class AsyncBridge:
             coro.close()
             raise RuntimeError("AsyncBridge is closed") from e
         with self._futures_lock:
-            self._futures.add(future)
+            stopped = self._stopped
+            if not stopped:
+                self._futures.add(future)
+        if stopped:  # the loop stopped after _ensure_loop returned
+            future.cancel()
+            raise RuntimeError("AsyncBridge is closed")
         future.add_done_callback(self._forget)
         return future
 

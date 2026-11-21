@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `AsyncBridge` shutdown cancels work that outlived it while its loop
+  is still open, so no callback fails on a closed loop. Work submitted
+  once the loop has stopped is refused with `RuntimeError` and is
+  never left waiting.
 - With `on_persist_error="warn"`, a `Neo4jSessionManager` turn that
   ends after a close left messages unwritten no longer raises from the
   Strands hook. It logs one ERROR with the number of messages lost.

@@ -178,6 +178,77 @@ class TestAsyncBridge:
         finally:
             bridge.close()
 
+    @staticmethod
+    async def _ignores_cancel(seconds: float) -> None:
+        """A task that keeps running through cancellation for ``seconds``."""
+        import time
+
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                pass
+
+    def test_a_task_that_outlives_shutdown_is_cancelled_cleanly(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+        import threading
+
+        from neo4j_agent_memory.integrations import base
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        monkeypatch.setattr(base, "_SHUTDOWN_TIMEOUT_SECONDS", 0.2)
+        bridge = _AsyncBridge(timeout=5.0)
+        result: list[BaseException] = []
+
+        def caller() -> None:
+            try:
+                bridge.run(self._ignores_cancel(1.0))
+            except RuntimeError as e:
+                result.append(e)
+
+        thread = threading.Thread(target=caller)
+        with caplog.at_level(logging.ERROR, logger="concurrent.futures"):
+            thread.start()
+            import time
+
+            time.sleep(0.1)
+            bridge.close()
+            thread.join(timeout=5.0)
+
+        assert [str(e) for e in result] == ["AsyncBridge closed with work in flight"]
+        # The future was cancelled while its loop was open, so no callback failed.
+        assert [r for r in caplog.records if r.name == "concurrent.futures"] == []
+
+    def test_submit_refuses_work_once_the_loop_has_stopped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import threading
+        import time
+
+        from neo4j_agent_memory.integrations import base
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        monkeypatch.setattr(base, "_SHUTDOWN_TIMEOUT_SECONDS", 0.5)
+        bridge = _AsyncBridge()
+        stubborn = bridge.submit(self._ignores_cancel(1.0))  # holds shutdown open
+        loop = bridge._loop
+        closer = threading.Thread(target=bridge.close)
+        closer.start()
+        time.sleep(0.1)  # the loop has stopped and is shutting down
+
+        async def noop() -> None:
+            return None
+
+        # The race: _ensure_loop() returned the loop just before close().
+        monkeypatch.setattr(bridge, "_ensure_loop", lambda: loop)
+        with pytest.raises(RuntimeError, match="AsyncBridge is closed"):
+            bridge.submit(noop())
+        closer.join(timeout=5.0)
+        assert stubborn.cancelled()
+
 
 class TestMappingHelpers:
     def test_message_text_concatenates_text_blocks(self) -> None:
