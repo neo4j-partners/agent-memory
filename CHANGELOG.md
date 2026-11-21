@@ -245,7 +245,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raises `SessionException`. One manager tracks one agent's turns, so
   a call on the second agent could discard the first agent's turn.
   Attaching the same agent again is allowed. The manager does not keep
-  its agent alive, so once that agent is freed, another can attach.
+  its agent alive, so once that agent is freed, another can attach. A
+  turn the freed agent left paused at an interrupt is dropped then, with
+  a warning, since nothing can resume it. After a call whose end the
+  manager missed, the manager keeps that agent until it closes, so
+  another agent still cannot attach.
 - The `[strands]` extra now needs `strands-agents>=1.55`. It needed
   `>=1.52` before. Strands 1.55 is the first release whose
   `stream_async` closes its events when a caller abandons a stream. The

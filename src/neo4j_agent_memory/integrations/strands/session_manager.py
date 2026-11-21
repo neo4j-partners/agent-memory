@@ -517,6 +517,10 @@ class Neo4jSessionManager(SessionManager):
         the agent's history, with a warning. Stored messages are not
         changed.
 
+        Once the previous Agent is freed, another can attach. A turn the
+        freed Agent left open is dropped, with a warning. See
+        ``_drop_freed_agents_turn``.
+
         Raises:
             SessionException: The manager is closed, loading failed, or the
                 manager already serves another Agent. One manager tracks
@@ -529,6 +533,8 @@ class Neo4jSessionManager(SessionManager):
                 f"Session manager for session {self.session_id!r} is already "
                 "attached to another Agent. Give each Agent its own manager."
             )
+        if self._agent_ref is not None and attached is None:
+            self._drop_freed_agents_turn()
         self._check_memory_manager_coexistence(agent)
         preloaded = self._restored is not None
         if self._restored is not None:
@@ -561,6 +567,36 @@ class Neo4jSessionManager(SessionManager):
             else:
                 self._flush_buffer()
         self._agent_ref = weakref.ref(agent)
+
+    def _drop_freed_agents_turn(self) -> None:
+        """Drop the turn that a freed Agent left open.
+
+        A turn paused at an interrupt can be resumed only by the Agent that
+        holds the interrupt. Once that Agent is freed, nothing can resume
+        the turn. The next Agent's first call would otherwise write it
+        ahead of its own turn, with a tool call that has no result. A turn
+        left running is dropped too, as the next call would discard it.
+        Messages appended outside a call stay buffered.
+        """
+        with self._queue_lock:
+            if self._turn_state == "idle":
+                return
+            dropped = len(self._turn)
+            self._turn.clear()
+            self._turn_state = "idle"
+            self._resume_from = None
+            self._owner = None
+            self._owner_task = None
+            self._owner_appended = False
+            self._owner_locks = False
+            self._open_calls = 0
+        logger.warning(
+            "Session %r: a new agent attached after the agent with an open "
+            "turn was freed. Nothing can resume that turn, so its %d "
+            "message(s) are not written.",
+            self.session_id,
+            dropped,
+        )
 
     def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
         """Wire base persistence hooks, then our turn and injection hooks.

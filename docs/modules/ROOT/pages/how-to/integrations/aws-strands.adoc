@@ -299,7 +299,7 @@ Await writes, check the applicable extraction lifecycle, and apply workspace/dat
 
 === Limitations
 
-* One `Agent` per session manager. Attaching a second `Agent` raises `SessionException`, because one manager tracks one agent's turns. Attaching `Neo4jSessionManager` to a Strands Graph, Swarm or `BidiAgent` raises `NotImplementedError` at the first dispatch; use one of Strands' repository-backed managers for those topologies.
+* One `Agent` per session manager. Attaching a second `Agent` raises `SessionException`, because one manager tracks one agent's turns. Once that agent is freed, another can attach. A turn the freed agent left paused at an interrupt is dropped then, with a warning, since nothing can resume it. After a call whose end the manager missed, the manager keeps that agent until it closes, so another agent still cannot attach. Attaching `Neo4jSessionManager` to a Strands Graph, Swarm or `BidiAgent` raises `NotImplementedError` at the first dispatch; use one of Strands' repository-backed managers for those topologies.
 * Text turns are restored; tool-use blocks and `agent.state` are not. Set `record_tool_calls=True` to keep an audit record of tool use.
 * Restored history alternates roles and starts with a user message. Consecutive assistant messages are merged, and leading assistant messages are dropped. User messages that never got a reply are left out, with a warning. This covers an earlier prompt in a run of user messages and a final user message. Stored messages are not changed.
 * Pass `settings=` or an unconnected `memory_client=`. A client already connected on another event loop cannot be driven from the manager's background loop.

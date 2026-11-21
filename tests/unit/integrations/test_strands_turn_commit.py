@@ -9,9 +9,11 @@ its reply. A turn paused by an interrupt stays buffered until it resumes.
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 import logging
 import tomllib
+import weakref
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +31,7 @@ from strands.hooks import (  # noqa: E402
     BeforeInvocationEvent,
 )
 from strands.types.agent import ConcurrentInvocationMode  # noqa: E402
+from strands.types.exceptions import SessionException  # noqa: E402
 
 from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E402
     Neo4jSessionManager,
@@ -112,6 +115,35 @@ _FULL_APPROVAL_TURN = [
     ("assistant", "Asking for approval."),
     ("assistant", "Done."),
 ]
+
+
+async def _leave_turn_open(manager: Neo4jSessionManager, how: str) -> weakref.ref[Agent]:
+    """Have a new agent leave its turn open, and return a weak reference to it.
+
+    ``how`` is ``"paused"`` for a call that stops at an interrupt, or
+    ``"failed_at_interrupt"`` for one that raises while Strands holds the
+    interrupt. ``"running"`` is a call whose end the manager misses.
+    """
+    if how == "running":
+        agent = _agent(manager, [{"text": "A1"}])
+        agent.hooks.add_callback(AfterInvocationEvent, _once(_crash))  # runs before ours
+    else:
+        agent = _approval_agent(manager)
+        if how == "failed_at_interrupt":
+            agent.hooks.add_callback(AfterToolsEvent, _once(_crash))  # Strands keeps the interrupt
+    if how == "paused":
+        await agent.invoke_async("delete the file")
+    else:
+        with pytest.raises(Exception, match="hook failed"):
+            await agent.invoke_async("delete the file")
+    return weakref.ref(agent)
+
+
+async def _collect() -> None:
+    """Collect garbage once the loop has closed a finished call's async generators."""
+    for _ in range(3):
+        await asyncio.sleep(0)
+        gc.collect()
 
 
 class _StalledModel(ScriptedModel):
@@ -423,6 +455,36 @@ class TestAnInterruptedTurn:
         finally:
             await manager.aclose()
         assert _stored(client) == _FULL_APPROVAL_TURN
+
+    @pytest.mark.parametrize("how", ["paused", "failed_at_interrupt"])
+    async def test_the_next_agent_drops_a_freed_agents_open_turn(
+        self, how: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        try:
+            first = await _leave_turn_open(manager, how)
+            await _collect()
+            assert first() is None
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await _agent(manager, [{"text": "Hi"}]).invoke_async("hello")
+        finally:
+            await manager.aclose()
+        assert _stored(client) == [("user", "hello"), ("assistant", "Hi")]
+        assert any("freed" in r for r in _records(caplog, "WARNING"))
+
+    async def test_a_missed_end_keeps_its_agent_attached(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        try:
+            first = await _leave_turn_open(manager, "running")
+            await _collect()
+            assert first() is not None  # the open turn holds the call's invocation_state
+            with pytest.raises(SessionException, match="another Agent"):
+                _agent(manager, [{"text": "Hi"}])
+        finally:
+            await manager.aclose()
+        assert _stored(client) == []
 
     async def test_a_cancelled_resume_keeps_the_turn_paused(self) -> None:
         client = FakeMemoryClient()
