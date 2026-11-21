@@ -72,7 +72,7 @@ class LLMProvider(Protocol):
 
 Implementations MUST:
 
-* Be safe to call concurrently — no shared mutable state.
+* Be safe to call concurrently. Keep no shared mutable state, except a one-way latch that moves once from its initial value to a final one. `BedrockProvider` has one such latch. After Bedrock rejects a forced `toolChoice` and the `auto` retry works, the provider sends `toolChoice` auto from then on. Concurrent calls made before the latch is set can each pay one rejected request. Only one warning is logged.
 * Translate SDK-specific errors to `ProviderError` subclasses.
 * Leave temperature out of the request when `temperature` is `None`. The model's own default then applies.
 * Send any other `temperature`, including `0.0`, as given. An adapter option such as `send_temperature=False` can turn this off for models that reject the field.

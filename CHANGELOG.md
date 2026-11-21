@@ -81,8 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `us-gov.` inference profiles, and ARNs that end in an Anthropic model
   id. Earlier releases sent these models to the generic SAP loop. With
   the default `tool_choice=None`, the provider forces the tool call. If
-  Bedrock rejects the forced `toolChoice`, the provider logs one warning,
-  retries that call with `toolChoice` auto, and sends auto from then on.
+  Bedrock rejects the forced `toolChoice`, the provider retries that
+  call with `toolChoice` auto. Once a retry works, it logs one warning
+  and sends auto from then on.
   For models that reject a forced tool choice, such as Claude Sonnet 5.5,
   pass `tool_choice="auto"` to skip the rejected call.
 - **Behavior change:** In `BedrockProvider.complete_structured`, a native

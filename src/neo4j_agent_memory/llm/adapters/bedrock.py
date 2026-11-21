@@ -176,8 +176,11 @@ class BedrockProvider:
       ``None`` is never sent either way.
     * ``tool_choice``: Controls ``complete_structured`` on Anthropic
       models. ``None`` forces the ``submit_extraction`` tool. If Bedrock
-      rejects the forced choice, the provider logs one warning, retries
-      that call with ``"auto"``, and sends ``"auto"`` from then on.
+      rejects the forced choice, the provider retries that call with
+      ``"auto"``. Once a retry works, it logs one warning and sends
+      ``"auto"`` from then on. This switch is a one-way latch shared by
+      all calls on the provider. Calls made concurrently before it is set
+      can each pay one rejected request, and only one warning is logged.
       ``"tool"`` always forces the tool and never falls back. ``"auto"``
       lets the model choose. If the model answers in
       text instead, the provider parses that text as JSON. When it does
