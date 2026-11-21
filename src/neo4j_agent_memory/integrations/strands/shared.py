@@ -10,6 +10,7 @@ pool and thread. A server that runs many sessions builds one
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
 
 __all__ = ["SharedMemory"]
 
+logger = logging.getLogger(__name__)
+
 
 class SharedMemory:
     """A memory client and a background loop that session managers share.
@@ -31,9 +34,12 @@ class SharedMemory:
     built this way closes neither: its ``close()`` and ``aclose()`` write
     its own messages and return.
 
-    Close every manager before closing this object. Closing stops the
-    loop, so a write still running is cancelled. ``aclose()`` and
-    ``close()`` close the client once, and a second call does nothing.
+    Close every manager before closing this object. A manager's close
+    leaves its background work running, such as deferred entity
+    extraction. ``aclose()`` and ``close()`` wait for every task still
+    running on the loop, up to ``timeout`` seconds. Then they close the
+    client and stop the loop, which cancels the tasks still running. A
+    WARNING gives their number. A second call does nothing.
 
     Example::
 
@@ -111,22 +117,68 @@ class SharedMemory:
             self._closed = True
             return True
 
-    async def aclose(self) -> None:
-        """Close the client and stop the loop without blocking the caller's loop."""
+    async def aclose(self, timeout: float = 30.0) -> None:
+        """Like ``close()``, without blocking the caller's loop."""
+        _check_timeout(timeout)
         if not self._begin_close():
             return
         try:
-            if self._client.is_connected:
-                await self._bridge.run_async(self._client.close(), self._request_timeout)
+            try:
+                await self._bridge.run_async(
+                    self._await_tasks(timeout), timeout + self._request_timeout
+                )
+            finally:
+                if self._client.is_connected:
+                    await self._bridge.run_async(self._client.close(), self._request_timeout)
         finally:
             await asyncio.to_thread(self._bridge.close)
 
-    def close(self) -> None:
-        """Close the client and stop the loop, blocking until done."""
+    def close(self, timeout: float = 30.0) -> None:
+        """Wait for the loop's tasks, close the client, and stop the loop.
+
+        Blocks until done. ``timeout`` bounds the wait for the tasks still
+        running on the loop. It is separate from ``request_timeout``,
+        which bounds closing the client.
+
+        Raises:
+            ValueError: ``timeout`` is not positive. The object stays open.
+        """
+        _check_timeout(timeout)
         if not self._begin_close():
             return
         try:
-            if self._client.is_connected:
-                self._bridge.run(self._client.close(), self._request_timeout)
+            try:
+                self._bridge.run(self._await_tasks(timeout), timeout + self._request_timeout)
+            finally:
+                if self._client.is_connected:
+                    self._bridge.run(self._client.close(), self._request_timeout)
         finally:
             self._bridge.close()
+
+    async def _await_tasks(self, timeout: float) -> None:
+        """Wait up to ``timeout`` for the loop's other tasks. Runs on the loop.
+
+        A task can start another while this waits, so the wait looks again
+        until no task is left or the time runs out. A WARNING gives the
+        number still running.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        this = asyncio.current_task()
+        while pending := asyncio.all_tasks() - {this}:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    "Closing SharedMemory while %d background task(s) are still "
+                    "running after %ss. They are cancelled.",
+                    len(pending),
+                    timeout,
+                )
+                return
+            await asyncio.wait(pending, timeout=remaining)
+
+
+def _check_timeout(timeout: float) -> None:
+    """Raise ``ValueError`` unless ``timeout`` is a positive number of seconds."""
+    if not timeout > 0:
+        raise ValueError(f"timeout must be positive, not {timeout!r}.")

@@ -8,6 +8,7 @@ session, and leaves the client and the loop running when it closes.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from typing import Any
 
@@ -24,6 +25,7 @@ from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E
     SessionException,
 )
 from tests.unit.integrations.strands_fakes import FakeMemoryClient  # noqa: E402
+from tests.unit.integrations.test_strands_deferred_extraction import _Gate  # noqa: E402
 from tests.unit.integrations.test_strands_nonblocking import ScriptedModel  # noqa: E402
 
 _SETTINGS: Any = object()  # open() hands it to the patched MemoryClient only
@@ -153,6 +155,66 @@ class TestClosingSharedMemory:
         with pytest.raises(ConnectionError, match="no route"):
             SharedMemory.open(_SETTINGS)
         assert _bridge_threads() == threads_before
+
+
+class TestClosingWithBackgroundWork:
+    @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
+    async def test_close_waits_for_deferred_extractions(
+        self, client: FakeMemoryClient, use_async: bool
+    ) -> None:
+        gate = _Gate(client)
+        shared = SharedMemory.open(_SETTINGS)
+        manager = shared.session_manager("sess-1", defer_extraction=True)
+        await _agent(manager, "A1").invoke_async("Q1")
+        await manager.aclose()
+        assert gate.done == []
+
+        threading.Timer(0.2, gate.opened.set).start()
+        if use_async:
+            await shared.aclose()
+        else:
+            await asyncio.to_thread(shared.close)
+
+        assert gate.done == ["Q1", "A1"]
+        assert client.close_calls == 1
+
+    @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
+    async def test_tasks_still_running_after_the_timeout_are_cancelled(
+        self, client: FakeMemoryClient, use_async: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger="neo4j_agent_memory.integrations.strands.shared")
+        gate = _Gate(client)  # never opens
+        threads_before = _bridge_threads()
+        shared = SharedMemory.open(_SETTINGS)
+        manager = shared.session_manager("sess-1", defer_extraction=True)
+        await _agent(manager, "A1").invoke_async("Q1")
+        await manager.aclose()
+
+        if use_async:
+            await asyncio.wait_for(shared.aclose(timeout=0.1), timeout=5)
+        else:
+            await asyncio.wait_for(asyncio.to_thread(shared.close, 0.1), timeout=5)
+
+        assert gate.done == []
+        assert "Closing SharedMemory while 2 background task(s) are still running" in caplog.text
+        assert client.close_calls == 1
+        assert _bridge_threads() == threads_before
+
+    @pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan")])
+    @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
+    async def test_a_timeout_that_is_not_positive_is_refused(
+        self, client: FakeMemoryClient, use_async: bool, timeout: float
+    ) -> None:
+        shared = SharedMemory.open(_SETTINGS)
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            if use_async:
+                await shared.aclose(timeout=timeout)
+            else:
+                shared.close(timeout=timeout)
+
+        assert not shared.closed
+        await shared.aclose()
+        assert client.close_calls == 1
 
 
 class TestAManagerOnASharedBridge:

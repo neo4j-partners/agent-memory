@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes its own messages and leaves the client connected.
   `SharedMemory.aclose()` closes the client once. Before, each manager
   held its own client, connection pool, and thread.
+  `SharedMemory.aclose(timeout=30.0)` and `close(timeout=30.0)` first
+  wait for the tasks still running on the loop, such as deferred
+  extractions. The timeout must be positive. The tasks still running
+  after it are cancelled, and a WARNING gives their number.
 - `Neo4jSessionManager(bridge=...)`. The manager runs its memory I/O on
   that background loop and needs `memory_client=`. It closes neither the
   loop nor the client. Each manager keeps its own `request_timeout` on a

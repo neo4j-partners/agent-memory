@@ -163,7 +163,7 @@ async def handle(session_id: str, user_id: str, prompt: str) -> str:
 await shared.aclose()
 ----
 
-`session_manager()` passes its keyword arguments to `Neo4jSessionManager`. Its `request_timeout` defaults to the one given to `open()`. A manager's `close()` or `aclose()` writes its own messages and returns. It leaves the client connected and the loop running for the other sessions. `SharedMemory.aclose()` or `close()` closes the client and stops the loop. A second call does nothing. Close every manager first, because closing the loop cancels a write still running.
+`session_manager()` passes its keyword arguments to `Neo4jSessionManager`. Its `request_timeout` defaults to the one given to `open()`. A manager's `close()` or `aclose()` writes its own messages and returns. It leaves the client connected and the loop running for the other sessions. `SharedMemory.aclose()` or `close()` first waits for the tasks still running on the loop, such as deferred extractions. Its `timeout` argument bounds that wait. It defaults to 30 seconds and must be positive. It then closes the client and stops the loop, which cancels the tasks still running. A warning gives their number. A second call does nothing. Close every manager first, because closing the loop cancels a write still running.
 
 === Inject retrieved context per turn
 
