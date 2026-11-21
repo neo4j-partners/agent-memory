@@ -402,3 +402,30 @@ async def test_sap_raises_after_exhausting_retries():
         )
     # All three attempts surface in the error so callers can diagnose.
     assert len(excinfo.value.last_attempts) == 3
+
+
+@pytest.mark.parametrize("reply", ["", "  \n"], ids=["empty", "whitespace"])
+async def test_sap_retry_replaces_a_blank_reply_with_a_placeholder(reply):
+    """Bedrock rejects a blank text block, so the retry must not send one."""
+    provider = CannedLLMProvider(responses=[reply, '{"name": "Alice", "age": 30}'])
+    result = await schema_aligned_extract(
+        provider,
+        messages=[ChatMessage(role="user", content="extract")],
+        response_model=SimplePayload,
+    )
+    assert result.age == 30
+    assistant_turns = [m for m in provider.calls[1] if m.role == "assistant"]
+    assert len(assistant_turns) == 1
+    assert assistant_turns[0].content.strip()
+
+
+async def test_sap_error_keeps_the_raw_empty_attempt():
+    provider = CannedLLMProvider(responses=["", ""])
+    with pytest.raises(StructuredExtractionError) as excinfo:
+        await schema_aligned_extract(
+            provider,
+            messages=[ChatMessage(role="user", content="extract")],
+            response_model=SimplePayload,
+            max_retries=1,
+        )
+    assert excinfo.value.last_attempts == ["", ""]

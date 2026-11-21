@@ -69,6 +69,9 @@ Rules:
 _FENCE_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)\s*```", re.DOTALL)
 _OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+# Stands in for an empty reply when it is sent back to the model on retry.
+_EMPTY_REPLY_PLACEHOLDER = "[empty response]"
+
 
 async def schema_aligned_extract(
     provider: LLMProvider,
@@ -134,10 +137,13 @@ async def schema_aligned_extract(
             )
 
             # Append the failed assistant response and a feedback message
-            # asking the model to correct it.
+            # asking the model to correct it. Some providers, such as
+            # Bedrock Converse, reject a blank text block, so a blank reply
+            # is replaced with a placeholder.
+            reply = completion.content if completion.content.strip() else _EMPTY_REPLY_PLACEHOLDER
             convo = [
                 *convo,
-                ChatMessage(role="assistant", content=completion.content),
+                ChatMessage(role="assistant", content=reply),
                 ChatMessage(
                     role="user",
                     content=_format_retry_prompt(exc, response_model),
