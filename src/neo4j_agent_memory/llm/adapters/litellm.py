@@ -142,7 +142,8 @@ class LiteLLMProvider:
           and they will be forwarded to every ``acompletion`` call. See
           the LiteLLM docs for provider-specific kwargs.
         * ``send_temperature=False`` never sends a temperature, even when
-          a caller passes one. Use it for models that reject the field.
+          a caller or the constructor passes one. Use it for models that
+          reject the field.
     """
 
     def __init__(
@@ -179,6 +180,9 @@ class LiteLLMProvider:
         for key, value in default_kwargs.items():
             if value is not None:
                 call_kwargs[key] = value
+        if not send_temperature:
+            # A constructor-supplied temperature would reach every call.
+            call_kwargs.pop("temperature", None)
         self._call_kwargs = call_kwargs
 
     async def complete(

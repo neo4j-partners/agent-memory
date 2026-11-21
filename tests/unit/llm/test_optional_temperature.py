@@ -327,6 +327,22 @@ async def test_litellm_honors_send_temperature_false(monkeypatch: pytest.MonkeyP
     assert all("send_temperature" not in call for call in calls)
 
 
+async def test_litellm_send_temperature_false_drops_constructor_temperature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from neo4j_agent_memory.llm.adapters.litellm import LiteLLMProvider
+
+    calls = _record_litellm(monkeypatch)
+    provider = LiteLLMProvider(
+        "bedrock/us.anthropic.claude-sonnet-5-5-v1:0", send_temperature=False, temperature=0.2
+    )
+
+    await provider.complete(_MESSAGES)
+    await provider.complete_structured(_MESSAGES, _Extraction)
+
+    assert all("temperature" not in call for call in calls)
+
+
 async def test_litellm_fallback_drops_bedrock_only_kwargs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
