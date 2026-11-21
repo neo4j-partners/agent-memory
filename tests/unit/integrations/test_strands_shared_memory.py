@@ -281,14 +281,23 @@ class TestAManagerOnASharedBridge:
         with pytest.raises(ValueError, match="memory_client"):
             Neo4jSessionManager("sess-1", settings=settings, bridge=AsyncBridge())
 
-    async def test_it_does_not_close_a_client_it_connected(self) -> None:
+    def test_bridge_needs_a_connected_client(self) -> None:
+        bridge = AsyncBridge()
+        try:
+            with pytest.raises(ValueError, match="connected"):
+                Neo4jSessionManager("sess-1", memory_client=FakeMemoryClient(), bridge=bridge)
+        finally:
+            bridge.close()
+
+    async def test_it_does_not_close_the_client(self) -> None:
         client = FakeMemoryClient()
         bridge = AsyncBridge()
+        await bridge.run_async(client.connect())
         manager = Neo4jSessionManager(
             "sess-1", memory_client=client, bridge=bridge, extract_entities=False
         )
         try:
-            await manager.aopen()  # connects the client on the shared loop
+            await manager.aopen()
             await manager.aclose()
             assert client.is_connected
             assert not bridge.closed
@@ -303,6 +312,7 @@ class TestAManagerOnASharedBridge:
 
         client.short_term.get_conversation = hang
         bridge = AsyncBridge(timeout=30.0)
+        await bridge.run_async(client.connect())
         manager = Neo4jSessionManager(
             "sess-1", memory_client=client, bridge=bridge, request_timeout=0.1
         )

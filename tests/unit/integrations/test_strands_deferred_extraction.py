@@ -220,6 +220,7 @@ class TestClosingWithDeferredExtractions:
         client = FakeMemoryClient()
         gate = _Gate(client)
         bridge = AsyncBridge()
+        await bridge.run_async(client.connect())
         manager = _deferring(client, bridge=bridge)
         try:
             await _agent(manager, "A1").invoke_async("Q1")

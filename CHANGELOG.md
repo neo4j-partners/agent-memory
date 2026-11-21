@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stops the loop before the error propagates. A connect can fail after
   it opened the driver. An error from that close is logged as a WARNING.
 - `Neo4jSessionManager(bridge=...)`. The manager runs its memory I/O on
-  that background loop and needs `memory_client=`. It closes neither the
+  that background loop and needs `memory_client=`. The client must
+  already be connected on that loop, or the manager raises `ValueError`. It closes neither the
   loop nor the client. Each manager keeps its own `request_timeout` on a
   shared loop.
 - `Neo4jSessionManager.aopen()` and `aclose()`. Await `aopen()` before

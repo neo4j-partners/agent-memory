@@ -166,8 +166,9 @@ class Neo4jSessionManager(SessionManager):
     constructed and owned by the manager).
 
     ``bridge`` runs the manager's memory I/O on a loop it does not own,
-    and it needs ``memory_client``. The client must be connected on that
-    bridge's loop, or not connected at all. A manager given a bridge
+    and it needs ``memory_client``. The client must already be connected
+    on that bridge's loop, or the manager raises ``ValueError``. A manager
+    given a bridge
     closes neither the bridge nor the client. Its ``close()`` writes its
     own messages and returns. ``SharedMemory`` builds managers this way,
     so many sessions share one client and one loop.
@@ -252,11 +253,17 @@ class Neo4jSessionManager(SessionManager):
             raise ValueError(
                 "Provide exactly one of memory_client= or settings= to Neo4jSessionManager."
             )
-        if bridge is not None and memory_client is None:
-            raise ValueError(
-                "bridge= needs memory_client=. A client built from settings= "
-                "connects on the manager's own bridge."
-            )
+        if bridge is not None:
+            if memory_client is None:
+                raise ValueError(
+                    "bridge= needs memory_client=. A client built from settings= "
+                    "connects on the manager's own bridge."
+                )
+            if not memory_client.is_connected:
+                raise ValueError(
+                    "bridge= needs a memory_client connected on that bridge's loop. "
+                    "The bridge's owner connects the client and closes it."
+                )
         if on_persist_error not in _PERSIST_ERROR_POLICIES:
             raise ValueError(
                 f"on_persist_error must be 'raise' or 'warn', not {on_persist_error!r}."
