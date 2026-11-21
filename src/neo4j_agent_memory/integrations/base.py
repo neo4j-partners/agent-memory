@@ -154,8 +154,8 @@ class AsyncBridge:
 
         A task that ignores the shutdown cancel is still pending when the
         loop closes, and its done callbacks never run. Shutdown then calls
-        ``callback`` itself and logs a WARNING that names the task. Runs on
-        the loop thread only.
+        ``callback`` itself and logs a WARNING that names the task. If that
+        call raises, a WARNING logs the error. Runs on the loop thread only.
         """
         token = object()
         self._when_done[token] = (task, callback)
@@ -167,7 +167,10 @@ class AsyncBridge:
             entry[1]()
 
     def _call_stranded(self) -> None:
-        """Run the callbacks of tasks that are still pending at shutdown."""
+        """Run the callbacks of tasks that are still pending at shutdown.
+
+        A callback that raises is logged as a WARNING, and the rest still run.
+        """
         for token in list(self._when_done):
             task, _ = self._when_done[token]
             logger.warning(
@@ -175,7 +178,12 @@ class AsyncBridge:
                 "closes. Its done callback runs now.",
                 task.get_name(),
             )
-            self._call_when_done(token)
+            try:
+                self._call_when_done(token)
+            except Exception:
+                logger.warning(
+                    "The done callback of task %r raised.", task.get_name(), exc_info=True
+                )
 
     @property
     def on_loop_thread(self) -> bool:

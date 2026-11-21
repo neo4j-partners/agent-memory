@@ -95,6 +95,41 @@ class TestAsyncBridge:
         assert calls == ["quick", "stuck"]
         assert "Task 'stuck' ignored cancellation" in caplog.text
 
+    def test_a_stranded_callback_that_raises_does_not_skip_the_rest(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from neo4j_agent_memory.integrations import base
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        monkeypatch.setattr(base, "_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+        caplog.set_level(logging.WARNING, logger="neo4j_agent_memory.integrations.base")
+        bridge = _AsyncBridge()
+        calls: list[str] = []
+
+        def broken() -> None:
+            calls.append("first")
+            raise RuntimeError("callback broke")
+
+        async def stubborn() -> None:
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    continue  # ignores every cancel
+
+        async def scenario() -> None:
+            first = asyncio.create_task(stubborn(), name="first")
+            bridge.when_done(first, broken)
+            second = asyncio.create_task(stubborn(), name="second")
+            bridge.when_done(second, lambda: calls.append("second"))
+
+        bridge.run(scenario())
+        bridge.close()
+
+        assert calls == ["first", "second"]
+        assert "The done callback of task 'first' raised" in caplog.text
+        assert "callback broke" in caplog.text
+
     def test_close_does_not_wait_for_a_hung_executor_job(
         self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
