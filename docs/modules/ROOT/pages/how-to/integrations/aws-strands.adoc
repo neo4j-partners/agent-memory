@@ -110,11 +110,28 @@ anchor:_constructor_reference[]
 |`retrieval_config` |`None` |A `Neo4jRetrievalConfig` turns on per-turn context injection. `None` means persistence only.
 |`extract_entities` |`True` |Runs entity extraction on stored messages (Bolt only; NAMS extracts server-side).
 |`record_tool_calls` |`False` |Records observed tool-use blocks in reasoning memory for audit.
-|`request_timeout` |`30.0` |Seconds to wait for each backend call made from Strands' synchronous hooks.
+|`request_timeout` |`30.0` |Seconds to wait for each backend call. A write that times out raises `SessionException`.
 |`restore_limit` |`None` |Maximum messages restored into the agent. `None` uses the backend default; Bolt returns up to 1000.
 |===
 
 `Neo4jSessionManager.for_nams(session_id, **kwargs)` builds a manager for the hosted service from `MEMORY_API_KEY` and optional `MEMORY_ENDPOINT`; `Neo4jMemoryStore.for_nams(config)` does the same for a store. The Bolt program above uses settings instead.
+
+=== Use the session manager from async code
+
+The manager's hooks run on the agent's event loop and await memory I/O on the manager's own background loop. A slow write does not stall other tasks on the agent's loop. This matters when one server loop runs many sessions.
+
+Strands calls `initialize` synchronously while it builds the `Agent`, so by default the history load blocks. In async code, await `aopen()` before you build the agent. The manager then restores the preloaded history with no I/O. Close with `await manager.aclose()` instead of `close()`, so the final write and the client close are awaited too.
+
+[source,python]
+----
+manager = Neo4jSessionManager(session_id, settings=settings)
+await manager.aopen()
+try:
+    agent = Agent(model=model, session_manager=manager)
+    result = await agent.invoke_async(prompt)
+finally:
+    await manager.aclose()
+----
 
 === Inject retrieved context per turn
 

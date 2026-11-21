@@ -1,0 +1,443 @@
+"""Fix A: the Strands session manager never blocks the agent's event loop.
+
+Strands awaits MessageAddedEvent and AfterInvocationEvent callbacks on the
+agent's loop. A hosted runtime can run every session on one shared loop, so
+a hook that blocks on a memory write stalls every session. These tests drive
+a real ``strands.Agent`` with a scripted model and a slow fake memory client.
+A ticker task on the agent's loop must keep ticking while memory I/O runs.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
+from collections.abc import AsyncIterator, Awaitable
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+pytest.importorskip("strands", reason="strands-agents not installed")
+
+from strands import Agent, tool  # noqa: E402
+from strands.models.model import Model  # noqa: E402
+from strands.types.exceptions import SessionException  # noqa: E402
+
+from neo4j_agent_memory.integrations.base import AsyncBridge  # noqa: E402
+from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E402
+    Neo4jRetrievalConfig,
+    Neo4jSessionManager,
+)
+from tests.unit.integrations.strands_fakes import FakeMemoryClient  # noqa: E402
+
+_TICK = 0.01
+
+
+class ScriptedModel(Model):
+    """A Strands model that replays canned assistant turns."""
+
+    def __init__(self, *turns: list[dict[str, Any]]) -> None:
+        self._turns = list(turns)
+        self.config: dict[str, Any] = {}
+
+    def update_config(self, **model_config: Any) -> None:
+        self.config.update(model_config)
+
+    def get_config(self) -> dict[str, Any]:
+        return self.config
+
+    async def structured_output(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        raise NotImplementedError
+        yield  # pragma: no cover - makes this an async generator
+
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        turn = self._turns.pop(0)
+        yield {"messageStart": {"role": "assistant"}}
+        for block in turn:
+            if "text" in block:
+                yield {"contentBlockStart": {"start": {}}}
+                yield {"contentBlockDelta": {"delta": {"text": block["text"]}}}
+            else:
+                use = block["toolUse"]
+                start = {"toolUse": {"toolUseId": use["toolUseId"], "name": use["name"]}}
+                yield {"contentBlockStart": {"start": start}}
+                yield {
+                    "contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(use["input"])}}}
+                }
+            yield {"contentBlockStop": {}}
+        stop = "tool_use" if any("toolUse" in b for b in turn) else "end_turn"
+        yield {"messageStop": {"stopReason": stop}}
+
+
+@tool
+def lookup(city: str) -> str:
+    """Look up the weather for a city."""
+    return f"Sunny in {city}"
+
+
+_TOOL_TURN = [
+    {"text": "Let me check."},
+    {"toolUse": {"toolUseId": "t1", "name": "lookup", "input": {"city": "Paris"}}},
+]
+
+
+def _slow_client(delay: float) -> FakeMemoryClient:
+    """A fake client whose add_message sleeps first, like a real write."""
+    client = FakeMemoryClient()
+    original = client.short_term.add_message
+
+    async def slow_add(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(delay)
+        return await original(*args, **kwargs)
+
+    client.short_term.add_message = slow_add  # type: ignore[method-assign]
+    return client
+
+
+def _stored(client: FakeMemoryClient) -> list[tuple[str, str]]:
+    return [(c["role"], c["content"]) for c in client.short_term.add_message_calls]
+
+
+def _agent(manager: Neo4jSessionManager, *turns: list[dict[str, Any]]) -> Agent:
+    return Agent(
+        model=ScriptedModel(*turns),
+        tools=[lookup],
+        session_manager=manager,
+        callback_handler=None,
+    )
+
+
+async def _ticks_during(work: Awaitable[Any]) -> int:
+    """Count ticks a sibling task gets on this loop while ``work`` runs."""
+    ticks = 0
+    done = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not done.is_set():
+            await asyncio.sleep(_TICK)
+            ticks += 1
+
+    task = asyncio.create_task(ticker())
+    try:
+        await work
+    finally:
+        done.set()
+        await task
+    return ticks
+
+
+# ---------------------------------------------------------------------------
+# AsyncBridge.run_async
+# ---------------------------------------------------------------------------
+
+
+class TestBridgeRunAsync:
+    async def test_runs_on_the_bridge_loop_and_returns_the_result(self) -> None:
+        bridge = AsyncBridge()
+
+        async def which_loop() -> int:
+            return id(asyncio.get_running_loop())
+
+        try:
+            bridge_loop = await bridge.run_async(which_loop())
+            assert bridge_loop != id(asyncio.get_running_loop())
+            assert bridge_loop == bridge.run(which_loop())
+        finally:
+            bridge.close()
+
+    async def test_caller_loop_keeps_running_while_work_runs(self) -> None:
+        bridge = AsyncBridge()
+        try:
+            ticks = await _ticks_during(bridge.run_async(asyncio.sleep(0.3)))
+        finally:
+            bridge.close()
+        assert ticks >= 10
+
+    async def test_timeout_raises_and_cancels_the_bridge_task(self) -> None:
+        bridge = AsyncBridge(timeout=0.05)
+        cancelled = threading.Event()
+
+        async def slow() -> None:
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        try:
+            with pytest.raises(TimeoutError):
+                await bridge.run_async(slow())
+            assert await asyncio.to_thread(cancelled.wait, 2)
+        finally:
+            bridge.close()
+
+    async def test_run_async_after_close_raises_and_closes_the_coroutine(self) -> None:
+        bridge = AsyncBridge()
+        bridge.close()
+
+        async def noop() -> None:
+            return None
+
+        coro = noop()
+        with pytest.raises(RuntimeError, match="AsyncBridge is closed"):
+            await bridge.run_async(coro)
+        assert coro.cr_frame is None
+        assert bridge._thread is None
+
+    @pytest.mark.parametrize("use_async", [False, True], ids=["run", "run_async"])
+    async def test_dead_thread_is_restarted(self, use_async: bool) -> None:
+        """A loop thread that died without close() starts again on next use."""
+        bridge = AsyncBridge()
+
+        async def answer() -> int:
+            return 42
+
+        try:
+            bridge.run(answer())
+            dead = bridge._thread
+            assert dead is not None and bridge._loop is not None
+            bridge._loop.call_soon_threadsafe(bridge._loop.stop)
+            dead.join(timeout=2)
+            assert not dead.is_alive()
+
+            if use_async:
+                assert await bridge.run_async(answer()) == 42
+            else:
+                assert bridge.run(answer()) == 42
+            # Thread idents can be reused, so compare the thread objects.
+            assert bridge._thread is not dead and bridge._thread.is_alive()
+        finally:
+            bridge.close()
+
+
+# ---------------------------------------------------------------------------
+# Hooks run off the agent's loop
+# ---------------------------------------------------------------------------
+
+
+class TestHooksDoNotBlockTheLoop:
+    async def test_agent_loop_keeps_running_during_memory_writes(self) -> None:
+        """The core regression: each write sleeps 0.3 s on the bridge loop."""
+        client = _slow_client(0.3)
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = _agent(manager, [{"text": "Hello!"}])
+        try:
+            ticks = await _ticks_during(agent.invoke_async("hi"))
+            assert _stored(client) == [("user", "hi"), ("assistant", "Hello!")]
+            # Two writes take 0.6 s. A blocked loop would barely tick.
+            assert ticks >= 30
+        finally:
+            await manager.aclose()
+
+    async def test_retrieval_does_not_block_the_loop(self) -> None:
+        client = FakeMemoryClient()
+        client.long_term.entities = [
+            SimpleNamespace(
+                display_name="Acme", type="ORGANIZATION", full_type="ORGANIZATION", description=None
+            )
+        ]
+        original = client.long_term.search_entities
+
+        async def slow_search(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(0.3)
+            return await original(*args, **kwargs)
+
+        client.long_term.search_entities = slow_search  # type: ignore[method-assign]
+        manager = Neo4jSessionManager(
+            "sess-1",
+            memory_client=client,
+            retrieval_config=Neo4jRetrievalConfig(include_preferences=False),
+        )
+        agent = _agent(manager, [{"text": "Acme is a customer."}])
+        try:
+            ticks = await _ticks_during(agent.invoke_async("tell me about Acme"))
+            assert ticks >= 15
+            # The agent saw the injected block; the stored text is the original.
+            assert agent.messages[0]["content"][0]["text"].startswith("<user_context>")
+            assert _stored(client)[0] == ("user", "tell me about Acme")
+        finally:
+            await manager.aclose()
+
+    async def test_aclose_does_not_block_the_loop(self) -> None:
+        client = _slow_client(0.3)
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = SimpleNamespace(messages=[], agent_id="a1")
+        manager.initialize(agent)
+        manager.append_message({"role": "user", "content": [{"text": "last"}]}, agent)
+
+        ticks = await _ticks_during(manager.aclose())
+
+        assert ticks >= 15
+        assert _stored(client) == [("user", "last")]
+        assert client.close_calls == 1
+        assert manager._bridge._thread is None
+
+
+class TestPersistenceThroughTheAgent:
+    async def test_tool_turn_persists_text_messages_in_order(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = _agent(manager, _TOOL_TURN, [{"text": "Sunny."}])
+        try:
+            await agent.invoke_async("weather in Paris?")
+            assert _stored(client) == [
+                ("user", "weather in Paris?"),
+                ("assistant", "Let me check."),
+                ("assistant", "Sunny."),
+            ]
+        finally:
+            await manager.aclose()
+
+    def test_sync_agent_call_still_persists(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = _agent(manager, [{"text": "Hello!"}])
+        try:
+            agent("hi")
+            assert _stored(client) == [("user", "hi"), ("assistant", "Hello!")]
+        finally:
+            manager.close()
+
+    def test_append_message_does_no_io(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = SimpleNamespace(messages=[], agent_id="a1")
+        manager.initialize(agent)
+
+        def no_io(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("append_message must not block on the bridge")
+
+        try:
+            manager._bridge.run = no_io  # type: ignore[method-assign]
+            manager.append_message({"role": "user", "content": [{"text": "one"}]}, agent)
+            manager.append_message({"role": "assistant", "content": [{"text": "two"}]}, agent)
+        finally:
+            del manager._bridge.run
+            manager.close()
+        assert _stored(client) == [("user", "one"), ("assistant", "two")]
+
+    async def test_write_timeout_surfaces_session_exception_without_hanging(self) -> None:
+        client = _slow_client(5)
+        manager = Neo4jSessionManager("sess-1", memory_client=client, request_timeout=0.1)
+        agent = _agent(manager, [{"text": "Hello!"}])
+        started = time.monotonic()
+        try:
+            with pytest.raises(Exception) as info:
+                await agent.invoke_async("hi")
+            assert time.monotonic() - started < 2
+            # Strands may wrap a hook error raised mid-cycle in EventLoopException.
+            chain = [info.value, info.value.__cause__]
+            failure = next(e for e in chain if isinstance(e, SessionException))
+            assert isinstance(failure.__cause__, TimeoutError)
+        finally:
+            manager._bridge.close()
+
+
+# ---------------------------------------------------------------------------
+# aopen(): initialize does no I/O
+# ---------------------------------------------------------------------------
+
+
+class TestAopen:
+    async def test_aopen_preloads_history_so_initialize_does_no_io(self) -> None:
+        client = FakeMemoryClient()
+        await client.short_term.create_conversation(session_id="sess-1")
+        await client.short_term.add_message("sess-1", "user", "earlier")
+        await client.short_term.add_message("sess-1", "assistant", "noted")
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+
+        await manager.aopen()
+
+        def no_io(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("initialize must not block on the bridge after aopen()")
+
+        manager._bridge.run = no_io  # type: ignore[method-assign]
+        try:
+            agent = _agent(manager, [{"text": "Hello again."}])
+        finally:
+            del manager._bridge.run
+        try:
+            assert [m["content"][0]["text"] for m in agent.messages] == ["earlier", "noted"]
+            await agent.invoke_async("hi")
+            assert _stored(client)[-2:] == [("user", "hi"), ("assistant", "Hello again.")]
+        finally:
+            await manager.aclose()
+
+    async def test_aopen_failure_raises_session_exception(self) -> None:
+        client = FakeMemoryClient()
+
+        async def boom(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("no database")
+
+        client.short_term.get_conversation = boom  # type: ignore[method-assign]
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        try:
+            with pytest.raises(SessionException, match="initialize"):
+                await manager.aopen()
+        finally:
+            await manager.aclose()
+
+    async def test_aopen_after_close_raises_session_exception(self) -> None:
+        manager = Neo4jSessionManager("sess-1", memory_client=FakeMemoryClient())
+        await manager.aclose()
+        with pytest.raises(SessionException, match="closed"):
+            await manager.aopen()
+
+    async def test_seeded_messages_are_written_by_the_first_hook(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        await manager.aopen()
+        agent = Agent(
+            model=ScriptedModel([{"text": "Hello!"}]),
+            session_manager=manager,
+            callback_handler=None,
+            messages=[
+                {"role": "user", "content": [{"text": "seed q"}]},
+                {"role": "assistant", "content": [{"text": "seed a"}]},
+            ],
+        )
+        try:
+            assert _stored(client) == []
+            await agent.invoke_async("hi")
+            assert _stored(client) == [
+                ("user", "seed q"),
+                ("assistant", "seed a"),
+                ("user", "hi"),
+                ("assistant", "Hello!"),
+            ]
+        finally:
+            await manager.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Closed manager: hooks raise SessionException, not a bridge RuntimeError
+# ---------------------------------------------------------------------------
+
+
+class TestHooksAfterClose:
+    @pytest.mark.parametrize("hook", ["_on_after_invocation", "_on_message_flush"])
+    async def test_hook_after_close_raises_session_exception(self, hook: str) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = SimpleNamespace(messages=[], agent_id="a1")
+        manager.initialize(agent)
+        manager.append_message({"role": "user", "content": [{"text": "x"}]}, agent)
+        client.short_term.fail_next_add = True
+        with pytest.raises(SessionException):
+            manager.close()  # the close-time write fails
+
+        event = SimpleNamespace(agent=agent, message={"role": "user", "content": []})
+        with pytest.raises(SessionException, match="closed"):
+            await getattr(manager, hook)(event)
+
+    async def test_aclose_is_idempotent_and_close_after_aclose_is_a_noop(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        manager.initialize(SimpleNamespace(messages=[], agent_id="a1"))
+        await manager.aclose()
+        await manager.aclose()
+        manager.close()
+        assert client.close_calls == 1

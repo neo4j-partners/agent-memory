@@ -32,11 +32,16 @@ class AsyncBridge:
     many sequential calls. Use run_sync for stateless one-shot calls; use
     AsyncBridge when the same client instance must serve multiple calls.
 
+    ``run()`` blocks the calling thread until the result arrives. From async
+    code, await ``run_async()`` instead, so the caller's event loop keeps
+    running.
+
     The loop thread starts lazily on first use. ``close()`` is final: a
     later ``run()`` raises ``RuntimeError`` instead of starting a new
     thread, so a closed owner cannot leak a loop thread or reuse
-    transports bound to the old loop. A thread that died without
-    ``close()`` is still restarted on the next ``run()``.
+    transports bound to the old loop. ``run_async()`` behaves the same way.
+    A thread that died without ``close()`` is still restarted on the next
+    ``run()`` or ``run_async()``.
     """
 
     def __init__(self, timeout: float = 30.0) -> None:
@@ -79,6 +84,27 @@ class AsyncBridge:
             raise
         future = asyncio.run_coroutine_threadsafe(coro, loop)
         return future.result(timeout=timeout if timeout is not None else self._timeout)
+
+    async def run_async(self, coro: Coroutine[Any, Any, T], timeout: float | None = None) -> T:
+        """Submit ``coro`` to the background loop and await its result.
+
+        Use this from async code. The caller's event loop stays free while
+        ``coro`` runs, so its other tasks keep running. ``coro`` still runs
+        on the bridge loop, next to the client's loop-bound transports.
+
+        On timeout this raises ``TimeoutError`` and cancels the bridge
+        task. Cancelling the caller also cancels the bridge task.
+        """
+        try:
+            loop = self._ensure_loop()
+        except RuntimeError:
+            coro.close()  # never scheduled; avoid a "never awaited" warning
+            raise
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return await asyncio.wait_for(
+            asyncio.wrap_future(future),
+            timeout if timeout is not None else self._timeout,
+        )
 
     def close(self) -> None:
         """Stop and discard the loop thread. Safe to call repeatedly.

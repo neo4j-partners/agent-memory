@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Neo4jSessionManager.aopen()` and `aclose()`. Await `aopen()` before
+  building the `Agent`, so restoring history does no blocking I/O. Await
+  `aclose()` to write the last turn and close the client from async code.
+
+### Fixed
+
+- `Neo4jSessionManager` no longer blocks the agent's event loop. Its
+  Strands hooks are now coroutines that await memory I/O on the manager's
+  background loop. A slow write no longer stalls other sessions that share
+  the loop. `append_message` now only buffers, and the next hook writes.
+
 ### Changed
 
 - **Behavior change:** LLM extraction, summarization, and every provider

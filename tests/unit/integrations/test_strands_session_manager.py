@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+
 import pytest
 
 pytest.importorskip("strands", reason="strands-agents not installed")
@@ -316,18 +319,19 @@ class TestInitialize:
 
 
 class TestAppendAndBuffer:
-    def test_append_buffers_then_flushes_on_next_append(self) -> None:
+    def test_append_buffers_and_the_message_hook_writes_older_messages(self) -> None:
         manager, client = _make_manager()
         try:
             agent = _fake_agent()
             manager.initialize(agent)
 
             manager.append_message({"role": "user", "content": [{"text": "one"}]}, agent)
+            manager.append_message({"role": "assistant", "content": [{"text": "two"}]}, agent)
             assert client.short_term.add_message_calls == []  # buffered, not stored
 
-            manager.append_message({"role": "assistant", "content": [{"text": "two"}]}, agent)
-            assert len(client.short_term.add_message_calls) == 1
-            assert client.short_term.add_message_calls[0]["content"] == "one"
+            # The MessageAddedEvent hook writes all but the latest message.
+            asyncio.run(manager._on_message_flush(SimpleNamespace(agent=agent)))
+            assert [c["content"] for c in client.short_term.add_message_calls] == ["one"]
         finally:
             manager.close()
 
@@ -641,7 +645,7 @@ class TestRetrievalInjection:
         try:
             manager.initialize(_fake_agent())
             message = {"role": "user", "content": [{"text": "tell me about Acme"}]}
-            manager._inject_context(message)
+            asyncio.run(manager._inject_context(message))
             text = message["content"][0]["text"]
             assert text.startswith("<user_context>")
             assert "[entity] Acme (ORGANIZATION) — customer" in text
@@ -656,7 +660,7 @@ class TestRetrievalInjection:
         try:
             manager.initialize(_fake_agent())
             message = {"role": "assistant", "content": [{"text": "answer"}]}
-            manager._inject_context(message)
+            asyncio.run(manager._inject_context(message))
             assert message["content"][0]["text"] == "answer"
         finally:
             manager.close()
@@ -669,7 +673,7 @@ class TestRetrievalInjection:
         try:
             manager.initialize(_fake_agent())
             message = {"role": "user", "content": [{"text": "hello"}]}
-            manager._inject_context(message)
+            asyncio.run(manager._inject_context(message))
             assert message["content"][0]["text"] == "hello"
         finally:
             manager.close()
@@ -683,7 +687,7 @@ class TestRetrievalInjection:
             manager.initialize(_fake_agent())
             message = {"role": "user", "content": [{"text": "hello"}]}
             with caplog.at_level(logging.WARNING):
-                manager._inject_context(message)
+                asyncio.run(manager._inject_context(message))
             assert message["content"][0]["text"] == "hello"  # turn not broken
         finally:
             manager.close()
@@ -696,7 +700,7 @@ class TestRetrievalInjection:
             message = {"role": "user", "content": [{"text": "tell me about Acme"}]}
             # Simulate the hook firing order: append (base) then inject (ours).
             manager.append_message(message, agent)
-            manager._inject_context(message)
+            asyncio.run(manager._inject_context(message))
             manager._flush_buffer()
             stored = client.short_term.add_message_calls[0]["content"]
             assert stored == "tell me about Acme"  # original, not augmented
@@ -720,8 +724,10 @@ class TestRetrievalInjection:
             # exactly as Strands dispatches this (non-reversed) event.
             event = SimpleNamespace(message=message, agent=agent)
             for event_type, callback in registry.callbacks:
-                if event_type is MessageAddedEvent:
-                    callback(event)
+                if event_type is MessageAddedEvent and inspect.isawaitable(
+                    result := callback(event)
+                ):
+                    asyncio.run(result)
             manager._flush_buffer()
             stored = client.short_term.add_message_calls[0]["content"]
             assert stored == "tell me about Acme"  # persisted original
@@ -734,9 +740,9 @@ class TestRetrievalInjection:
         try:
             manager.initialize(_fake_agent())
             message = {"role": "user", "content": [{"text": "tell me about Acme"}]}
-            manager._inject_context(message)
+            asyncio.run(manager._inject_context(message))
             once = message["content"][0]["text"]
-            manager._inject_context(message)
+            asyncio.run(manager._inject_context(message))
             assert message["content"][0]["text"] == once  # no double block
         finally:
             manager.close()
@@ -765,7 +771,7 @@ class TestRetrievalInjection:
             manager.initialize(_fake_agent())
             message = {"role": "user", "content": [{"text": "Acme?"}]}
             with caplog.at_level(logging.WARNING):
-                manager._inject_context(message)
+                asyncio.run(manager._inject_context(message))
             text = message["content"][0]["text"]
             assert "[entity] Acme (ORGANIZATION)" in text  # entity search still works
             assert client.wire.methods.count("search_entities") == 1
@@ -789,7 +795,7 @@ class TestRegisterHooks:
             agent = _fake_agent()
             manager.initialize(agent)
             manager.append_message({"role": "user", "content": [{"text": "x"}]}, agent)
-            flush_cb(SimpleNamespace(agent=agent))
+            asyncio.run(flush_cb(SimpleNamespace(agent=agent)))
             assert [c["content"] for c in client.short_term.add_message_calls] == ["x"]
         finally:
             manager.close()
@@ -920,7 +926,7 @@ class TestRetrievalInjectionTenancy:
         try:
             manager.initialize(_fake_agent())
             message = {"role": "user", "content": [{"text": "hi"}]}
-            manager._inject_context(message)
+            asyncio.run(manager._inject_context(message))
             text = message["content"][0]["text"]
 
             assert "[preference] style: concise answers" in text
@@ -957,10 +963,10 @@ class TestRetrievalInjectionExtended:
         try:
             manager.initialize(_fake_agent())
             message = {"role": "user", "content": [{"text": "tell me about Acme"}]}
-            manager._inject_context(message)
+            asyncio.run(manager._inject_context(message))
             count_after_first = client.long_term.search_calls
             assert count_after_first > 0  # sanity: first injection did search
-            manager._inject_context(message)  # second call on already-injected message
+            asyncio.run(manager._inject_context(message))  # second call on already-injected message
             assert client.long_term.search_calls == count_after_first  # no extra search
         finally:
             manager.close()

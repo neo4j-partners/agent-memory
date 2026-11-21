@@ -12,6 +12,7 @@ formatting), and ``integrations.base`` (the sync↔async bridge).
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 from typing import TYPE_CHECKING, Any
@@ -126,7 +127,9 @@ class Neo4jSessionManager(SessionManager):
             assert memory_client is not None  # guaranteed by the XOR check above
             self._client = memory_client
         self._conversation_key: str | None = None
-        self._pending: StrandsMessage | None = None  # write-behind buffer
+        self._pending: StrandsMessage | None = None  # latest message, still redactable
+        self._ready: list[StrandsMessage] = []  # older messages waiting for a hook to write
+        self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
         self._closed = False
@@ -216,9 +219,22 @@ class Neo4jSessionManager(SessionManager):
         if self._closed:
             raise SessionException(f"Session manager for session {self.session_id!r} is closed")
 
-    def _ensure_session(self) -> str:
-        """Resolve the conversation key on demand (lazy; does NOT load history)."""
-        return self._conversation_key or self._bridge.run(self._aresolve_key())
+    async def aopen(self) -> None:
+        """Connect and load history without blocking the caller's event loop.
+
+        Optional. Await it before building the ``Agent``. ``initialize`` then
+        uses the preloaded history and does no I/O, and any seeded messages
+        are written by the first hook instead. Without ``aopen()``,
+        ``initialize`` loads history itself and blocks until it arrives.
+
+        Raises:
+            SessionException: The manager is closed, or loading failed.
+        """
+        self._check_open()
+        try:
+            self._restored = await self._bridge.run_async(self._ainitialize())
+        except Exception as e:
+            raise SessionException(f"Failed to initialize session {self.session_id!r}") from e
 
     # ----------------------------------------------------- SessionManager API
 
@@ -282,10 +298,14 @@ class Neo4jSessionManager(SessionManager):
         """
         self._check_open()
         self._check_memory_manager_coexistence(agent)
-        try:
-            stored = self._bridge.run(self._ainitialize())
-        except Exception as e:
-            raise SessionException(f"Failed to initialize session {self.session_id!r}") from e
+        preloaded = self._restored is not None
+        if self._restored is not None:
+            stored, self._restored = self._restored, None
+        else:
+            try:
+                stored = self._bridge.run(self._ainitialize())
+            except Exception as e:
+                raise SessionException(f"Failed to initialize session {self.session_id!r}") from e
         if stored:
             # Normalizing can leave nothing, for example a lone stale user
             # message. The session still exists, so do not seed it below.
@@ -303,14 +323,23 @@ class Neo4jSessionManager(SessionManager):
             # New session seeded with pre-existing in-memory history.
             for message in list(agent.messages):
                 self.append_message(message, agent)
-            self._flush_buffer()
+            if preloaded:
+                # aopen() promised no I/O here; the first hook writes these.
+                self._release_pending()
+            else:
+                self._flush_buffer()
 
     def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
         """Wire base persistence hooks, then our flush + injection hooks.
 
+        Our hooks are coroutines. Strands awaits them on the agent's loop,
+        and they await memory I/O on the bridge loop, so the agent's loop
+        keeps running other tasks meanwhile.
+
         Order matters: Strands fires ``MessageAddedEvent`` callbacks in
-        registration order, so persistence (base ``MessageAddedEvent`` ->
-        append_message) always runs before context injection.
+        registration order, so buffering (base ``MessageAddedEvent`` ->
+        append_message) always runs before the write of older messages and
+        before context injection.
         AfterInvocationEvent dispatches in reverse registration order, so our
         flush runs before the base no-op sync_agent. That same reverse ordering
         means any user hooks registered after this manager run BEFORE our flush,
@@ -328,16 +357,23 @@ class Neo4jSessionManager(SessionManager):
         """
         super().register_hooks(registry, **kwargs)
         registry.add_callback(AfterInvocationEvent, self._on_after_invocation)
+        registry.add_callback(MessageAddedEvent, self._on_message_flush)
         if self._retrieval_config is not None:
             registry.add_callback(MessageAddedEvent, self._on_message_added)
 
-    def _on_after_invocation(self, event: AfterInvocationEvent) -> None:
-        self._flush_buffer()
+    async def _on_after_invocation(self, event: AfterInvocationEvent) -> None:
+        self._check_open()
+        await self._aflush_buffer()
 
-    def _on_message_added(self, event: MessageAddedEvent) -> None:
-        self._inject_context(event.message)
+    async def _on_message_flush(self, event: MessageAddedEvent) -> None:
+        """Write the messages ``append_message`` moved out of the slot."""
+        self._check_open()
+        await self._aflush_ready()
 
-    def _inject_context(self, message: StrandsMessage) -> None:
+    async def _on_message_added(self, event: MessageAddedEvent) -> None:
+        await self._inject_context(event.message)
+
+    async def _inject_context(self, message: StrandsMessage) -> None:
         """Prepend relevant long-term memories to a user message (in-memory only).
 
         Failures degrade: a memory lookup must never break the agent's turn.
@@ -355,7 +391,7 @@ class Neo4jSessionManager(SessionManager):
         if target is None or target["text"].startswith(f"<{cfg.context_tag}>\nRelevant memory:\n"):
             return  # no text block, or already injected (event re-fired)
         try:
-            block = self._bridge.run(
+            block = await self._bridge.run_async(
                 _retrieve_context(
                     self._client.long_term,
                     query,
@@ -375,15 +411,22 @@ class Neo4jSessionManager(SessionManager):
             target["text"] = f"{block}\n{target['text']}"
 
     def append_message(self, message: StrandsMessage, agent: Agent, **kwargs: Any) -> None:
-        """Buffer the new message, persisting the previously buffered one.
+        """Buffer the new message. Does no I/O.
 
-        The one-slot write-behind buffer exists so guardrail redaction can
-        rewrite the latest message before it ever reaches the backend
-        (NAMS has no message update/delete endpoint).
+        The latest message waits in a one-slot buffer so guardrail
+        redaction can rewrite it before it ever reaches the backend (NAMS
+        has no message update/delete endpoint). The message it replaces
+        moves to the ready queue, which the next hook writes.
         """
         self._check_open()
-        self._flush_buffer()
+        self._release_pending()
         self._pending = copy.deepcopy(message)
+
+    def _release_pending(self) -> None:
+        """Move the slot's message to the ready queue."""
+        if self._pending is not None:
+            self._ready.append(self._pending)
+            self._pending = None
 
     def redact_latest_message(
         self, redact_message: StrandsMessage, agent: Agent, **kwargs: Any
@@ -402,6 +445,10 @@ class Neo4jSessionManager(SessionManager):
         self._check_open()
         if self._pending is not None:
             self._pending = copy.deepcopy(redact_message)
+            return
+        if self._ready:
+            # Seeded by initialize() after aopen() and not written yet.
+            self._ready[-1] = copy.deepcopy(redact_message)
             return
         if self._last_persisted is None:
             logger.warning(
@@ -435,51 +482,87 @@ class Neo4jSessionManager(SessionManager):
         return None
 
     def _flush_buffer(self) -> None:
-        """Persist the buffered message, if any. Raises SessionException on failure."""
-        if self._pending is None:
-            return
-        message, self._pending = self._pending, None
-        if self._record_tool_calls:
-            self._record_tool_uses(message)
-        text = _message_text(message)
-        if not text:
-            return  # pure tool-use/result message: not memory, not stored
-        try:
-            self._store_message(message["role"], text, extract=self._extract_entities)
-        except Exception as e:
-            raise SessionException(
-                f"Failed to persist message for session {self.session_id!r}"
-            ) from e
+        """Persist every buffered message, blocking until done.
 
-    def _store_message(self, role: str, text: str, *, extract: bool) -> None:
-        """Resolve the session key and persist one message (tracked for late redaction)."""
-        self._last_persisted = self._bridge.run(
-            self._client.short_term.add_message(
-                self._ensure_session(),
-                role,
-                text,
-                extract_entities=extract,
-                user_identifier=self._user_id,
-                metadata={_SESSION_KEY: self.session_id},
-            )
-        )
+        For ``close()`` and other sync callers. Hooks await
+        ``_aflush_buffer`` instead. Raises SessionException on failure.
+        """
+        self._release_pending()
+        while self._ready:
+            message = self._ready.pop(0)
+            if blocks := self._tool_uses(message):
+                try:
+                    self._bridge.run(self._arecord_tool_uses(blocks))
+                except Exception as e:
+                    logger.warning("Failed to mirror tool calls to reasoning memory: %s", e)
+            if text := _message_text(message):
+                try:
+                    self._store_message(message["role"], text, extract=self._extract_entities)
+                except Exception as e:
+                    raise SessionException(
+                        f"Failed to persist message for session {self.session_id!r}"
+                    ) from e
 
-    def _record_tool_uses(self, message: StrandsMessage) -> None:
-        """Mirror toolUse blocks into reasoning memory (enrichment; never raises)."""
-        blocks = [
+    async def _aflush_buffer(self) -> None:
+        """Persist every buffered message without blocking the caller's loop."""
+        self._release_pending()
+        await self._aflush_ready()
+
+    async def _aflush_ready(self) -> None:
+        """Persist the ready queue in order, leaving the latest message buffered.
+
+        Raises SessionException on failure. Messages after the failed one
+        stay queued.
+        """
+        while self._ready:
+            message = self._ready.pop(0)
+            if blocks := self._tool_uses(message):
+                try:
+                    await self._bridge.run_async(self._arecord_tool_uses(blocks))
+                except Exception as e:
+                    logger.warning("Failed to mirror tool calls to reasoning memory: %s", e)
+            if text := _message_text(message):
+                try:
+                    self._last_persisted = await self._bridge.run_async(
+                        self._aadd_message(message["role"], text, extract=self._extract_entities)
+                    )
+                except Exception as e:
+                    raise SessionException(
+                        f"Failed to persist message for session {self.session_id!r}"
+                    ) from e
+
+    def _tool_uses(self, message: StrandsMessage) -> list[ToolUse]:
+        """The toolUse blocks to mirror into reasoning memory, if enabled.
+
+        A message with no text (pure tool use or result) is not memory, so
+        only its tool uses are recorded.
+        """
+        if not self._record_tool_calls:
+            return []
+        return [
             b["toolUse"]
             for b in (message.get("content") or [])
             if isinstance(b, dict) and "toolUse" in b
         ]
-        if not blocks:
-            return
-        try:
-            key = self._ensure_session()
-            self._bridge.run(self._arecord_tool_uses(key, blocks))
-        except Exception as e:
-            logger.warning("Failed to mirror tool calls to reasoning memory: %s", e)
 
-    async def _arecord_tool_uses(self, key: str, blocks: list[ToolUse]) -> None:
+    def _store_message(self, role: str, text: str, *, extract: bool) -> None:
+        """Persist one message, blocking (tracked for late redaction)."""
+        self._last_persisted = self._bridge.run(self._aadd_message(role, text, extract=extract))
+
+    async def _aadd_message(self, role: str, text: str, *, extract: bool) -> StoredMessage:
+        """Resolve the session key and add one message. Runs on the bridge loop."""
+        return await self._client.short_term.add_message(
+            await self._aresolve_key(),
+            role,
+            text,
+            extract_entities=extract,
+            user_identifier=self._user_id,
+            metadata={_SESSION_KEY: self.session_id},
+        )
+
+    async def _arecord_tool_uses(self, blocks: list[ToolUse]) -> None:
+        """Mirror toolUse blocks into reasoning memory. Runs on the bridge loop."""
+        key = await self._aresolve_key()
         trace_id = self._trace_id
         if trace_id is None:
             trace = await self._client.reasoning.start_trace(key, task="Strands agent session")
@@ -491,6 +574,20 @@ class Neo4jSessionManager(SessionManager):
                 trace_id, thought=f"Tool use: {name}", action=name
             )
             await self._client.reasoning.record_tool_call(step.id, name, block.get("input") or {})
+
+    async def aclose(self) -> None:
+        """Like ``close()``, but awaits the I/O so the caller's loop keeps running."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._aflush_buffer()
+        finally:
+            try:
+                if self._should_close_client and self._client.is_connected:
+                    await self._bridge.run_async(self._client.close())
+            finally:
+                await asyncio.to_thread(self._bridge.close)
 
     def close(self) -> None:
         """Flush, release the client (if owned/connected by us), stop the bridge."""
