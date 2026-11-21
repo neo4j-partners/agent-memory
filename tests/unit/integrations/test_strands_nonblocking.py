@@ -361,11 +361,13 @@ class TestHooksDoNotBlockTheLoop:
 
 class TestPersistenceThroughTheAgent:
     async def test_tool_turn_persists_text_messages_in_order(self) -> None:
-        client = FakeMemoryClient()
+        client = _slow_client(0.1)
         manager = Neo4jSessionManager("sess-1", memory_client=client)
         agent = _agent(manager, _TOOL_TURN, [{"text": "Sunny."}])
         try:
-            await agent.invoke_async("weather in Paris?")
+            ticks = await _ticks_during(agent.invoke_async("weather in Paris?"))
+            # Three writes take 0.3 s. A blocked loop would barely tick.
+            assert ticks >= 15
             assert _stored(client) == [
                 ("user", "weather in Paris?"),
                 ("assistant", "Let me check."),
@@ -406,15 +408,25 @@ class TestPersistenceThroughTheAgent:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         client = _slow_client(5)
-        manager = Neo4jSessionManager("sess-1", memory_client=client, request_timeout=0.1)
+        manager = Neo4jSessionManager("sess-1", memory_client=client, request_timeout=0.5)
         agent = _agent(manager, [{"text": "Hello!"}])
+        errors: list[Exception] = []
+
+        async def invoke() -> None:
+            try:
+                await agent.invoke_async("hi")
+            except Exception as e:  # noqa: BLE001 - checked below
+                errors.append(e)
+
         started = time.monotonic()
         try:
-            with pytest.raises(Exception) as info:
-                await agent.invoke_async("hi")
+            ticks = await _ticks_during(invoke())
             assert time.monotonic() - started < 2
+            # The 0.5 s wait must not block the loop.
+            assert ticks >= 20
+            assert len(errors) == 1
             # Strands may wrap a hook error raised mid-cycle in EventLoopException.
-            chain = [info.value, info.value.__cause__]
+            chain = [errors[0], errors[0].__cause__]
             failure = next(e for e in chain if isinstance(e, SessionException))
             assert isinstance(failure.__cause__, TimeoutError)
         finally:
@@ -629,6 +641,73 @@ class TestAopen:
             ]
         finally:
             await manager.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Redaction rewrites the queue before anything reaches the backend
+# ---------------------------------------------------------------------------
+
+
+class RedactingModel(ScriptedModel):
+    """A model whose guardrail redacts the user's message before replying."""
+
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        yield {"redactContent": {"redactUserContentMessage": "[REDACTED]"}}
+        async for event in super().stream(*args, **kwargs):
+            yield event
+
+
+class TestRedactionThroughTheAgent:
+    async def test_redaction_rewrites_a_queued_seed_message(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        await manager.aopen()
+        agent = SimpleNamespace(
+            messages=[
+                {"role": "user", "content": [{"text": "seed q"}]},
+                {"role": "user", "content": [{"text": "my SSN is 123-45-6789"}]},
+            ],
+            agent_id="a1",
+        )
+        manager.initialize(agent)  # queues the seed; aopen promised no I/O here
+        manager.redact_latest_message({"role": "user", "content": [{"text": "[REDACTED]"}]}, agent)
+        try:
+            await manager._aflush_buffer()
+            assert _stored(client) == [("user", "seed q"), ("user", "[REDACTED]")]
+        finally:
+            await manager.aclose()
+
+    @pytest.mark.parametrize("seeded", [False, True], ids=["fresh", "seeded"])
+    async def test_guardrail_redaction_stores_only_the_redacted_text(self, seeded: bool) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        seed = [
+            {"role": "user", "content": [{"text": "seed q"}]},
+            {"role": "assistant", "content": [{"text": "seed a"}]},
+        ]
+        if seeded:
+            await manager.aopen()
+        agent = Agent(
+            model=RedactingModel(_TOOL_TURN, [{"text": "done"}]),
+            tools=[lookup],
+            session_manager=manager,
+            callback_handler=None,
+            messages=seed if seeded else None,
+        )
+        try:
+            await agent.invoke_async("secret 123")
+        finally:
+            await manager.aclose()
+
+        stored = _stored(client)
+        assert all("secret 123" not in text for _, text in stored)
+        expected_turn = [
+            ("user", "[REDACTED]"),
+            ("assistant", "Let me check."),
+            ("assistant", "done"),
+        ]
+        expected_seed = [("user", "seed q"), ("assistant", "seed a")] if seeded else []
+        assert stored == expected_seed + expected_turn
 
 
 # ---------------------------------------------------------------------------
