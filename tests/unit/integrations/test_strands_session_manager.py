@@ -125,6 +125,59 @@ class TestAsyncBridge:
         coro.close()
         assert bridge._thread is None
 
+    def test_run_on_the_loop_thread_raises_at_once(self) -> None:
+        import time
+
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        bridge = _AsyncBridge(timeout=1.0)
+
+        async def noop() -> None:
+            return None
+
+        inner = noop()
+
+        async def nested_run() -> tuple[BaseException | None, float]:
+            start = time.monotonic()
+            try:
+                bridge.run(inner)
+            except Exception as e:
+                return e, time.monotonic() - start
+            return None, time.monotonic() - start
+
+        try:
+            error, elapsed = bridge.run(nested_run(), timeout=5.0)
+            assert isinstance(error, RuntimeError)
+            assert "loop thread" in str(error)
+            assert elapsed < 0.5  # not a wait until the timeout
+            assert inner.cr_frame is None  # refused unscheduled, then closed
+        finally:
+            bridge.close()
+
+    def test_close_on_the_loop_thread_raises_and_leaves_the_bridge_open(self) -> None:
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        bridge = _AsyncBridge()
+
+        async def nested_close() -> BaseException | None:
+            try:
+                bridge.close()
+            except Exception as e:
+                return e
+            return None
+
+        async def answer() -> int:
+            return 42
+
+        try:
+            error = bridge.run(nested_close())
+            assert isinstance(error, RuntimeError)
+            assert "loop thread" in str(error)
+            assert not bridge.closed
+            assert bridge.run(answer()) == 42
+        finally:
+            bridge.close()
+
 
 class TestMappingHelpers:
     def test_message_text_concatenates_text_blocks(self) -> None:
@@ -492,6 +545,25 @@ class TestCloseSemantics:
         manager.initialize(_fake_agent())
         manager.close()
         assert client.close_calls == 0
+
+    def test_close_on_the_bridge_thread_raises_and_leaves_the_manager_open(self) -> None:
+        manager, client = _make_manager(request_timeout=1.0)
+        agent = _fake_agent()
+        manager.initialize(agent)
+        manager.append_message({"role": "user", "content": [{"text": "a"}]}, agent)
+
+        async def nested_close() -> BaseException | None:
+            try:
+                manager.close()
+            except Exception as e:
+                return e
+            return None
+
+        error = manager._bridge.run(nested_close(), timeout=5.0)
+        assert isinstance(error, RuntimeError)
+        assert "sess-1" in str(error)
+        manager.close()  # from this thread it works, and the message is written
+        assert [c["content"] for c in client.short_term.add_message_calls] == ["a"]
 
     def test_context_manager_calls_close(self) -> None:
         manager, client = _make_manager()

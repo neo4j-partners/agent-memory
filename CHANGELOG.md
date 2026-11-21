@@ -44,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `AsyncBridge.run()` and `AsyncBridge.close()` now raise
+  `RuntimeError` when called on the bridge's own loop thread.
+  `run()` used to block there until its timeout, and `close()` stopped
+  the loop under its caller. `Neo4jSessionManager.close()` raises the
+  same way on that thread and leaves the manager open, with its
+  messages still queued.
 - A guardrail redaction that lands while `Neo4jSessionManager` is
   writing the message is no longer lost. Once the write finishes, Bolt
   deletes the stored original and stores the redacted text. NAMS keeps

@@ -936,7 +936,17 @@ class Neo4jSessionManager(SessionManager):
 
         A call made while another close is running returns at once. Waiting
         here could block the event loop that close is running on.
+
+        Raises:
+            RuntimeError: The caller runs on the bridge's loop thread, where
+                waiting for the writes would block them. The manager stays
+                open.
         """
+        if self._bridge.on_loop_thread:
+            raise RuntimeError(
+                f"Neo4jSessionManager.close() for session {self.session_id!r} "
+                "cannot run on its bridge loop thread. Call it from another thread."
+            )
         closing = self._begin_close()
         if closing is None:
             return
