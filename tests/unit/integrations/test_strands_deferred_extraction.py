@@ -228,6 +228,14 @@ class TestDeferredExtraction:
 
         assert gate.started == ["Q1"]
 
+    @pytest.mark.parametrize("defer", [False, True], ids=["inline", "deferred"])
+    def test_a_deferred_extraction_is_not_a_step_of_the_drain_wait(self, defer: bool) -> None:
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=FakeMemoryClient(), request_timeout=1.0, defer_extraction=defer
+        )
+
+        assert manager._drain_timeout() == (1.0 if defer else 2.0)
+
     @pytest.mark.parametrize("backend", ["nams", "no extraction"])
     async def test_no_extraction_starts_when_the_drain_would_not_extract(
         self, backend: str
