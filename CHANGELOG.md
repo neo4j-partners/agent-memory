@@ -255,7 +255,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   turn, because the caller got an answer. A turn paused by an interrupt
   stays buffered, and the call that resumes it writes the whole turn. A
   resume that a BeforeInvocationEvent hook cancels keeps the turn
-  paused. Messages appended outside an agent call are written when the
+  paused. A call that raises while Strands still holds an interrupt
+  keeps its turn paused too, so the call that resumes it writes the
+  whole turn. Messages appended outside an agent call are written when the
   next call starts, or at close. A process that stops mid-turn loses
   that turn.
 - **Behavior change:** LLM extraction, summarization, and every provider

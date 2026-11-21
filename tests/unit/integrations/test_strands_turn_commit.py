@@ -23,7 +23,11 @@ from pydantic import BaseModel
 pytest.importorskip("strands", reason="strands-agents not installed")
 
 from strands import Agent, ToolContext, tool  # noqa: E402
-from strands.hooks import AfterInvocationEvent, BeforeInvocationEvent  # noqa: E402
+from strands.hooks import (  # noqa: E402
+    AfterInvocationEvent,
+    AfterToolsEvent,
+    BeforeInvocationEvent,
+)
 from strands.types.agent import ConcurrentInvocationMode  # noqa: E402
 
 from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E402
@@ -399,6 +403,26 @@ class TestAnInterruptedTurn:
             ("assistant", "Asking for approval."),
             ("assistant", "Done."),
         ]
+
+    @pytest.mark.parametrize("end_missed", [False, True], ids=["end_seen", "end_missed"])
+    async def test_a_call_that_fails_at_an_interrupt_is_kept_for_its_resume(
+        self, end_missed: bool
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _approval_agent(manager)
+        agent.hooks.add_callback(AfterToolsEvent, _once(_crash))  # Strands keeps the interrupt
+        if end_missed:
+            agent.hooks.add_callback(AfterInvocationEvent, _once(_crash))  # runs before ours
+        try:
+            # Strands wraps the tools hook's error in EventLoopException.
+            with pytest.raises(Exception, match="hook failed"):
+                await agent.invoke_async("delete the file")
+            paused = SimpleNamespace(interrupts=list(agent._interrupt_state.interrupts.values()))
+            await agent.invoke_async(_answer(paused))
+        finally:
+            await manager.aclose()
+        assert _stored(client) == _FULL_APPROVAL_TURN
 
     async def test_a_cancelled_resume_keeps_the_turn_paused(self) -> None:
         client = FakeMemoryClient()

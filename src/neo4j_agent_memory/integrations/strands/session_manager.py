@@ -621,11 +621,9 @@ class Neo4jSessionManager(SessionManager):
         invocation lock. A turn owned by another such call is then left
         over. Otherwise the owner's task has finished, or this call runs in
         that task with no message added since. This call takes over, and
-        the left-over turn is discarded with a warning, as for any call
-        that raised. A turn paused by an interrupt that Strands still holds
-        keeps its paused messages. A left-over turn that is not a resume
-        and stopped at an interrupt Strands still holds is paused instead,
-        so the call that resumes it writes the whole turn.
+        the left-over turn is handled as for any call that raised. See
+        ``_discard_failed_turn_locked``. Unless the whole turn is kept, a
+        warning reports how many messages were discarded.
         """
         self._check_open()
         task = asyncio.current_task()
@@ -634,10 +632,7 @@ class Neo4jSessionManager(SessionManager):
         with self._queue_lock:
             state = self._turn_state
             if state == "running" and self._left_over(task, locks):
-                if self._resume_from is None and _interrupt_active(event.agent):
-                    self._turn_state = "paused"  # the owner stopped at an interrupt
-                else:
-                    discarded = self._discard_failed_turn_locked(event.agent)
+                discarded = self._discard_failed_turn_locked(event.agent)
                 self._owner = None
                 self._owner_task = None
                 # Only the owner's call is gone. A call that overlapped it,
@@ -708,9 +703,8 @@ class Neo4jSessionManager(SessionManager):
         signal set means ``agent.cancel()`` or a ``cancel_signal`` stopped
         it. The turn's messages are then discarded with an INFO log, so a
         failed turn never stores a prompt without its reply. A call that
-        resumes a paused turn and fails that way discards only what it
-        added. The turn stays paused while Strands still holds the
-        interrupt.
+        fails while Strands still holds an interrupt pauses the turn
+        instead. See ``_discard_failed_turn_locked``.
 
         Any other result means the turn succeeded, so its messages are
         written in order. That covers the ``limit_*`` stop reasons, since
@@ -787,7 +781,7 @@ class Neo4jSessionManager(SessionManager):
             if result is not None and result.stop_reason == "interrupt":
                 self._turn_state = "paused"
             elif failed:
-                discarded = self._discard_failed_turn_locked(agent)
+                discarded = self._discard_failed_turn_locked(agent) or 0
             else:
                 self._turn_state = "idle"
                 self._resume_from = None
@@ -795,17 +789,22 @@ class Neo4jSessionManager(SessionManager):
             self._turns_ended += 1  # after the release, which numbers the messages
             return discarded, turn
 
-    def _discard_failed_turn_locked(self, agent: Agent | None) -> int:
+    def _discard_failed_turn_locked(self, agent: Agent | None) -> int | None:
         """Discard a failed turn's messages and return how many. Holds _queue_lock.
 
-        A failed resume of a turn that Strands still holds paused discards
-        only what the resume added, and the turn stays paused. Any other
-        failed turn is discarded whole, and the turn goes idle.
+        A call that fails while Strands still holds an interrupt leaves the
+        turn paused, since the next call must resume it. A failed resume
+        discards only what it added. A failed call that was not a resume
+        keeps its whole turn, so the call that resumes it writes the whole
+        turn. This returns None then. Any other failed turn is discarded
+        whole, and the turn goes idle.
         """
-        if self._resume_from is not None and _interrupt_active(agent):
+        if _interrupt_active(agent):
+            self._turn_state = "paused"
+            if self._resume_from is None:
+                return None
             discarded = len(self._turn) - self._resume_from
             del self._turn[self._resume_from :]
-            self._turn_state = "paused"
             return discarded
         discarded = len(self._turn)
         self._turn.clear()
