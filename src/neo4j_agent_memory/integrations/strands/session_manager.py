@@ -502,7 +502,8 @@ class Neo4jSessionManager(SessionManager):
         """Persist every buffered message, blocking until done.
 
         For ``close()`` and other sync callers. Hooks await
-        ``_aflush_buffer`` instead. Raises SessionException on failure.
+        ``_aflush_buffer`` instead. Raises SessionException on failure, and
+        the failed message stays queued (see ``_adrain``).
         """
         self._release_pending()
         try:
@@ -526,8 +527,8 @@ class Neo4jSessionManager(SessionManager):
         or a timeout, stops only the wait. The write itself runs to
         completion, and ``close()`` waits for it.
 
-        Raises SessionException on failure. The failed message is lost, and
-        messages after it stay queued.
+        Raises SessionException on failure. The failed message stays at the
+        head of the queue, and the next flush retries it (see ``_adrain``).
         """
         try:
             future = self._submit_drain()
@@ -554,6 +555,12 @@ class Neo4jSessionManager(SessionManager):
         and a sync ``close()`` on another thread) cannot reorder or
         double-write messages. A message leaves the queue only once its
         write has finished.
+
+        Delivery is at least once. A failed write leaves its message at the
+        head of the queue for the next drain to retry, ahead of every later
+        message. Neither backend lets the caller set a message id, so a
+        retry after a write that failed late, for example once the backend
+        had stored it, can store the message twice.
         """
         if self._drain_lock is None:
             self._drain_lock = asyncio.Lock()
@@ -564,14 +571,9 @@ class Neo4jSessionManager(SessionManager):
                         return
                     message = self._ready[0]
                 if text := _message_text(message):
-                    try:
-                        self._last_persisted = await self._aadd_message(
-                            message["role"], text, extract=self._extract_entities
-                        )
-                    except BaseException:
-                        with self._queue_lock:
-                            self._ready.popleft()
-                        raise
+                    self._last_persisted = await self._aadd_message(
+                        message["role"], text, extract=self._extract_entities
+                    )
                 with self._queue_lock:
                     self._ready.popleft()
                 if blocks := self._tool_uses(message):

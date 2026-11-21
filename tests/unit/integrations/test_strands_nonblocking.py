@@ -513,6 +513,29 @@ class TestWritesRunToCompletion:
 
         assert _stored(client) == [("user", "one"), ("user", "two"), ("user", "three")]
 
+    @pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+    async def test_a_failed_message_stays_queued_for_the_next_flush(self, use_async: bool) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        _buffered(manager, "one", "two")
+
+        async def flush() -> None:
+            if use_async:
+                await manager._aflush_buffer()
+            else:
+                await asyncio.to_thread(manager._flush_buffer)
+
+        client.short_term.fail_next_add = True
+        try:
+            with pytest.raises(SessionException):
+                await flush()
+            assert _stored(client) == []
+
+            await flush()
+            assert _stored(client) == [("user", "one"), ("user", "two")]
+        finally:
+            await manager.aclose()
+
     async def test_aclose_during_a_turn_keeps_order(self) -> None:
         client = _slow_client(0.3)
         manager = Neo4jSessionManager("sess-1", memory_client=client)

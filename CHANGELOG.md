@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waiting on cancelled work gets `RuntimeError`, not a bare
   `CancelledError`, and a `run()` in flight no longer waits for its
   timeout.
+- A `Neo4jSessionManager` message whose write fails now stays at the head
+  of the queue, and the next flush retries it before any later message.
+  Before, the failed message was lost. Delivery is at least once. Neither
+  backend lets the caller set a message id, so a write that failed after
+  the backend stored it can be stored twice.
 
 ### Changed
 
