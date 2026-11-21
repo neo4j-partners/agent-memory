@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -52,6 +52,8 @@ T = TypeVar("T", bound=BaseModel)
 
 
 _DEFAULT_MAX_TOKENS = 4096
+
+_TOOL_CHOICES = ("tool", "auto")
 
 
 def _strip_provider_prefix(model: str) -> str:
@@ -138,6 +140,26 @@ class BedrockProvider:
             "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
             aws_region="us-west-2",
         )
+
+    Two options adjust the Converse request for models that reject parts
+    of it:
+
+    * ``send_temperature``: When False, the provider never sends a
+      temperature, even when a caller passes one. A ``temperature`` of
+      ``None`` is never sent either way.
+    * ``tool_choice``: Controls ``complete_structured`` on Anthropic
+      models. ``None`` or ``"tool"`` forces the ``submit_extraction``
+      tool. ``"auto"`` lets the model choose. If the model answers in
+      text instead, the provider falls back to ``schema_aligned_extract``.
+
+    Claude Sonnet 5.5 and similar models reject both a temperature and a
+    forced tool choice. Configure them like this::
+
+        provider = BedrockProvider(
+            "bedrock/us.anthropic.claude-sonnet-5-5-v1:0",
+            send_temperature=False,
+            tool_choice="auto",
+        )
     """
 
     def __init__(
@@ -151,7 +173,11 @@ class BedrockProvider:
         timeout: float = 60.0,
         return_raw: bool = False,
         default_max_tokens: int = _DEFAULT_MAX_TOKENS,
+        send_temperature: bool = True,
+        tool_choice: Literal["tool", "auto"] | None = None,
     ) -> None:
+        if tool_choice is not None and tool_choice not in _TOOL_CHOICES:
+            raise ValueError(f"tool_choice must be None, 'tool', or 'auto', not {tool_choice!r}")
         bare = _strip_provider_prefix(model)
         self.model = f"bedrock/{bare}"
         self._bare_model = bare
@@ -162,7 +188,16 @@ class BedrockProvider:
         self._timeout = timeout
         self._return_raw = return_raw
         self._default_max_tokens = default_max_tokens
+        self._send_temperature = send_temperature
+        self._tool_choice = tool_choice
         self._client: Any | None = None
+
+    def _inference_config(self, temperature: float | None, max_tokens: int) -> dict[str, Any]:
+        """Build ``inferenceConfig``, leaving temperature out when it must not be sent."""
+        config: dict[str, Any] = {"maxTokens": max_tokens}
+        if self._send_temperature and temperature is not None:
+            config["temperature"] = temperature
+        return config
 
     def _ensure_client(self) -> Any:
         if self._client is None:
@@ -193,17 +228,17 @@ class BedrockProvider:
         self,
         messages: Sequence[ChatMessage],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         timeout: float | None = None,
     ) -> Completion:
         client = self._ensure_client()
         system, conv_messages = _converse_messages(messages)
-        inference_config: dict[str, Any] = {
-            "temperature": temperature,
-            "maxTokens": max_tokens if max_tokens is not None else self._default_max_tokens,
-        }
+        inference_config = self._inference_config(
+            temperature,
+            max_tokens if max_tokens is not None else self._default_max_tokens,
+        )
         if stop is not None:
             inference_config["stopSequences"] = list(stop)
         kwargs: dict[str, Any] = {
@@ -244,7 +279,7 @@ class BedrockProvider:
         messages: Sequence[ChatMessage],
         response_model: type[T],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
     ) -> T:
@@ -252,7 +287,9 @@ class BedrockProvider:
 
         Only Anthropic models on Bedrock reliably support forced tool use
         through Converse. For Titan and Llama models we delegate to the
-        generic SAP retry loop.
+        generic SAP retry loop. When the model replies without a valid
+        ``submit_extraction`` call, which ``tool_choice="auto"`` allows,
+        the SAP loop takes over.
         """
         if not _is_anthropic_on_bedrock(self._bare_model):
             return await schema_aligned_extract(
@@ -279,13 +316,14 @@ class BedrockProvider:
         kwargs: dict[str, Any] = {
             "modelId": self._bare_model,
             "messages": conv_messages,
-            "inferenceConfig": {
-                "temperature": temperature,
-                "maxTokens": self._default_max_tokens,
-            },
+            "inferenceConfig": self._inference_config(temperature, self._default_max_tokens),
             "toolConfig": {
                 "tools": [tool_spec],
-                "toolChoice": {"tool": {"name": "submit_extraction"}},
+                "toolChoice": (
+                    {"auto": {}}
+                    if self._tool_choice == "auto"
+                    else {"tool": {"name": "submit_extraction"}}
+                ),
             },
         }
         if system is not None:

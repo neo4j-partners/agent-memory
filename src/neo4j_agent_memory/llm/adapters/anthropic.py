@@ -59,7 +59,7 @@ _DEFAULT_MAX_TOKENS = 4096
 _sampling_warning_emitted = False
 
 
-def _note_dropped_temperature(temperature: float) -> None:
+def _note_dropped_temperature(temperature: float | None) -> None:
     """Log once when a caller asks for a temperature Anthropic no longer accepts.
 
     ``messages.create()`` has no ``temperature`` parameter on the anthropic 1.x
@@ -68,7 +68,7 @@ def _note_dropped_temperature(temperature: float) -> None:
     between what the caller asked for and what was sent, so say it once.
     """
     global _sampling_warning_emitted
-    if temperature == 0.0 or _sampling_warning_emitted:
+    if temperature is None or temperature == 0.0 or _sampling_warning_emitted:
         return
     _sampling_warning_emitted = True
     logger.warning(
@@ -250,7 +250,7 @@ class AnthropicProvider:
         self,
         messages: Sequence[ChatMessage],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         timeout: float | None = None,
@@ -298,7 +298,7 @@ class AnthropicProvider:
         messages: Sequence[ChatMessage],
         response_model: type[T],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
     ) -> T:

@@ -88,16 +88,17 @@ class InstructorProvider:
         messages: Sequence[ChatMessage],
         response_model: type[T],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
     ) -> T:
         kwargs: dict[str, Any] = {
             "response_model": response_model,
             "messages": [m.model_dump(exclude_none=True) for m in messages],
-            "temperature": temperature,
             "max_retries": max_retries,
         }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if timeout is not None:
             kwargs["timeout"] = timeout
         # instructor.AsyncInstructor.create() is typed as returning ``T | Any``

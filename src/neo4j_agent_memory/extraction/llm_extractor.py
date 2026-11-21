@@ -182,7 +182,7 @@ class LLMEntityExtractor(EntityExtractor):
         entity_types: list[str] | None = None,
         subtypes: dict[str, list[str]] | None = None,
         extraction_prompt: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         extract_relations: bool = True,
         extract_preferences: bool = True,
         ontology: OntologyDocument | None = None,
@@ -200,7 +200,8 @@ class LLMEntityExtractor(EntityExtractor):
             subtypes: Per-type subtype hints. Defaults to the POLE+O table,
                 or — when ``ontology`` is set — to the subtypes it declares.
             extraction_prompt: Override for the prompt template.
-            temperature: Sampling temperature.
+            temperature: Sampling temperature. ``None`` uses the model's
+                default and sends no temperature.
             extract_relations: Whether to request relations.
             extract_preferences: Whether to request preferences.
             ontology: Optional ontology. When set, the prompt's type guidance

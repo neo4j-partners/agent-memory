@@ -63,7 +63,7 @@ class LLMProvider(Protocol):
         self,
         messages: Sequence[ChatMessage],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         timeout: float | None = None,
@@ -74,6 +74,7 @@ Implementations MUST:
 
 * Be safe to call concurrently — no shared mutable state.
 * Translate SDK-specific errors to `ProviderError` subclasses.
+* Leave temperature out of the request when `temperature` is `None`. The model's own default then applies.
 * Honor `temperature=0.0` as deterministic where the provider supports it.
 
 The protocol requires the canonical `"provider/model"` identifier in the `model` attribute. Adapters that accept bare names normalise to include the prefix.
@@ -90,7 +91,7 @@ class StructuredExtractor(Protocol):
         messages: Sequence[ChatMessage],
         response_model: type[T],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
     ) -> T: ...
@@ -203,7 +204,7 @@ async def schema_aligned_extract(
     messages: Sequence[ChatMessage],
     response_model: type[T],
     *,
-    temperature: float = 0.0,
+    temperature: float | None = None,
     max_retries: int = 2,
     timeout: float | None = None,
 ) -> T: ...

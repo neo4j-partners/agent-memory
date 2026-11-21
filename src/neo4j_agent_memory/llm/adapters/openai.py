@@ -196,7 +196,7 @@ class OpenAIProvider(_OpenAISDKMixin):
         self,
         messages: Sequence[ChatMessage],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         timeout: float | None = None,
@@ -205,8 +205,9 @@ class OpenAIProvider(_OpenAISDKMixin):
         kwargs: dict[str, Any] = {
             "model": self._bare_model,
             "messages": [m.model_dump(exclude_none=True) for m in messages],
-            "temperature": temperature,
         }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         if stop is not None:
@@ -236,7 +237,7 @@ class OpenAIProvider(_OpenAISDKMixin):
         messages: Sequence[ChatMessage],
         response_model: type[T],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
     ) -> T:
@@ -271,7 +272,7 @@ class OpenAIProvider(_OpenAISDKMixin):
         messages: Sequence[ChatMessage],
         response_model: type[T],
         *,
-        temperature: float,
+        temperature: float | None,
         timeout: float | None,
     ) -> T:
         """One-shot strict-mode call. Raises on validation/schema errors."""
@@ -287,7 +288,6 @@ class OpenAIProvider(_OpenAISDKMixin):
         kwargs: dict[str, Any] = {
             "model": self._bare_model,
             "messages": [m.model_dump(exclude_none=True) for m in messages],
-            "temperature": temperature,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -297,6 +297,8 @@ class OpenAIProvider(_OpenAISDKMixin):
                 },
             },
         }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if timeout is not None:
             kwargs["timeout"] = timeout
 

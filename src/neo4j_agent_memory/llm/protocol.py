@@ -49,7 +49,9 @@ class LLMProvider(Protocol):
     * Be safe to call concurrently — no shared mutable state.
     * Translate provider-specific errors to
       :class:`~neo4j_agent_memory.llm.errors.ProviderError` subclasses.
-    * Honor ``temperature=0.0`` as deterministic when the provider supports it.
+    * Leave ``temperature`` out of the request when it is ``None``, so the
+      model's own default applies. Honor ``temperature=0.0`` as
+      deterministic when the provider supports it.
 
     Attributes:
         model: Canonical ``"provider/model"`` identifier (e.g.
@@ -64,7 +66,7 @@ class LLMProvider(Protocol):
         self,
         messages: Sequence[ChatMessage],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         timeout: float | None = None,
@@ -75,7 +77,8 @@ class LLMProvider(Protocol):
             messages: Conversation messages, in order. Adapters may extract
                 a ``role='system'`` message into a top-level system parameter
                 if the underlying provider requires that (Anthropic).
-            temperature: Sampling temperature (0.0 = deterministic).
+            temperature: Sampling temperature (0.0 = deterministic). ``None``
+                uses the model's default and sends no temperature.
             max_tokens: Maximum completion tokens to generate. Some providers
                 (Anthropic) require this; adapters should default to a
                 sensible value (4096) if the caller omits it.
@@ -128,7 +131,7 @@ class StructuredExtractor(Protocol):
         messages: Sequence[ChatMessage],
         response_model: type[T],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
     ) -> T:
@@ -138,7 +141,8 @@ class StructuredExtractor(Protocol):
             messages: Conversation messages.
             response_model: Pydantic model class describing the expected
                 output shape.
-            temperature: Sampling temperature.
+            temperature: Sampling temperature. ``None`` uses the model's
+                default and sends no temperature.
             max_retries: Maximum retry attempts after the initial attempt.
                 Default 2 → 3 total attempts.
             timeout: Per-call timeout override.

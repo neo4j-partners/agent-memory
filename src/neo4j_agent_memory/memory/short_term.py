@@ -29,7 +29,7 @@ def _llm_summarizer(
     provider: LLMProvider,
     *,
     max_tokens: int = 500,
-    temperature: float = 0.0,
+    temperature: float | None = None,
 ) -> Callable[[str], Awaitable[str]]:
     """Build an async summarizer callable backed by an :class:`LLMProvider`.
 
@@ -45,7 +45,8 @@ def _llm_summarizer(
     Args:
         provider: An :class:`LLMProvider` to make the completion call.
         max_tokens: Soft upper bound on completion length.
-        temperature: Sampling temperature (0.0 = deterministic).
+        temperature: Sampling temperature (0.0 = deterministic). ``None``
+            uses the model's default and sends no temperature.
 
     Returns:
         An async callable ``(transcript: str) -> str``.

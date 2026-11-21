@@ -181,7 +181,7 @@ class LiteLLMProvider:
         self,
         messages: Sequence[ChatMessage],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         timeout: float | None = None,
@@ -190,9 +190,10 @@ class LiteLLMProvider:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": [m.model_dump(exclude_none=True) for m in messages],
-            "temperature": temperature,
             **self._call_kwargs,
         }
+        if temperature is not None:
+            kwargs.setdefault("temperature", temperature)
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         if stop is not None:
@@ -235,7 +236,7 @@ class LiteLLMProvider:
         messages: Sequence[ChatMessage],
         response_model: type[T],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
     ) -> T:

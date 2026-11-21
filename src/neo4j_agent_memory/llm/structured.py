@@ -75,7 +75,7 @@ async def schema_aligned_extract(
     messages: Sequence[ChatMessage],
     response_model: type[T],
     *,
-    temperature: float = 0.0,
+    temperature: float | None = None,
     max_retries: int = 2,
     timeout: float | None = None,
 ) -> T:
@@ -86,7 +86,8 @@ async def schema_aligned_extract(
         messages: User-supplied messages; the system message containing the
             schema is prepended automatically.
         response_model: Pydantic model class describing the expected output.
-        temperature: Sampling temperature (passed to every attempt).
+        temperature: Sampling temperature, passed to every attempt.
+            ``None`` uses the model's default.
         max_retries: Maximum retry attempts after the initial attempt. The
             total number of LLM calls is ``max_retries + 1``.
         timeout: Per-call timeout in seconds.
