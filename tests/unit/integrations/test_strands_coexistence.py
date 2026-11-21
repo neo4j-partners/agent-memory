@@ -171,6 +171,18 @@ class TestPrivateAttributeCoupling:
         )
         assert [s.name for s in manager._stores] == ["t"]
 
+    def test_agent_still_exposes_interrupt_state(self) -> None:
+        """Fails loudly if a strands upgrade moves Agent._interrupt_state.activated."""
+        from strands import Agent
+
+        agent = Agent(callback_handler=None)
+
+        assert agent._interrupt_state.activated is False, (
+            "Agent._interrupt_state.activated is gone; _interrupt_active in "
+            "session_manager.py needs a new way to tell that a resume left "
+            "the interrupt pending."
+        )
+
     def test_agent_cancel_still_sets_cancel_signal(self) -> None:
         """Fails loudly if agent.cancel() stops setting the signal the manager reads."""
         from strands import Agent

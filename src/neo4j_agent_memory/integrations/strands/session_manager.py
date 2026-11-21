@@ -110,6 +110,12 @@ def _cancel_requested(agent: Agent | None) -> bool:
     return isinstance(signal, threading.Event) and signal.is_set()
 
 
+def _interrupt_active(agent: Agent | None) -> bool:
+    """True while Strands holds an interrupt the next call must answer."""
+    state = getattr(agent, "_interrupt_state", None)
+    return bool(getattr(state, "activated", False))
+
+
 def _describe(error: BaseException) -> str:
     """The error's message, or its type name when it has none (TimeoutError)."""
     return str(error) or type(error).__name__
@@ -255,6 +261,9 @@ class Neo4jSessionManager(SessionManager):
         # Turns whose end-of-turn drain has finished. A message queued before
         # then is dropped if a later write of it fails.
         self._turns_written = 0  # under _queue_lock
+        # The paused turn's length when the running call resumed it, else
+        # None. A resume that fails drops what it added. Under _queue_lock.
+        self._resume_from: int | None = None
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
@@ -508,8 +517,11 @@ class Neo4jSessionManager(SessionManager):
         """
         self._check_open()
         with self._queue_lock:
-            if self._turn_state != "paused":
+            if self._turn_state == "paused":
+                self._resume_from = len(self._turn)
+            else:
                 self._release_turn_locked()
+                self._resume_from = None
         await self._aflush_ready()
         with self._queue_lock:
             self._turn_state = "running"
@@ -523,7 +535,10 @@ class Neo4jSessionManager(SessionManager):
         cancelled it. Stop reason ``"cancelled"`` with the agent's cancel
         signal set means ``agent.cancel()`` or a ``cancel_signal`` stopped
         it. The turn's messages are then discarded with an INFO log, so a
-        failed turn never stores a prompt without its reply.
+        failed turn never stores a prompt without its reply. A call that
+        resumes a paused turn and fails that way discards only what it
+        added. The turn stays paused while Strands still holds the
+        interrupt.
 
         Any other result means the turn succeeded, so its messages are
         written in order. That covers the ``limit_*`` stop reasons, since
@@ -573,8 +588,15 @@ class Neo4jSessionManager(SessionManager):
             discarded = 0
             if result is not None and result.stop_reason == "interrupt":
                 self._turn_state = "paused"
+            elif failed and self._resume_from is not None and _interrupt_active(agent):
+                # Strands still holds the interrupt, so the turn stays paused
+                # without what the failed resume added.
+                self._turn_state = "paused"
+                discarded = len(self._turn) - self._resume_from
+                del self._turn[self._resume_from :]
             else:
                 self._turn_state = "idle"
+                self._resume_from = None
                 if failed:
                     discarded = len(self._turn)
                     self._turn.clear()

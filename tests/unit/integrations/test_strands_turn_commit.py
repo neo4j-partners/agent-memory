@@ -60,6 +60,44 @@ def abort(tool_context: ToolContext) -> str:
     return "aborting"
 
 
+def _approval_agent(manager: Neo4jSessionManager) -> Agent:
+    return Agent(
+        model=ScriptedModel(_APPROVAL_TURN, [{"text": "Done."}]),
+        tools=[approve],
+        session_manager=manager,
+        callback_handler=None,
+    )
+
+
+def _answer(paused: Any) -> Any:
+    """The prompt that resumes ``paused`` with a yes."""
+    (interrupt,) = paused.interrupts or []
+    return [{"interruptResponse": {"interruptId": interrupt.id, "response": "yes"}}]
+
+
+def _once(hook: Any) -> Any:
+    """A BeforeInvocationEvent callback that runs ``hook`` on its first call only."""
+    calls: list[None] = []
+
+    def callback(event: BeforeInvocationEvent) -> None:
+        if not calls:
+            calls.append(None)
+            hook(event)
+
+    return callback
+
+
+def _deny(event: BeforeInvocationEvent) -> None:
+    event.cancel = "denied"
+
+
+_FULL_APPROVAL_TURN = [
+    ("user", "delete the file"),
+    ("assistant", "Asking for approval."),
+    ("assistant", "Done."),
+]
+
+
 class TestASuccessfulTurn:
     async def test_nothing_is_written_until_the_turn_ends(self) -> None:
         client = FakeMemoryClient()
@@ -268,6 +306,21 @@ class TestAnInterruptedTurn:
             ("assistant", "Asking for approval."),
             ("assistant", "Done."),
         ]
+
+    async def test_a_cancelled_resume_keeps_the_turn_paused(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _approval_agent(manager)
+        try:
+            paused = await agent.invoke_async("delete the file")
+            agent.hooks.add_callback(BeforeInvocationEvent, _once(_deny))
+            await agent.invoke_async(_answer(paused))  # the resume is cancelled
+            assert _stored(client) == []
+
+            await agent.invoke_async(_answer(paused))
+        finally:
+            await manager.aclose()
+        assert _stored(client) == _FULL_APPROVAL_TURN
 
     @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
     async def test_closing_during_an_interrupt_warns_and_writes_nothing(
