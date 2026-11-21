@@ -949,15 +949,45 @@ class TestToolMirroringOutlivesItsWait:
             "sess-1", memory_client=FakeMemoryClient(), record_tool_calls=True
         )
         block: Any = {"toolUseId": "t1", "name": "lookup", "input": {}}
-        waiter = asyncio.ensure_future(manager._arecord_tool_uses([block]))
-        await asyncio.sleep(0)  # the waiter starts the recording and waits on it
-        assert manager._tool_record is not None
-        manager._tool_record.cancel()  # before the recording takes its first step
-        with contextlib.suppress(asyncio.CancelledError):
-            await waiter
-        await asyncio.sleep(0)
 
-        assert manager._tool_records_running == 0
+        async def scenario() -> int:  # on the bridge loop, where recordings run
+            waiter = asyncio.ensure_future(manager._arecord_tool_uses([block]))
+            await asyncio.sleep(0)  # the waiter starts the recording and waits on it
+            assert manager._tool_record is not None
+            manager._tool_record.cancel()  # before the recording takes its first step
+            with contextlib.suppress(asyncio.CancelledError):
+                await waiter
+            await asyncio.sleep(0)
+            return manager._tool_records_running
+
+        assert await manager._bridge.run_async(scenario()) == 0
+        await manager.aclose()
+
+    async def test_a_recording_that_just_finished_is_not_reported_as_running(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=FakeMemoryClient(), record_tool_calls=True
+        )
+        block: Any = {"toolUseId": "t1", "name": "lookup", "input": {}}
+
+        async def scenario() -> None:  # on the bridge loop, where recordings run
+            gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+            async def record(blocks: list[Any]) -> None:
+                await gate
+
+            manager._arecord_blocks = record  # type: ignore[method-assign]
+            waiter = asyncio.ensure_future(manager._arecord_tool_uses([block]))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)  # the recording waits on the gate
+            gate.set_result(None)  # the recording finishes in the next iteration
+            await asyncio.ensure_future(manager._await_tool_records(1.0))  # same iteration
+            await waiter
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            await manager._bridge.run_async(scenario())
+        assert "still running" not in caplog.text
         await manager.aclose()
 
 

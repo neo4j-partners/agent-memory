@@ -1119,9 +1119,13 @@ class Neo4jSessionManager(SessionManager):
         Each recording waits for the one before it, so the latest finishing
         means all have. Closing the bridge cancels any still running, so a
         warning names how many.
+
+        A task that is already done is still waited on. Its done callbacks
+        run in a later loop iteration. The wait's own callback runs after
+        ``_tool_record_done``, so the count is current when the wait returns.
         """
         task = self._tool_record
-        if task is not None and not task.done():
+        if task is not None:
             await asyncio.wait({task}, timeout=timeout)
         if self._tool_records_running:
             logger.warning(
