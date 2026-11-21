@@ -142,6 +142,7 @@ class Neo4jSessionManager(SessionManager):
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
         self._closed = False
+        self._closing: concurrent.futures.Future[None] | None = None  # done when close ends
         self._warned_double_injection = False
 
     @property
@@ -667,11 +668,30 @@ class Neo4jSessionManager(SessionManager):
             )
             await self._client.reasoning.record_tool_call(step.id, name, block.get("input") or {})
 
+    def _begin_close(self) -> concurrent.futures.Future[None] | None:
+        """Mark the manager closed and return the future this close completes.
+
+        Returns None when another ``close()`` or ``aclose()`` got there first.
+        """
+        with self._queue_lock:
+            if self._closed:
+                return None
+            self._closed = True
+            self._closing = concurrent.futures.Future()
+            return self._closing
+
     async def aclose(self) -> None:
-        """Like ``close()``, but awaits the I/O so the caller's loop keeps running."""
-        if self._closed:
+        """Like ``close()``, but awaits the I/O so the caller's loop keeps running.
+
+        A call made while another close is still running waits for it to
+        finish, then returns. The first caller gets any error.
+        """
+        closing = self._begin_close()
+        if closing is None:
+            if self._closing is not None:
+                # asyncio.wait neither re-raises the error nor cancels the future.
+                await asyncio.wait({asyncio.wrap_future(self._closing)})
             return
-        self._closed = True
         try:
             await self._aflush_buffer()
         finally:
@@ -680,13 +700,20 @@ class Neo4jSessionManager(SessionManager):
                 if self._should_close_client and self._client.is_connected:
                     await self._bridge.run_async(self._client.close())
             finally:
-                await asyncio.to_thread(self._bridge.close)
+                try:
+                    await asyncio.to_thread(self._bridge.close)
+                finally:
+                    closing.set_result(None)
 
     def close(self) -> None:
-        """Flush, release the client (if owned/connected by us), stop the bridge."""
-        if self._closed:
+        """Flush, release the client (if owned/connected by us), stop the bridge.
+
+        A call made while another close is running returns at once. Waiting
+        here could block the event loop that close is running on.
+        """
+        closing = self._begin_close()
+        if closing is None:
             return
-        self._closed = True
         try:
             self._flush_buffer()
         finally:
@@ -695,7 +722,10 @@ class Neo4jSessionManager(SessionManager):
                 if self._should_close_client and self._client.is_connected:
                     self._bridge.run(self._client.close())
             finally:
-                self._bridge.close()
+                try:
+                    self._bridge.close()
+                finally:
+                    closing.set_result(None)
 
     def __enter__(self) -> Neo4jSessionManager:
         return self

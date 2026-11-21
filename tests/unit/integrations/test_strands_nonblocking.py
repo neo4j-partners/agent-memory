@@ -679,6 +679,42 @@ class TestHooksAfterClose:
         await stream.aclose()
         assert _stored(client) == [("user", "hi")]
 
+    async def test_a_second_aclose_waits_for_the_first(self) -> None:
+        client = _slow_client(0.2)
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        _buffered(manager, "one")
+        first = asyncio.create_task(manager.aclose())
+        await asyncio.sleep(0.05)
+
+        await manager.aclose()
+        assert _stored(client) == [("user", "one")]
+        assert first.done()
+        await first
+
+    async def test_a_second_aclose_waits_but_does_not_reraise(self) -> None:
+        client = _slow_client(0.2)
+        client.short_term.fail_next_add = True
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        _buffered(manager, "one")
+        first = asyncio.create_task(manager.aclose())
+        await asyncio.sleep(0.05)
+
+        await manager.aclose()  # the first caller owns the error
+        assert first.done()
+        with pytest.raises(SessionException):
+            await first
+
+    async def test_aclose_waits_for_a_close_on_another_thread(self) -> None:
+        client = _slow_client(0.2)
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        _buffered(manager, "one")
+        closer = asyncio.create_task(asyncio.to_thread(manager.close))
+        await asyncio.sleep(0.05)
+
+        await manager.aclose()
+        assert _stored(client) == [("user", "one")]
+        await closer
+
     async def test_aclose_is_idempotent_and_close_after_aclose_is_a_noop(self) -> None:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client)

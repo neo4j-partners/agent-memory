@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An `AsyncBridge` whose loop thread stops without `close()` is now
   broken for good. Later calls raise `RuntimeError` instead of starting
   a new loop, because the owner's clients are bound to the old one.
+- A second `Neo4jSessionManager.aclose()` made while a close is still
+  running now waits for that close to finish instead of returning at
+  once. The first caller still gets any error.
 
 ### Changed
 
