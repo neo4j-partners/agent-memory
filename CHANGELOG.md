@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Neo4jSessionManager.aopen()` and `aclose()`. Await `aopen()` before
   building the `Agent`, so restoring history does no blocking I/O. Await
   `aclose()` to write the last turn and close the client from async code.
+- `BedrockProvider(send_temperature=..., tool_choice=...)`. With
+  `send_temperature=False`, the provider never sends a temperature, even
+  when a caller passes one. `tool_choice="auto"` lets an Anthropic model
+  answer `complete_structured` without the forced tool call. If it
+  answers in text, the provider parses that text as JSON. Claude Sonnet
+  5.5 needs both settings.
+- `LiteLLMProvider(send_temperature=...)`. With `send_temperature=False`,
+  the provider never sends a temperature, whether it comes from a call or
+  from the constructor.
 
 ### Fixed
 
@@ -37,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retries that call with `toolChoice` auto, and sends auto from then on.
   For models that reject a forced tool choice, such as Claude Sonnet 5.5,
   pass `tool_choice="auto"` to skip the rejected call.
+- **Behavior change:** In `BedrockProvider.complete_structured`, a native
+  reply without a valid tool call now counts as the first of the
+  `max_retries + 1` attempts. The SAP loop validates that reply before it
+  makes any request. With `max_retries=0`, an invalid native reply raises
+  `StructuredExtractionError` and no SAP request is made. Earlier
+  releases made one more SAP request in that case.
 
 ## [0.8.0] - 2026-10-22
 
