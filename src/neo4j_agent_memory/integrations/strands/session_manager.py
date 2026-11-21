@@ -276,9 +276,9 @@ class Neo4jSessionManager(SessionManager):
         """Restore the agent's conversation history from the graph.
 
         Restored history is normalized so roles alternate, starting with a
-        user message. A trailing user message that never got a reply is
-        left out of the agent's history, with a warning. Stored messages
-        are not changed.
+        user message. User messages that never got a reply are left out of
+        the agent's history, with a warning. Stored messages are not
+        changed.
         """
         self._check_open()
         self._check_memory_manager_coexistence(agent)
@@ -290,11 +290,12 @@ class Neo4jSessionManager(SessionManager):
             # Normalizing can leave nothing, for example a lone stale user
             # message. The session still exists, so do not seed it below.
             restored, dropped = _normalize_history(stored)
-            if dropped is not None:
+            if dropped:
                 logger.warning(
-                    "Session %r ends with a user message that got no reply; "
-                    "leaving it out of the restored history.",
+                    "Session %r: leaving %d user message(s) with no reply out "
+                    "of the restored history.",
                     self.session_id,
+                    len(dropped),
                 )
             agent.messages.clear()
             agent.messages.extend(restored)

@@ -1098,7 +1098,10 @@ def _msg(role: str, text: str) -> dict:
 
 
 class TestNormalizeHistory:
-    """Fix D: restored text history alternates user, assistant."""
+    """Fix D: restored text history alternates user, assistant.
+
+    The second value is the list of user messages left out, oldest first.
+    """
 
     @staticmethod
     def _normalize(messages):
@@ -1107,11 +1110,11 @@ class TestNormalizeHistory:
         return _normalize_history(messages)
 
     def test_empty(self) -> None:
-        assert self._normalize([]) == ([], None)
+        assert self._normalize([]) == ([], [])
 
     def test_valid_history_is_unchanged(self) -> None:
         history = [_msg("user", "a"), _msg("assistant", "b")]
-        assert self._normalize(list(history)) == (history, None)
+        assert self._normalize(list(history)) == (history, [])
 
     def test_merges_consecutive_assistant_messages(self) -> None:
         history = [
@@ -1121,14 +1124,32 @@ class TestNormalizeHistory:
         ]
         assert self._normalize(history) == (
             [_msg("user", "q"), _msg("assistant", "Let me look that up.\n\nFound it.")],
-            None,
+            [],
         )
 
-    def test_merges_consecutive_user_messages(self) -> None:
+    def test_user_run_keeps_only_last_message(self) -> None:
         history = [_msg("user", "a"), _msg("user", "b"), _msg("assistant", "c")]
         assert self._normalize(history) == (
-            [_msg("user", "a\n\nb"), _msg("assistant", "c")],
-            None,
+            [_msg("user", "b"), _msg("assistant", "c")],
+            [_msg("user", "a")],
+        )
+
+    def test_stale_prompt_does_not_leak_into_next_question(self) -> None:
+        history = [
+            _msg("user", "q1"),
+            _msg("assistant", "a1"),
+            _msg("user", "stale"),
+            _msg("user", "new"),
+            _msg("assistant", "a2"),
+        ]
+        assert self._normalize(history) == (
+            [
+                _msg("user", "q1"),
+                _msg("assistant", "a1"),
+                _msg("user", "new"),
+                _msg("assistant", "a2"),
+            ],
+            [_msg("user", "stale")],
         )
 
     def test_drops_leading_assistant(self) -> None:
@@ -1138,21 +1159,21 @@ class TestNormalizeHistory:
             _msg("user", "a"),
             _msg("assistant", "b"),
         ]
-        assert self._normalize(history) == ([_msg("user", "a"), _msg("assistant", "b")], None)
+        assert self._normalize(history) == ([_msg("user", "a"), _msg("assistant", "b")], [])
 
     def test_drops_and_returns_trailing_user(self) -> None:
         history = [_msg("user", "a"), _msg("assistant", "b"), _msg("user", "c"), _msg("user", "d")]
         assert self._normalize(history) == (
             [_msg("user", "a"), _msg("assistant", "b")],
-            _msg("user", "c\n\nd"),
+            [_msg("user", "c"), _msg("user", "d")],
         )
 
     def test_lone_user_message_normalizes_to_empty(self) -> None:
-        assert self._normalize([_msg("user", "a")]) == ([], _msg("user", "a"))
+        assert self._normalize([_msg("user", "a")]) == ([], [_msg("user", "a")])
 
     def test_merge_skips_empty_text(self) -> None:
         history = [_msg("user", "q"), _msg("assistant", ""), _msg("assistant", "b")]
-        assert self._normalize(history) == ([_msg("user", "q"), _msg("assistant", "b")], None)
+        assert self._normalize(history) == ([_msg("user", "q"), _msg("assistant", "b")], [])
 
 
 class TestInitializeNormalizesHistory:
@@ -1200,6 +1221,32 @@ class TestInitializeNormalizesHistory:
             # Stored data is untouched.
             stored = client.short_term.conversations["sess-1"].messages
             assert [m.content for m in stored] == ["a", "b", "stale"]
+        finally:
+            manager.close()
+
+    def test_abandoned_prompt_is_left_out_with_warning(self, caplog) -> None:
+        manager, client = _make_manager()
+        try:
+            self._seed(
+                client,
+                ("user", "q1"),
+                ("assistant", "a1"),
+                ("user", "stale"),
+                ("user", "new"),
+                ("assistant", "a2"),
+            )
+            agent = _fake_agent()
+            with caplog.at_level("WARNING"):
+                manager.initialize(agent)
+            assert agent.messages == [
+                _msg("user", "q1"),
+                _msg("assistant", "a1"),
+                _msg("user", "new"),
+                _msg("assistant", "a2"),
+            ]
+            assert "1 user message" in caplog.text
+            stored = client.short_term.conversations["sess-1"].messages
+            assert [m.content for m in stored] == ["q1", "a1", "stale", "new", "a2"]
         finally:
             manager.close()
 

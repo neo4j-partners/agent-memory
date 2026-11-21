@@ -34,28 +34,37 @@ def _to_strands_message(stored: StoredMessage) -> StrandsMessage:
 
 def _normalize_history(
     messages: list[StrandsMessage],
-) -> tuple[list[StrandsMessage], StrandsMessage | None]:
+) -> tuple[list[StrandsMessage], list[StrandsMessage]]:
     """Shape restored text history so roles alternate user, assistant, user.
 
     Restored messages hold text only, so a tool turn with preamble text
-    leaves consecutive assistant messages, and a failed turn leaves
-    consecutive user messages. Each same-role run is merged into one
-    message, with the non-empty texts joined by a blank line. Leading assistant
-    messages are dropped, so history starts with a user message. A
-    trailing user message never got a reply, so it is dropped too.
+    leaves consecutive assistant messages. Each assistant run is merged
+    into one message, with the non-empty texts joined by a blank line.
 
-    Returns the normalized history and the dropped trailing user message,
-    or None when nothing was dropped from the end.
+    Consecutive user messages come only from failed or abandoned turns.
+    Only the last message of a user run is kept, so an unanswered prompt
+    is never glued onto the next question. Leading assistant messages are
+    dropped, so history starts with a user message. A trailing user
+    message never got a reply, so it is dropped too.
+
+    Returns the normalized history and the user messages left out, oldest
+    first.
     """
-    merged: list[StrandsMessage] = []
+    history: list[StrandsMessage] = []
+    dropped: list[StrandsMessage] = []
     for message in messages:
-        if merged and merged[-1]["role"] == message["role"]:
-            parts = (_message_text(merged[-1]), _message_text(message))
-            text = "\n\n".join(part for part in parts if part)
-            merged[-1] = {"role": message["role"], "content": [{"text": text}]}
+        previous = history[-1] if history else None
+        if previous is None or previous["role"] != message["role"]:
+            history.append(message)
+        elif message["role"] == "user":
+            dropped.append(previous)
+            history[-1] = message
         else:
-            merged.append(message)
-    if merged and merged[0]["role"] == "assistant":
-        merged.pop(0)
-    trailing = merged.pop() if merged and merged[-1]["role"] == "user" else None
-    return merged, trailing
+            parts = (_message_text(previous), _message_text(message))
+            text = "\n\n".join(part for part in parts if part)
+            history[-1] = {"role": message["role"], "content": [{"text": text}]}
+    if history and history[0]["role"] == "assistant":
+        history.pop(0)
+    if history and history[-1]["role"] == "user":
+        dropped.append(history.pop())
+    return history, dropped
