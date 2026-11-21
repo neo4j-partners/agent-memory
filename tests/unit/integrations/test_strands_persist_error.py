@@ -11,6 +11,7 @@ Restore failures always raise.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 from collections.abc import Awaitable
 from types import SimpleNamespace
@@ -79,6 +80,18 @@ def test_rejects_an_unknown_policy() -> None:
             memory_client=FakeMemoryClient(),
             on_persist_error="ignore",  # type: ignore[arg-type]
         )
+
+
+class TestWaitThatRunsOut:
+    async def test_a_drain_that_finishes_just_after_the_wait_is_not_a_failure(self) -> None:
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=FakeMemoryClient(), on_persist_error="raise"
+        )
+        drain: concurrent.futures.Future[None] = concurrent.futures.Future()
+        drain.set_result(None)  # it finished between the timeout and the check
+
+        manager._wait_failed(drain, TimeoutError())  # no raise
+        await manager.aclose()
 
 
 class TestCloseErrorPrecedence:

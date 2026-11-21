@@ -651,9 +651,13 @@ class Neo4jSessionManager(SessionManager):
         """Handle an error from a flush's wait for its drain.
 
         A drain that is still running means the wait ran out, not a write.
-        The drain goes on. Any other error is a failed flush.
+        The drain goes on. A drain that succeeded means it finished just
+        after the wait ran out, so nothing failed. Any other error is a
+        failed flush.
         """
         if future is None or future.done():
+            if future is not None and not future.cancelled() and future.exception() is None:
+                return
             self._persist_failed(error)
             return
         with self._queue_lock:
