@@ -408,7 +408,9 @@ class BedrockProvider:
 
         Only the default ``tool_choice=None`` falls back, and only when
         Bedrock rejects the forced ``toolChoice`` itself. Any other error
-        is raised unchanged.
+        is raised unchanged. The provider switches to auto only after the
+        auto retry succeeds. If the retry fails, its error is raised with
+        the rejection as its cause, and the next call is forced again.
         """
         try:
             return await asyncio.to_thread(client.converse, **kwargs)
@@ -416,17 +418,22 @@ class BedrockProvider:
             forced = "tool" in kwargs["toolConfig"]["toolChoice"]
             if self._tool_choice is not None or not forced or not _rejects_tool_choice(exc):
                 raise
-            if not self._fall_back_to_auto:
-                self._fall_back_to_auto = True
-                logger.warning(
-                    "Bedrock model %s rejected a forced toolChoice, so this provider "
-                    "now sends toolChoice auto. Pass tool_choice='auto' to skip the "
-                    "rejected call. Error: %s",
-                    self._bare_model,
-                    exc,
-                )
+            rejection = exc
         auto = {**kwargs, "toolConfig": {**kwargs["toolConfig"], "toolChoice": {"auto": {}}}}
-        return await asyncio.to_thread(client.converse, **auto)
+        try:
+            response: dict[str, Any] = await asyncio.to_thread(client.converse, **auto)
+        except Exception as exc:
+            raise exc from rejection
+        if not self._fall_back_to_auto:
+            self._fall_back_to_auto = True
+            logger.warning(
+                "Bedrock model %s rejected a forced toolChoice, so this provider "
+                "now sends toolChoice auto. Pass tool_choice='auto' to skip the "
+                "rejected call. Error: %s",
+                self._bare_model,
+                rejection,
+            )
+        return response
 
 
 class BedrockEmbeddingProvider:

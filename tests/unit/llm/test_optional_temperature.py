@@ -216,6 +216,38 @@ async def test_bedrock_rejected_forced_tool_choice_falls_back_to_auto(
     assert "toolChoice" in warnings[0].getMessage()
 
 
+async def test_bedrock_failed_auto_retry_keeps_the_forced_choice(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A toolChoice-mentioning error that auto also fails does not switch to auto."""
+    from neo4j_agent_memory.llm.adapters import bedrock as adapter
+    from neo4j_agent_memory.llm.errors import ProviderInvalidRequestError
+
+    provider, client = _rejecting_provider("unused")
+    rejection = _validation_error("toolChoice could not be applied to this request.")
+    retry_error = _validation_error("toolChoice auto could not be applied either.")
+    errors = iter([rejection, retry_error])
+
+    def converse(**kwargs: Any) -> dict[str, Any]:
+        client.calls.append(kwargs)
+        raise next(errors)
+
+    client.converse = converse  # type: ignore[method-assign]
+
+    with (
+        caplog.at_level("WARNING", logger=adapter.__name__),
+        pytest.raises(ProviderInvalidRequestError) as info,
+    ):
+        await provider.complete_structured(_MESSAGES, _Extraction)
+
+    choices = [call["toolConfig"]["toolChoice"] for call in client.calls]
+    assert choices == [_FORCED, _AUTO]
+    assert provider._fall_back_to_auto is False
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert info.value.__cause__ is retry_error
+    assert retry_error.__cause__ is rejection
+
+
 async def test_bedrock_other_validation_errors_do_not_fall_back() -> None:
     from neo4j_agent_memory.llm.errors import ProviderInvalidRequestError
 
