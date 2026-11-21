@@ -668,6 +668,53 @@ class RedactingModel(ScriptedModel):
             yield event
 
 
+def _contents(client: FakeMemoryClient) -> list[str]:
+    """The text of every message the backend holds now, after any deletes."""
+    return [m.content for c in client.short_term.conversations.values() for m in c.messages]
+
+
+class TestRedactionDuringAWrite:
+    async def test_the_redacted_text_replaces_the_written_message(self) -> None:
+        client = _slow_client(0.3)
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = _buffered(manager, "secret 123")
+        manager._release_pending()
+        drain = asyncio.wrap_future(manager._submit_drain())
+        await asyncio.sleep(0.1)  # the write of "secret 123" is in flight
+
+        manager.redact_latest_message({"role": "user", "content": [{"text": "[REDACTED]"}]}, agent)
+        await drain
+
+        assert _contents(client) == ["[REDACTED]"]
+        assert len(client.short_term.deleted_message_ids) == 1
+        await manager.aclose()
+
+    async def test_a_failed_redaction_is_logged_as_an_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = _slow_client(0.3)
+
+        async def delete_fails(*args: Any, **kwargs: Any) -> bool:
+            raise RuntimeError("delete refused")
+
+        client.short_term.delete_message = delete_fails  # type: ignore[method-assign]
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = _buffered(manager, "secret 123")
+        manager._release_pending()
+        drain = asyncio.wrap_future(manager._submit_drain())
+        await asyncio.sleep(0.1)
+
+        manager.redact_latest_message({"role": "user", "content": [{"text": "[REDACTED]"}]}, agent)
+        with caplog.at_level(logging.ERROR, logger=_LOGGER):
+            await drain  # the write succeeded, so the flush does not fail
+
+        (error,) = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert "sess-1" in error.getMessage()
+        assert "delete refused" in error.getMessage()
+        assert manager._last_persisted is None  # never retarget a failed redaction
+        await manager.aclose()
+
+
 class TestRedactionThroughTheAgent:
     async def test_redaction_rewrites_a_queued_seed_message(self) -> None:
         client = FakeMemoryClient()

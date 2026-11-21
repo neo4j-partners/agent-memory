@@ -516,14 +516,13 @@ class Neo4jSessionManager(SessionManager):
     ) -> None:
         """Replace the latest message with redacted content.
 
-        Normal path: the latest message is still in the write-behind
-        buffer, so we rewrite the buffer and the original never reaches
-        the backend. Late path (buffer already flushed — defensive; the
-        Strands lifecycle redacts within the same invocation): bolt
-        deletes the stored message and re-adds the redacted text (the
-        re-added message gets a fresh timestamp, so it moves to the end
-        of restored history); NAMS has no delete/update endpoint, so we
-        log a warning.
+        Normal path: the latest message is still queued, so the queue is
+        rewritten and the original never reaches the backend. A message
+        stays queued while its write runs, so a redaction that lands then
+        also rewrites the queue, and the drain applies it once the write
+        finishes. Late path: the message is already stored. The Strands
+        lifecycle redacts within the same invocation, so this path is
+        defensive. See ``_aredact_stored`` for what each backend does.
         """
         self._check_open()
         redacted = copy.deepcopy(redact_message)
@@ -532,33 +531,46 @@ class Neo4jSessionManager(SessionManager):
                 self._pending = redacted
                 return
             if self._ready:
-                # Seeded by initialize() after aopen() and not written yet.
                 self._ready[-1].message = redacted
                 return
-        if self._last_persisted is None:
+            stored = self._last_persisted
+        if stored is None:
             logger.warning(
                 "redact_latest_message called for session %s but no message "
                 "has been stored yet; nothing to redact.",
                 self.session_id,
             )
             return
-        if self._is_nams:
-            logger.warning(
-                "Cannot redact already-persisted message %s on NAMS (no "
-                "message update/delete endpoint). The redacted content was "
-                "NOT applied server-side.",
-                self._last_persisted.id,
-            )
-            return
-        text = _message_text(redact_message) or "[REDACTED]"
         try:
-            self._bridge.run(self._client.short_term.delete_message(self._last_persisted.id))
-            self._store_message(redact_message.get("role", "user"), text)
+            self._last_persisted = self._bridge.run(self._aredact_stored(stored, redacted))
         except Exception as e:
             self._last_persisted = None  # id may already be deleted; don't reuse it
             raise SessionException(
                 f"Failed to redact latest message for session {self.session_id!r}"
             ) from e
+
+    async def _aredact_stored(
+        self, stored: StoredMessage, redacted: StrandsMessage
+    ) -> StoredMessage:
+        """Replace a stored message with redacted content. Runs on the bridge loop.
+
+        Bolt deletes the stored message and adds the redacted text. The new
+        message gets a fresh timestamp, so it moves to the end of restored
+        history. NAMS has no endpoint to update or delete a message. There
+        the original stays, a warning is logged, and ``stored`` is returned.
+        """
+        if self._is_nams:
+            logger.warning(
+                "Cannot redact stored message %s of session %r on NAMS. NAMS "
+                "has no endpoint to update or delete a message, so the "
+                "original stays.",
+                stored.id,
+                self.session_id,
+            )
+            return stored
+        await self._client.short_term.delete_message(stored.id)
+        text = _message_text(redacted) or "[REDACTED]"
+        return await self._aadd_message(redacted.get("role", "user"), text)
 
     def sync_agent(self, agent: Agent, **kwargs: Any) -> None:
         """Agent state is not persisted (design decision: no Strands-specific
@@ -754,11 +766,12 @@ class Neo4jSessionManager(SessionManager):
                     dropped = _MessageDropped(e)
                     self._pop_head()
                     continue
-                self._pop_head()
+                latest = self._pop_head(stored)
+                if stored is not None and latest is not message:
+                    stored = await self._aredact_written(stored, latest)
                 if stored is not None:
-                    self._last_persisted = stored
                     await self._aextract(stored)
-                if blocks := self._tool_uses(message):
+                if blocks := self._tool_uses(latest):
                     try:
                         await asyncio.wait_for(
                             self._arecord_tool_uses(blocks), self._request_timeout
@@ -770,11 +783,48 @@ class Neo4jSessionManager(SessionManager):
         if dropped is not None:
             raise dropped
 
-    def _pop_head(self) -> None:
-        """Remove the head of the ready queue and count it."""
+    def _pop_head(self, stored: StoredMessage | None = None) -> StrandsMessage:
+        """Remove the head of the ready queue, count it, and return its content.
+
+        The content is read under the lock, so it includes a redaction that
+        landed while the write ran. ``stored`` becomes the target of a late
+        redaction in the same step. So a redaction finds the message either
+        in the queue or in ``_last_persisted``.
+        """
         with self._queue_lock:
-            self._ready.popleft()
+            entry = self._ready.popleft()
+            if stored is not None:
+                self._last_persisted = stored
         self._dequeued += 1
+        return entry.message
+
+    async def _aredact_written(
+        self, stored: StoredMessage, redacted: StrandsMessage
+    ) -> StoredMessage | None:
+        """Apply a redaction that landed while its message was being written.
+
+        Returns the message that is now stored, or None when the redaction
+        failed. A failure is logged as an ERROR, since the original text
+        may still be stored. The message itself was written, so it is not
+        a persist failure.
+        """
+        try:
+            result: StoredMessage | None = await asyncio.wait_for(
+                self._aredact_stored(stored, redacted), self._request_timeout
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to redact message %s of session %r, so its original "
+                "text may still be stored. The redaction arrived while the "
+                "message was being written: %s",
+                stored.id,
+                self.session_id,
+                _describe(e),
+            )
+            result = None
+        with self._queue_lock:
+            self._last_persisted = result
+        return result
 
     def _tool_uses(self, message: StrandsMessage) -> list[ToolUse]:
         """The toolUse blocks to mirror into reasoning memory, if enabled.
@@ -789,10 +839,6 @@ class Neo4jSessionManager(SessionManager):
             for b in (message.get("content") or [])
             if isinstance(b, dict) and "toolUse" in b
         ]
-
-    def _store_message(self, role: str, text: str) -> None:
-        """Persist one message without extraction, blocking (tracked for late redaction)."""
-        self._last_persisted = self._bridge.run(self._aadd_message(role, text))
 
     async def _aadd_message(self, role: str, text: str) -> StoredMessage:
         """Resolve the session key and add one message. Runs on the bridge loop.

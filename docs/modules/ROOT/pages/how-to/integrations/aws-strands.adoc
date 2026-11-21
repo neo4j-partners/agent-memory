@@ -256,7 +256,7 @@ Await writes, check the applicable extraction lifecycle, and apply workspace/dat
 * Text turns are restored; tool-use blocks and `agent.state` are not. Set `record_tool_calls=True` to keep an audit record of tool use.
 * Restored history alternates roles and starts with a user message. Consecutive assistant messages are merged, and leading assistant messages are dropped. User messages that never got a reply are left out, with a warning. This covers an earlier prompt in a run of user messages and a final user message. Stored messages are not changed.
 * Pass `settings=` or an unconnected `memory_client=`. A client already connected on another event loop cannot be driven from the manager's background loop.
-* Guardrail redaction rewrites the latest message before it is stored. After it is stored, Bolt deletes and re-adds the redacted message at the end of the history; NAMS cannot redact a stored message and logs a warning.
+* Guardrail redaction rewrites the latest message before it is stored. A redaction that lands while the message is being written is applied once the write finishes. After the message is stored, Bolt deletes it and re-adds the redacted message at the end of the history. NAMS cannot redact a stored message, so it logs a warning. A redaction that fails on a stored message is logged as an ERROR.
 * Hooks for `AfterInvocationEvent` registered after the session manager run before the final turn is stored; read persisted state on the next turn.
 
 == See also

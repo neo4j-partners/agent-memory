@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A guardrail redaction that lands while `Neo4jSessionManager` is
+  writing the message is no longer lost. Once the write finishes, Bolt
+  deletes the stored original and stores the redacted text. NAMS keeps
+  the original and logs a warning. A redaction that fails here is logged
+  as an ERROR.
 - `Neo4jSessionManager` no longer blocks the agent's event loop. Its
   Strands hooks are now coroutines that await memory I/O on the manager's
   background loop. A slow write no longer stalls other sessions that share
