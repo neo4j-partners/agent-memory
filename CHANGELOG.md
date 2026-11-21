@@ -89,6 +89,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Deferred entity extractions of one session now run in write order
+  across managers that share a bridge. Before, each manager kept its own
+  chain, so two managers of one session id on `SharedMemory` could
+  extract at once and out of order. `AsyncBridge.chain()` now keeps the
+  last task for each session id.
 - `add_message` and `add_messages_batch` on bolt now return the
   timestamp stored in the database. Before, `created_at` was the client
   clock when the `Message` was built, so it differed from what

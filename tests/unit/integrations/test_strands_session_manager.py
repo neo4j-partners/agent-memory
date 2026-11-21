@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import inspect
+from typing import Any
 
 import pytest
 
@@ -27,6 +28,38 @@ class TestRetrievalConfig:
 
 
 class TestAsyncBridge:
+    def test_a_chain_forgets_a_task_only_while_it_is_the_tail(self) -> None:
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        bridge = _AsyncBridge()
+
+        async def scenario() -> list[str | None]:
+            release = asyncio.Event()
+            followed: list[str | None] = []
+
+            def chain(name: str) -> asyncio.Task[Any]:
+                def start(previous: asyncio.Task[Any] | None) -> asyncio.Task[Any]:
+                    followed.append(None if previous is None else previous.get_name())
+                    wait = release.wait() if name != "a" else asyncio.sleep(0)
+                    return asyncio.create_task(wait, name=name)
+
+                return bridge.chain("k", start)
+
+            a = chain("a")
+            b = chain("b")
+            await a  # a ends while b is the tail
+            c = chain("c")
+            release.set()
+            await asyncio.gather(b, c)
+            await asyncio.sleep(0)  # the last done callbacks run
+            chain("d")
+            return followed
+
+        try:
+            assert bridge.run(scenario()) == [None, "a", "b", None]
+        finally:
+            bridge.close()
+
     def test_run_returns_coroutine_result(self) -> None:
         from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
 

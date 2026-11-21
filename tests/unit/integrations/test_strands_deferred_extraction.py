@@ -232,6 +232,28 @@ class TestClosingWithDeferredExtractions:
         finally:
             await asyncio.to_thread(bridge.close)
 
+    async def test_managers_of_one_session_on_a_shared_bridge_share_one_order(self) -> None:
+        client = FakeMemoryClient()
+        gate = _Gate(client)
+        bridge = AsyncBridge()
+        await bridge.run_async(client.connect())
+        first = _deferring(client, bridge=bridge)
+        second = _deferring(client, bridge=bridge)
+        try:
+            await _agent(first, "A1").invoke_async("Q1")
+            await _agent(second, "A2").invoke_async("Q2")
+            await _eventually(lambda: bool(gate.started))
+            await asyncio.sleep(0.1)  # time for a second extraction to start, if it could
+
+            gate.opened.set()
+            await _eventually(lambda: len(gate.done) == 4)
+            await first.aclose()
+            await second.aclose()
+        finally:
+            await asyncio.to_thread(bridge.close)
+        assert gate.started == ["Q1", "A1", "Q2", "A2"]
+        assert gate.most_running == 1
+
 
 class _Hook:
     """A ``background_hook`` that records each start and done with a serial number."""

@@ -324,7 +324,7 @@ class Neo4jSessionManager(SessionManager):
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
         self._tool_record: asyncio.Task[None] | None = None  # latest mirroring; bridge loop only
         self._tool_records_running = 0  # mirroring tasks not yet finished; bridge loop only
-        self._extraction: asyncio.Task[None] | None = None  # latest deferred; bridge loop only
+        self._extraction: asyncio.Task[None] | None = None  # own latest deferred; bridge loop only
         self._extractions_running = 0  # deferred extractions not yet finished; bridge loop only
         self._redacted_ids: set[UUID] = set()  # ids a redaction deleted; bridge loop only
         self._closed = False
@@ -1410,13 +1410,19 @@ class Neo4jSessionManager(SessionManager):
     def _defer_extract(self, stored: StoredMessage) -> None:
         """Start extracting a stored message in the background. Bridge loop only.
 
-        Each extraction waits for the one before it, so a session's
-        extractions run in write order. Does nothing when ``_aextract``
-        would do nothing, so no task starts on NAMS.
+        Each extraction waits for the one before it on the bridge for this
+        session id, so a session's extractions run in write order. That
+        holds across managers that share a bridge. Does nothing when
+        ``_aextract`` would do nothing, so no task starts on NAMS.
         """
         if not self._extract_entities or self._is_nams:
             return
-        task = self._start_background("extract", self._aextract_after(self._extraction, stored))
+        task = self._bridge.chain(
+            f"extract:{self.session_id}",
+            lambda previous: self._start_background(
+                "extract", self._aextract_after(previous, stored)
+            ),
+        )
         self._extraction = task
         self._extractions_running += 1
         task.add_done_callback(self._extraction_done)  # also runs for one never started

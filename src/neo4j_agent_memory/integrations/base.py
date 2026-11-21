@@ -92,11 +92,35 @@ class AsyncBridge:
         self._futures: set[concurrent.futures.Future[Any]] = set()
         self._futures_lock = threading.Lock()
         self._stopped = False  # under _futures_lock
+        # The last task chained under each key. Loop thread only.
+        self._tails: dict[str, asyncio.Task[Any]] = {}
 
     @property
     def closed(self) -> bool:
         """True once ``close()`` has been called."""
         return self._closed
+
+    def chain(
+        self,
+        key: str,
+        start: Callable[[asyncio.Task[Any] | None], asyncio.Task[T]],
+    ) -> asyncio.Task[T]:
+        """Start a task that follows the last task chained under ``key``.
+
+        ``start`` gets that task, or None when none is running, and returns
+        the new task. The new task should wait for the one it gets. Every
+        user of this bridge that chains under one key then shares one
+        order. Runs on the loop thread only.
+        """
+        task = start(self._tails.get(key))
+        self._tails[key] = task
+        task.add_done_callback(lambda done: self._drop_tail(key, done))
+        return task
+
+    def _drop_tail(self, key: str, task: asyncio.Task[Any]) -> None:
+        """Forget ``task`` as the tail of ``key``, unless a later task replaced it."""
+        if self._tails.get(key) is task:
+            del self._tails[key]
 
     @property
     def on_loop_thread(self) -> bool:
