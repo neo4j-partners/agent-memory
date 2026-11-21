@@ -16,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `send_temperature=False`, the provider never sends a temperature, even
   when a caller passes one. `tool_choice="auto"` lets an Anthropic model
   answer `complete_structured` without the forced tool call. If it
-  answers in text, the provider parses that text as JSON. Claude Sonnet
-  5.5 needs both settings.
+  answers in text, the provider parses that text as JSON. Both settings
+  are recommended for Claude Sonnet 5.5. `from_provider` passes
+  `tool_choice` only to `BedrockProvider`. When it routes to LiteLLM, a
+  value other than `None`, `"tool"`, or `"auto"` raises `ValueError`. A
+  valid value is dropped, and a WARNING is logged once per process.
 - `LiteLLMProvider(send_temperature=...)`. With `send_temperature=False`,
   the provider never sends a temperature, whether it comes from a call or
   from the constructor.
@@ -85,9 +88,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Behavior change:** In `BedrockProvider.complete_structured`, a native
   reply without a valid tool call now counts as the first of the
   `max_retries + 1` attempts. The SAP loop validates that reply before it
-  makes any request. With `max_retries=0`, an invalid native reply raises
+  makes any request. A tool input that is a string is validated as the
+  reply text, as is. With `max_retries=0`, an invalid native reply raises
   `StructuredExtractionError` and no SAP request is made. Earlier
-  releases made one more SAP request in that case.
+  releases made one more SAP request in that case. A forced request that
+  Bedrock rejects before the fallback to `toolChoice` auto does not count
+  toward `max_retries`.
 
 ## [0.8.0] - 2026-10-22
 
