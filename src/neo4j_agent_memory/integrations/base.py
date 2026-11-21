@@ -54,7 +54,10 @@ def _shutdown_executor(executor: concurrent.futures.ThreadPoolExecutor) -> None:
     3.11 it takes no timeout and joins its thread even when cancelled, so
     one hung ``asyncio.to_thread`` job would hang the loop's shutdown. A
     job still running after the wait is left to finish on its own thread,
-    jobs not yet started are cancelled, and a WARNING says so.
+    jobs not yet started are cancelled, and a WARNING says so. The loop is
+    not running during this wait, so a job that calls back into it, such
+    as with ``run_coroutine_threadsafe``, waits out the bound and is then
+    left running.
     """
     waiter = threading.Thread(target=executor.shutdown, name="asyncbridge-executor", daemon=True)
     waiter.start()
