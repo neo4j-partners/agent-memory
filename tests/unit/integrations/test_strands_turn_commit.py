@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import tomllib
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -38,6 +40,7 @@ from tests.unit.integrations.test_strands_nonblocking import (  # noqa: E402
 from tests.unit.integrations.test_strands_persist_error import _failing_client  # noqa: E402
 
 _LOGGER = "neo4j_agent_memory.integrations.strands.session_manager"
+_REPO = Path(__file__).resolve().parents[3]
 _NO_TURN = "pop from empty list"  # a ScriptedModel with no turn left raises this
 
 
@@ -307,10 +310,13 @@ class TestATurnWithoutAResult:
             await manager.aclose()
         assert _stored(client) == [("user", "Q2"), ("assistant", "A2")]
 
-    @pytest.mark.skipif(
-        "events.aclose()" not in inspect.getsource(Agent.stream_async),
-        reason="This Strands leaves an abandoned stream's AfterInvocationEvent to the GC.",
-    )
+    def test_the_strands_floor_closes_an_abandoned_stream(self) -> None:
+        """Strands before 1.55 leaves an abandoned stream's AfterInvocationEvent to the GC."""
+        pyproject = tomllib.loads((_REPO / "pyproject.toml").read_text(encoding="utf-8"))
+        strands = pyproject["project"]["optional-dependencies"]["strands"]
+        assert "strands-agents>=1.55,<2" in strands
+        assert "events.aclose()" in inspect.getsource(Agent.stream_async)
+
     async def test_an_abandoned_stream_stores_nothing(self) -> None:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)

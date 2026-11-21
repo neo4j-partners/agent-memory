@@ -106,8 +106,11 @@ instructor = ["instructor>=1.7,<2"]
 google = ["google-cloud-aiplatform>=2.0,<3", "google-genai>=1.66"]
 aws = ["boto3>=1.26.0"]
 
-# AWS Strands Agents SDK 1.x. The floor is 1.52 because that is the oldest
-# release carrying every surface the two adapters bind to: the `SessionManager`
+# AWS Strands Agents SDK 1.x. The floor is 1.55 because that is the oldest
+# release whose `stream_async` closes its event loop when a caller abandons
+# the stream, so the session manager's AfterInvocationEvent runs at once and
+# not from the garbage collector. 1.52 already carried every surface the two
+# adapters bind to: the `SessionManager`
 # base class with multi-agent *and* bidirectional hooks (`sync_multi_agent`,
 # `initialize_bidi_agent`, `append_bidi_message`, `sync_bidi_agent`, registered
 # unconditionally in `strands.session.session_manager`), and the `strands.memory`
@@ -115,7 +118,7 @@ aws = ["boto3>=1.26.0"]
 # `ExtractionConfig`) that `Neo4jMemoryStore` implements. Capped at the next
 # major: `SessionManager` and `MemoryStore` are both pre-2.0 contracts that a
 # major bump is free to reshape.
-strands = ["strands-agents>=1.52,<2", "boto3>=1.26.0"]
+strands = ["strands-agents>=1.55,<2", "boto3>=1.26.0"]
 
 # Entity extraction. `sentencepiece` and `protobuf` are hard requirements of
 # the GLiNER2.5 checkpoints (a DeBERTa-v3 SPM tokenizer) that gliner2 itself

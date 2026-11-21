@@ -184,6 +184,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The `[strands]` extra now needs `strands-agents>=1.55`. It needed
+  `>=1.52` before. Strands 1.55 is the first release whose
+  `stream_async` closes its events when a caller abandons a stream. The
+  session manager then ends that turn at once. Before 1.55, the turn
+  ended only when the garbage collector finalized the stream.
 - **Behavior change:** `Neo4jSessionManager` now writes a turn's messages
   in order when the agent call returns a result. Earlier releases wrote
   each message once the next one arrived. An agent call that raises or

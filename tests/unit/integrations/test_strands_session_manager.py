@@ -1213,7 +1213,7 @@ class TestRestoreLimit:
 
 
 class TestStrandsBaseClassContract:
-    """Pins the strands>=1.52 SessionManager surface this adapter builds on.
+    """Pins the strands>=1.55 SessionManager surface this adapter builds on.
 
     These assert facts about the installed strands-agents, not about our code:
     they are the tripwire for a strands upgrade that moves the contract out from
