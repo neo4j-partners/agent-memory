@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default. Earlier releases sent `temperature=0.0`. Pass `temperature=0.0`
   to `LLMEntityExtractor`, or to `complete` and `complete_structured`, to
   restore the old behavior. `LLMConfig.temperature` also defaults to `None`.
+- **Behavior change:** `BedrockProvider` now treats more model ids as
+  Anthropic models and uses the native tool call for them. The new ids
+  are those behind the `global.`, `eu.`, `apac.`, `jp.`, `au.` and
+  `us-gov.` inference profiles, and ARNs that end in an Anthropic model
+  id. Earlier releases sent these models to the generic SAP loop. With
+  the default `tool_choice=None`, the provider forces the tool call. If
+  Bedrock rejects the forced `toolChoice`, the provider logs one warning,
+  retries that call with `toolChoice` auto, and sends auto from then on.
+  For models that reject a forced tool choice, such as Claude Sonnet 5.5,
+  pass `tool_choice="auto"` to skip the rejected call.
 
 ## [0.8.0] - 2026-10-22
 

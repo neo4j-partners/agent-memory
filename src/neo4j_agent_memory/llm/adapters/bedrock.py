@@ -62,6 +62,10 @@ _TOOL_CHOICES = ("tool", "auto")
 # ``anthropic.``.
 _ANTHROPIC_MODEL_RE = re.compile(r"^(?:[a-z]+(?:-[a-z]+)*\.)?anthropic\.")
 
+# Bedrock names the rejected field in the message, for example "This model
+# doesn't support the toolConfig.toolChoice.tool field".
+_TOOL_CHOICE_ERROR_RE = re.compile(r"tool_?choice", re.IGNORECASE)
+
 
 def _strip_provider_prefix(model: str) -> str:
     if model.startswith("bedrock/"):
@@ -80,6 +84,17 @@ def _is_anthropic_on_bedrock(bare_model: str) -> bool:
     is not detected. Such a model uses the generic SAP loop.
     """
     return _ANTHROPIC_MODEL_RE.match(bare_model.rsplit("/", 1)[-1]) is not None
+
+
+def _rejects_tool_choice(exc: Exception) -> bool:
+    """Whether ``exc`` is a Bedrock ValidationException that rejects ``toolChoice``."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    error = response.get("Error", {})
+    if error.get("Code") != "ValidationException":
+        return False
+    return _TOOL_CHOICE_ERROR_RE.search(error.get("Message", "")) is not None
 
 
 def _translate_bedrock_exception(exc: Exception) -> Exception:
@@ -159,8 +174,11 @@ class BedrockProvider:
       temperature, even when a caller passes one. A ``temperature`` of
       ``None`` is never sent either way.
     * ``tool_choice``: Controls ``complete_structured`` on Anthropic
-      models. ``None`` or ``"tool"`` forces the ``submit_extraction``
-      tool. ``"auto"`` lets the model choose. If the model answers in
+      models. ``None`` forces the ``submit_extraction`` tool. If Bedrock
+      rejects the forced choice, the provider logs one warning, retries
+      that call with ``"auto"``, and sends ``"auto"`` from then on.
+      ``"tool"`` always forces the tool and never falls back. ``"auto"``
+      lets the model choose. If the model answers in
       text instead, the provider parses that text as JSON. When it does
       not validate, ``schema_aligned_extract`` retries, and the first
       reply counts toward ``max_retries``.
@@ -203,6 +221,8 @@ class BedrockProvider:
         self._default_max_tokens = default_max_tokens
         self._send_temperature = send_temperature
         self._tool_choice = tool_choice
+        # Set when Bedrock rejects a forced toolChoice under tool_choice=None.
+        self._fall_back_to_auto = False
         self._client: Any | None = None
 
     def _inference_config(self, temperature: float | None, max_tokens: int) -> dict[str, Any]:
@@ -336,7 +356,7 @@ class BedrockProvider:
                 "tools": [tool_spec],
                 "toolChoice": (
                     {"auto": {}}
-                    if self._tool_choice == "auto"
+                    if self._tool_choice == "auto" or self._fall_back_to_auto
                     else {"tool": {"name": "submit_extraction"}}
                 ),
             },
@@ -345,7 +365,7 @@ class BedrockProvider:
             kwargs["system"] = system
 
         try:
-            response = await asyncio.to_thread(client.converse, **kwargs)
+            response = await self._converse_with_tool(client, kwargs)
         except Exception as exc:
             translated = _translate_bedrock_exception(exc)
             if translated is exc:
@@ -378,6 +398,31 @@ class BedrockProvider:
             timeout=timeout,
             first_reply=first_reply,
         )
+
+    async def _converse_with_tool(self, client: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Send a tool-use Converse request, falling back to ``toolChoice`` auto.
+
+        Only the default ``tool_choice=None`` falls back, and only when
+        Bedrock rejects the forced ``toolChoice`` itself. Any other error
+        is raised unchanged.
+        """
+        try:
+            return await asyncio.to_thread(client.converse, **kwargs)
+        except Exception as exc:
+            forced = "tool" in kwargs["toolConfig"]["toolChoice"]
+            if self._tool_choice is not None or not forced or not _rejects_tool_choice(exc):
+                raise
+            if not self._fall_back_to_auto:
+                self._fall_back_to_auto = True
+                logger.warning(
+                    "Bedrock model %s rejected a forced toolChoice, so this provider "
+                    "now sends toolChoice auto. Pass tool_choice='auto' to skip the "
+                    "rejected call. Error: %s",
+                    self._bare_model,
+                    exc,
+                )
+        auto = {**kwargs, "toolConfig": {**kwargs["toolConfig"], "toolChoice": {"auto": {}}}}
+        return await asyncio.to_thread(client.converse, **auto)
 
 
 class BedrockEmbeddingProvider:

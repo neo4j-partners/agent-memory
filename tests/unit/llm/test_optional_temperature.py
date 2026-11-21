@@ -154,6 +154,91 @@ def test_bedrock_rejects_unknown_tool_choice() -> None:
 
 
 # ---------------------------------------------------------------------------
+# BedrockProvider falls back to toolChoice auto when a forced choice is rejected
+# ---------------------------------------------------------------------------
+
+_GLOBAL_SONNET = "bedrock/global.anthropic.claude-sonnet-5-5-v1:0"
+_FORCED = {"tool": {"name": "submit_extraction"}}
+_AUTO = {"auto": {}}
+
+
+def _validation_error(message: str) -> Exception:
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": "ValidationException", "Message": message}}, "Converse")
+
+
+class _RejectsForcedToolChoice:
+    """A Converse client that rejects a forced toolChoice and accepts auto."""
+
+    def __init__(self, rejection: str) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._rejection = rejection
+
+    def converse(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        if kwargs["toolConfig"]["toolChoice"] != _AUTO:
+            raise _validation_error(self._rejection)
+        return converse_tool_use({"value": "ok"})
+
+
+_TOOL_CHOICE_REJECTION = (
+    "This model doesn't support the toolConfig.toolChoice.tool field. "
+    "Remove toolConfig.toolChoice.tool and try again."
+)
+
+
+def _rejecting_provider(rejection: str, **kwargs: Any) -> tuple[Any, _RejectsForcedToolChoice]:
+    from neo4j_agent_memory.llm.adapters.bedrock import BedrockProvider
+
+    provider = BedrockProvider(_GLOBAL_SONNET, aws_region="us-west-2", **kwargs)
+    client = _RejectsForcedToolChoice(rejection)
+    provider._client = client
+    return provider, client
+
+
+async def test_bedrock_rejected_forced_tool_choice_falls_back_to_auto(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from neo4j_agent_memory.llm.adapters import bedrock as adapter
+
+    provider, client = _rejecting_provider(_TOOL_CHOICE_REJECTION)
+
+    with caplog.at_level("WARNING", logger=adapter.__name__):
+        first = await provider.complete_structured(_MESSAGES, _Extraction)
+        second = await provider.complete_structured(_MESSAGES, _Extraction)
+
+    assert (first.value, second.value) == ("ok", "ok")
+    choices = [call["toolConfig"]["toolChoice"] for call in client.calls]
+    assert choices == [_FORCED, _AUTO, _AUTO]
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "toolChoice" in warnings[0].getMessage()
+
+
+async def test_bedrock_other_validation_errors_do_not_fall_back() -> None:
+    from neo4j_agent_memory.llm.errors import ProviderInvalidRequestError
+
+    provider, client = _rejecting_provider("Input is too long for requested model.")
+
+    with pytest.raises(ProviderInvalidRequestError, match="too long"):
+        await provider.complete_structured(_MESSAGES, _Extraction)
+
+    assert len(client.calls) == 1
+
+
+async def test_bedrock_explicit_forced_tool_choice_does_not_fall_back() -> None:
+    from neo4j_agent_memory.llm.errors import ProviderInvalidRequestError
+
+    provider, client = _rejecting_provider(_TOOL_CHOICE_REJECTION, tool_choice="tool")
+
+    with pytest.raises(ProviderInvalidRequestError, match="toolChoice"):
+        await provider.complete_structured(_MESSAGES, _Extraction)
+
+    assert len(client.calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # Other adapters omit temperature when it is None
 # ---------------------------------------------------------------------------
 
