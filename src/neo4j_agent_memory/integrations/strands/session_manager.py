@@ -927,17 +927,25 @@ class Neo4jSessionManager(SessionManager):
                 # asyncio.wait neither re-raises the error nor cancels the future.
                 await asyncio.wait({asyncio.wrap_future(self._closing)})
             return
+        failure: BaseException | None = None
         try:
-            await self._aflush_buffer()
-        finally:
+            try:
+                await self._aflush_buffer()
+            except BaseException as e:
+                failure = e
             try:
                 if self._should_close_client and self._client.is_connected:
                     await self._bridge.run_async(self._client.close())
-            finally:
-                try:
-                    await asyncio.to_thread(self._bridge.close)
-                finally:
-                    closing.set_result(None)
+            except BaseException as e:
+                failure = self._first_failure(failure, e, "close the memory client")
+            try:
+                await asyncio.to_thread(self._bridge.close)
+            except BaseException as e:
+                failure = self._first_failure(failure, e, "stop the bridge")
+        finally:
+            closing.set_result(None)
+        if failure is not None:
+            raise failure
 
     def close(self) -> None:
         """Flush, release the client (if owned/connected by us), stop the bridge.
@@ -958,17 +966,45 @@ class Neo4jSessionManager(SessionManager):
         closing = self._begin_close()
         if closing is None:
             return
+        failure: BaseException | None = None
         try:
-            self._flush_buffer()
-        finally:
+            try:
+                self._flush_buffer()
+            except BaseException as e:
+                failure = e
             try:
                 if self._should_close_client and self._client.is_connected:
                     self._bridge.run(self._client.close())
-            finally:
-                try:
-                    self._bridge.close()
-                finally:
-                    closing.set_result(None)
+            except BaseException as e:
+                failure = self._first_failure(failure, e, "close the memory client")
+            try:
+                self._bridge.close()
+            except BaseException as e:
+                failure = self._first_failure(failure, e, "stop the bridge")
+        finally:
+            closing.set_result(None)
+        if failure is not None:
+            raise failure
+
+    def _first_failure(
+        self, failure: BaseException | None, error: BaseException, step: str
+    ) -> BaseException:
+        """Return the error a close raises, which is its first one.
+
+        Every close step runs even after one fails. The flush comes first,
+        so its error wins over an error from releasing the client or the
+        bridge. A later error is logged instead of raised.
+        """
+        if failure is None:
+            return error
+        logger.error(
+            "Failed to %s while closing session %r: %s",
+            step,
+            self.session_id,
+            _describe(error),
+            exc_info=error,
+        )
+        return failure
 
     def __enter__(self) -> Neo4jSessionManager:
         return self

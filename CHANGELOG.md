@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Neo4jSessionManager.close()` and `aclose()` raise their first error.
+  A failed final write is no longer replaced by an error from closing
+  the client or stopping the bridge. That later error is logged as an
+  ERROR.
 - `AsyncBridge` shutdown cancels work that outlived it while its loop
   is still open, so no callback fails on a closed loop. Work submitted
   once the loop has stopped is refused with `RuntimeError` and is

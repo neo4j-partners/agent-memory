@@ -81,6 +81,46 @@ def test_rejects_an_unknown_policy() -> None:
         )
 
 
+class TestCloseErrorPrecedence:
+    @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
+    async def test_the_flush_error_wins_and_a_client_close_error_is_logged(
+        self, use_async: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client, switch = _failing_client()
+
+        async def close_fails() -> None:
+            client.close_calls += 1
+            raise RuntimeError("client close failed")
+
+        client.close = close_fails  # type: ignore[method-assign]
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        _buffered(manager, "a")  # initialize connects, so close releases the client
+        switch.down = True
+        with caplog.at_level(logging.ERROR, logger=_LOGGER):
+            close = manager.aclose() if use_async else asyncio.to_thread(manager.close)
+            with pytest.raises(SessionException):
+                await close
+
+        assert client.close_calls == 1
+        assert manager._bridge.closed  # every step ran
+        assert any("client close failed" in r.getMessage() for r in _records(caplog, "ERROR"))
+
+    @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
+    async def test_a_client_close_error_alone_is_raised(self, use_async: bool) -> None:
+        client, _ = _failing_client()
+
+        async def close_fails() -> None:
+            raise RuntimeError("client close failed")
+
+        client.close = close_fails  # type: ignore[method-assign]
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        _buffered(manager, "a")
+        close = manager.aclose() if use_async else asyncio.to_thread(manager.close)
+        with pytest.raises(RuntimeError, match="client close failed"):
+            await close
+        assert manager._bridge.closed
+
+
 @_MODES
 class TestRetryBound:
     async def test_a_failed_turn_is_stored_in_order_by_the_next(
