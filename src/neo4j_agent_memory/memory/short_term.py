@@ -642,7 +642,8 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
                 Required when ``MemorySettings.memory.multi_tenant=True``.
 
         Returns:
-            List of created Message objects
+            List of created Message objects, each with the timestamp stored
+            in the database.
         """
         if not messages:
             return []
@@ -709,13 +710,18 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
             # Insert and link the batch in one transaction: the query locks the
             # conversation, reads its tail, creates the messages in input order
             # with increasing timestamps, and chains them after the tail.
-            await self._client.execute_write(
+            rows = await self._client.execute_write(
                 queries.CREATE_MESSAGES_BATCH,
                 {
                     "conversation_id": str(conv_id),
                     "messages": batch_data,
                 },
             )
+            # Return the times the database stored, which get_conversation
+            # reads back, not the time each Message was built here.
+            if rows:
+                for message, stored in zip(batch_messages, rows[0]["timestamps"], strict=True):
+                    message.created_at = _to_python_datetime(stored)
 
             all_created.extend(batch_messages)
 
@@ -949,7 +955,9 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
                 requested.
 
         Returns:
-            The created message, with this call's fields.
+            The created message, with this call's fields and the timestamp
+            stored in the database. After a retry that stored nothing, it
+            has the timestamp of the message stored before.
         """
         # Multi-tenant guardrail.
         self._enforce_multi_tenant(user_identifier)
@@ -979,7 +987,7 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
         )
 
         # Store message
-        await self._client.execute_write(
+        rows = await self._client.execute_write(
             queries.CREATE_MESSAGE,
             {
                 "conversation_id": str(conv_id),
@@ -990,6 +998,19 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
                 "metadata": _serialize_metadata(message.metadata),
             },
         )
+        # Return the time the database stored, which get_conversation reads
+        # back, not the time the Message was built here. A retry under a
+        # known id creates nothing and returns no row, so read the time of
+        # the message stored before.
+        if rows:
+            message.created_at = _to_python_datetime(rows[0]["m"]["timestamp"])
+        else:
+            prior = await self._client.execute_read(
+                queries.GET_MESSAGE_TIMESTAMP,
+                {"conversation_id": str(conv_id), "id": str(message.id)},
+            )
+            if prior and (stored := prior[0].get("timestamp")) is not None:
+                message.created_at = _to_python_datetime(stored)
 
         # Extract and link entities according to the requested mode.
         if extraction_mode == "skip":

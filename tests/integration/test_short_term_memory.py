@@ -32,6 +32,24 @@ class TestShortTermMemoryBasicOperations:
         assert msg.created_at is not None
 
     @pytest.mark.asyncio
+    async def test_add_message_returns_the_stored_timestamp(self, memory_client, session_id):
+        # The returned time used to be the client clock when the Message was
+        # built, not the server time that get_conversation reads back.
+        written = [
+            await memory_client.short_term.add_message(
+                session_id,
+                MessageRole.USER,
+                f"Message {i}",
+                extract_entities=False,
+                generate_embedding=False,
+            )
+            for i in range(3)
+        ]
+
+        conversation = await memory_client.short_term.get_conversation(session_id)
+        assert [m.created_at for m in written] == [m.created_at for m in conversation.messages]
+
+    @pytest.mark.asyncio
     async def test_add_message_with_all_roles(self, memory_client, session_id):
         """Test adding messages with all supported roles."""
         roles = [MessageRole.USER, MessageRole.ASSISTANT, MessageRole.SYSTEM]
@@ -873,6 +891,21 @@ class TestBatchMessageOrdering:
 
         conversation = await memory_client.short_term.get_conversation(session_id)
         assert [m.id for m in conversation.messages] == sorted((m.id for m in stored), key=str)
+
+    @pytest.mark.asyncio
+    async def test_batch_returns_the_stored_timestamps(self, memory_client, session_id):
+        batch = [
+            {"role": "user", "content": "explicit", "timestamp": "2024-01-01T10:00:00Z"},
+            {"role": "assistant", "content": "stamped one"},
+            {"role": "user", "content": "stamped two"},
+        ]
+        stored = await memory_client.short_term.add_messages_batch(
+            session_id, batch, generate_embeddings=False, extract_entities=False
+        )
+
+        conversation = await memory_client.short_term.get_conversation(session_id)
+        read_back = {m.id: m.created_at for m in conversation.messages}
+        assert [m.created_at for m in stored] == [read_back[m.id] for m in stored]
 
     @pytest.mark.asyncio
     async def test_concurrent_batch_and_single_appends_keep_one_chain(

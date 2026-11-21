@@ -45,3 +45,15 @@ class TestAddMessageRetry:
         with pytest.raises(Exception, match="already exists"):
             await _add(memory_client, f"{session_id}-other", "b", message_id)
         assert await _chain(memory_client, f"{session_id}-other") == []
+
+    @pytest.mark.asyncio
+    async def test_a_retry_returns_the_time_stored_by_the_first_write(
+        self, memory_client, session_id
+    ):
+        message_id = uuid4()
+        first = await _add(memory_client, session_id, "b", message_id)
+        retry = await _add(memory_client, session_id, "b", message_id)
+
+        conversation = await memory_client.short_term.get_conversation(session_id)
+        assert [m.created_at for m in conversation.messages] == [first.created_at]
+        assert retry.created_at == first.created_at

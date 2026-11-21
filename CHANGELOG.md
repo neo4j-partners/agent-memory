@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `add_message` and `add_messages_batch` on bolt now return the
+  timestamp stored in the database. Before, `created_at` was the client
+  clock when the `Message` was built, so it differed from what
+  `get_conversation` reads back. A retry under a known `message_id`
+  returns the timestamp of the message stored before.
 - `add_messages_batch` now stores a timestamp in a named UTC zone at
   offset UTC, so batch messages read back in the right order.
 - Strands redactions of a stored message now run one at a time. Before,

@@ -151,6 +151,11 @@ FOREACH (_ IN CASE WHEN last IS NULL THEN [1] ELSE [] END |
 RETURN m
 """
 
+GET_MESSAGE_TIMESTAMP = """
+MATCH (:Conversation {id: $conversation_id})-[:HAS_MESSAGE]->(m:Message {id: $id})
+RETURN m.timestamp AS timestamp
+"""
+
 CREATE_MESSAGES_BATCH = """
 MATCH (c:Conversation {id: $conversation_id})
 // Lock the conversation before reading its tail, exactly as CREATE_MESSAGE
@@ -198,7 +203,7 @@ FOREACH (j IN range(0, size(chain) - 2) |
         )
     )
 )
-RETURN size(messages) AS created
+RETURN [m IN messages | m.timestamp] AS timestamps
 """
 
 UPDATE_MESSAGE_EMBEDDING = """
