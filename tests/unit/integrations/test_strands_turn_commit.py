@@ -414,6 +414,24 @@ class TestAnInterruptedTurn:
             await manager.aclose()
         assert _stored(client) == _FULL_APPROVAL_TURN
 
+    async def test_a_resume_whose_model_raises_discards_the_whole_turn(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        model = ScriptedModel(_APPROVAL_TURN)  # no turn left for the resume
+        agent = Agent(model=model, tools=[approve], session_manager=manager, callback_handler=None)
+        try:
+            paused = await agent.invoke_async("delete the file")
+            with pytest.raises(Exception, match=_NO_TURN):
+                await agent.invoke_async(_answer(paused))
+            assert not agent._interrupt_state.activated  # the interrupt is consumed
+            assert _stored(client) == []
+
+            model._turns.append([{"text": "Hi."}])
+            await agent.invoke_async("hello")
+        finally:
+            await manager.aclose()
+        assert _stored(client) == [("user", "hello"), ("assistant", "Hi.")]
+
     async def test_a_resume_after_a_failed_before_hook_writes_the_whole_turn(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
