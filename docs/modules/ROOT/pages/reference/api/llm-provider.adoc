@@ -75,7 +75,7 @@ Implementations MUST:
 * Be safe to call concurrently — no shared mutable state.
 * Translate SDK-specific errors to `ProviderError` subclasses.
 * Leave temperature out of the request when `temperature` is `None`. The model's own default then applies.
-* Honor `temperature=0.0` as deterministic where the provider supports it.
+* Send any other `temperature`, including `0.0`, as given. An adapter option such as `send_temperature=False` can turn this off for models that reject the field.
 
 The protocol requires the canonical `"provider/model"` identifier in the `model` attribute. Adapters that accept bare names normalise to include the prefix.
 
