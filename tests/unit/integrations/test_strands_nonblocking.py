@@ -649,6 +649,33 @@ class TestHooksAfterClose:
         with pytest.raises(SessionException, match="closed"):
             await getattr(manager, hook)(event)
 
+    async def test_after_invocation_with_nothing_buffered_is_a_noop_after_close(
+        self,
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = SimpleNamespace(messages=[], agent_id="a1")
+        manager.initialize(agent)
+        manager.append_message({"role": "user", "content": [{"text": "x"}]}, agent)
+        await manager.aclose()  # writes "x"; nothing is left buffered
+
+        await manager._on_after_invocation(SimpleNamespace(agent=agent))
+        assert _stored(client) == [("user", "x")]
+
+    async def test_abandoned_stream_finalizes_cleanly_after_aclose(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = _agent(manager, [{"text": "Hello!"}])
+        stream = agent.stream_async("hi")
+        async for _ in stream:
+            if agent.messages:
+                break  # the caller walks away mid-turn
+        await manager.aclose()  # writes "hi"; nothing is left buffered
+
+        # Strands fires AfterInvocationEvent from the generator's finally.
+        await stream.aclose()
+        assert _stored(client) == [("user", "hi")]
+
     async def test_aclose_is_idempotent_and_close_after_aclose_is_a_noop(self) -> None:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client)

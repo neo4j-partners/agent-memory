@@ -371,7 +371,20 @@ class Neo4jSessionManager(SessionManager):
             registry.add_callback(MessageAddedEvent, self._on_message_added)
 
     async def _on_after_invocation(self, event: AfterInvocationEvent) -> None:
-        self._check_open()
+        """Write the rest of the turn.
+
+        Strands fires this from its ``finally``, so it also runs when a
+        caller abandons a stream and the generator is finalized after
+        ``aclose()``. With nothing buffered there is nothing to lose, so a
+        closed manager returns quietly. It raises only when messages would
+        be dropped.
+        """
+        if self._closed:
+            with self._queue_lock:
+                buffered = self._pending is not None or bool(self._ready)
+            if not buffered:
+                return
+            self._check_open()
         await self._aflush_buffer()
 
     async def _on_message_flush(self, event: MessageAddedEvent) -> None:

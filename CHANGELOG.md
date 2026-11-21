@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Before, the failed message was lost. Delivery is at least once. Neither
   backend lets the caller set a message id, so a write that failed after
   the backend stored it can be stored twice.
+- Abandoning a Strands stream and then calling `aclose()` no longer raises
+  `SessionException` when the stream's generator is finalized. After
+  close, the after-invocation hook raises only if messages are still
+  buffered.
 
 ### Changed
 
