@@ -143,6 +143,14 @@ class SharedMemory:
             **kwargs,
         )
 
+    def _check_off_loop(self, method: str) -> None:
+        """Raise ``RuntimeError`` when the caller runs on the loop thread."""
+        if self._bridge.on_loop_thread:
+            raise RuntimeError(
+                f"SharedMemory.{method}() cannot run on its loop thread. "
+                "Call it from another thread."
+            )
+
     def _begin_close(self) -> bool:
         """Mark this object closed. Returns False when it already was."""
         with self._lock:
@@ -152,8 +160,17 @@ class SharedMemory:
             return True
 
     async def aclose(self, timeout: float = 30.0) -> None:
-        """Like ``close()``, without blocking the caller's loop."""
+        """Like ``close()``, without blocking the caller's loop.
+
+        Raises:
+            ValueError: ``timeout`` is not a positive finite number. The
+                object stays open.
+            RuntimeError: The caller runs on the loop thread, where waiting
+                for the loop's tasks would wait for the caller too. The
+                object stays open.
+        """
         _check_timeout(timeout)
+        self._check_off_loop("aclose")
         if not self._begin_close():
             return
         try:
@@ -180,10 +197,7 @@ class SharedMemory:
                 open.
         """
         _check_timeout(timeout)
-        if self._bridge.on_loop_thread:
-            raise RuntimeError(
-                "SharedMemory.close() cannot run on its loop thread. Call it from another thread."
-            )
+        self._check_off_loop("close")
         if not self._begin_close():
             return
         try:

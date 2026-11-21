@@ -147,11 +147,17 @@ class TestClosingSharedMemory:
         with pytest.raises(RuntimeError, match="closed"):
             shared.session_manager("sess-1")
 
-    def test_close_on_the_loop_thread_raises_and_stays_open(self, client: FakeMemoryClient) -> None:
+    @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
+    def test_close_on_the_loop_thread_raises_and_stays_open(
+        self, client: FakeMemoryClient, use_async: bool
+    ) -> None:
         shared = SharedMemory.open(_SETTINGS)
 
         async def close_on_the_loop() -> None:
-            shared.close()
+            if use_async:
+                await shared.aclose(timeout=0.1)
+            else:
+                shared.close(timeout=0.1)
 
         with pytest.raises(RuntimeError, match="loop thread"):
             shared._bridge.run(close_on_the_loop())

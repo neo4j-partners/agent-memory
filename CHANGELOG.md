@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extractions. The timeout must be a positive finite number. The tasks
   still running after it are cancelled, and a WARNING gives their
   number. They get up to 5 seconds to unwind before the client closes.
-  `close()` called on the loop thread raises `RuntimeError` and leaves
-  the object open.
+  `close()` or `aclose()` called on the loop thread raises
+  `RuntimeError` and leaves the object open.
   When `SharedMemory.open()` fails to connect, it closes the client and
   stops the loop before the error propagates. A connect can fail after
   it opened the driver. An error from that close is logged as a WARNING.
