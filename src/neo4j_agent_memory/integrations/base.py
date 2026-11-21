@@ -27,6 +27,7 @@ _SYNC_TIMEOUT_SECONDS = 30
 _SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 _CLOSED_IN_FLIGHT = "AsyncBridge closed with work in flight"
+_THREAD_DIED = "AsyncBridge loop thread stopped unexpectedly; the bridge cannot be reused"
 
 
 class AsyncBridge:
@@ -46,8 +47,9 @@ class AsyncBridge:
     later ``run()`` raises ``RuntimeError`` instead of starting a new
     thread, so a closed owner cannot leak a loop thread or reuse
     transports bound to the old loop. ``run_async()`` behaves the same way.
-    A thread that died without ``close()`` is still restarted on the next
-    ``run()`` or ``run_async()``.
+    A loop thread that stops without ``close()`` is fatal too. The bridge is
+    marked broken, and later calls raise ``RuntimeError`` rather than start
+    a fresh loop that the owner's clients were never bound to.
 
     When the loop stops, its thread shuts it down the way ``asyncio.run``
     does. It cancels the tasks still pending, gives them
@@ -62,6 +64,7 @@ class AsyncBridge:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._closed = False
+        self._broken = False
         # Futures from submit() that are not done yet. Shutdown cancels any
         # whose task never started, so no caller waits on them forever.
         self._futures: set[concurrent.futures.Future[Any]] = set()
@@ -76,7 +79,11 @@ class AsyncBridge:
         with self._lock:
             if self._closed:
                 raise RuntimeError("AsyncBridge is closed")
-            if self._loop is None or self._thread is None or not self._thread.is_alive():
+            if self._thread is not None and not self._thread.is_alive():
+                self._broken = True
+            if self._broken:
+                raise RuntimeError(_THREAD_DIED)
+            if self._loop is None:
                 self._loop = asyncio.new_event_loop()
                 self._thread = threading.Thread(
                     target=self._run_loop,
@@ -93,6 +100,9 @@ class AsyncBridge:
         try:
             loop.run_forever()
         finally:
+            if not self._closed:
+                # Not lock-guarded: close() holds _lock while it joins us.
+                self._broken = True
             try:
                 tasks = asyncio.all_tasks(loop)
                 for task in tasks:

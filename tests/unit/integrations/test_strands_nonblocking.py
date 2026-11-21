@@ -191,8 +191,8 @@ class TestBridgeRunAsync:
         assert bridge._thread is None
 
     @pytest.mark.parametrize("use_async", [False, True], ids=["run", "run_async"])
-    async def test_dead_thread_is_restarted(self, use_async: bool) -> None:
-        """A loop thread that died without close() starts again on next use."""
+    async def test_dead_thread_is_fatal(self, use_async: bool) -> None:
+        """A loop thread that died without close() is not restarted."""
         bridge = AsyncBridge()
 
         async def answer() -> int:
@@ -206,12 +206,15 @@ class TestBridgeRunAsync:
             dead.join(timeout=2)
             assert not dead.is_alive()
 
-            if use_async:
-                assert await bridge.run_async(answer()) == 42
-            else:
-                assert bridge.run(answer()) == 42
-            # Thread idents can be reused, so compare the thread objects.
-            assert bridge._thread is not dead and bridge._thread.is_alive()
+            for _ in range(2):  # it stays broken
+                coro = answer()
+                with pytest.raises(RuntimeError, match="stopped unexpectedly"):
+                    if use_async:
+                        await bridge.run_async(coro)
+                    else:
+                        bridge.run(coro)
+                assert coro.cr_frame is None  # closed, so no "never awaited"
+            assert bridge._thread is dead
         finally:
             bridge.close()
 
