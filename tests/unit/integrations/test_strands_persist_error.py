@@ -119,6 +119,29 @@ class TestCloseErrorPrecedence:
         assert any("client close failed" in r.getMessage() for r in _records(caplog, "ERROR"))
 
     @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
+    async def test_a_later_interrupt_wins_and_the_flush_error_is_logged(
+        self, use_async: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client, switch = _failing_client()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        _buffered(manager, "a")
+        stop_bridge = manager._bridge.close
+
+        def interrupted() -> None:
+            stop_bridge()
+            raise KeyboardInterrupt
+
+        manager._bridge.close = interrupted  # type: ignore[method-assign]
+        switch.down = True
+        with caplog.at_level(logging.ERROR, logger=_LOGGER):
+            close = manager.aclose() if use_async else asyncio.to_thread(manager.close)
+            with pytest.raises(KeyboardInterrupt):
+                await close
+
+        errors = [r for r in _records(caplog, "ERROR") if r.exc_info]
+        assert any(isinstance(r.exc_info[1], SessionException) for r in errors)
+
+    @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
     async def test_a_client_close_error_alone_is_raised(self, use_async: bool) -> None:
         client, _ = _failing_client()
 

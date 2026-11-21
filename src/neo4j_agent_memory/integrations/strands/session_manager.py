@@ -1209,8 +1209,23 @@ class Neo4jSessionManager(SessionManager):
         Every close step runs even after one fails. The flush comes first,
         so its error wins over an error from releasing the client or the
         bridge. A later error is logged instead of raised.
+
+        An interrupt is the exception: a later BaseException that is not an
+        Exception, such as KeyboardInterrupt or CancelledError, wins over an
+        earlier Exception. The earlier one is logged instead, so Ctrl-C does
+        not turn into a catchable error.
         """
         if failure is None:
+            return error
+        if isinstance(failure, Exception) and not isinstance(error, Exception):
+            logger.error(
+                "Closing session %r was interrupted while it tried to %s. "
+                "An earlier step had failed: %s",
+                self.session_id,
+                step,
+                _describe(failure),
+                exc_info=failure,
+            )
             return error
         logger.error(
             "Failed to %s while closing session %r: %s",
