@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   When `SharedMemory.open()` fails to connect, it closes the client and
   stops the loop before the error propagates. A connect can fail after
   it opened the driver. An error from that close is logged as a WARNING.
+  A connect that runs out of `request_timeout` is cancelled and gets up
+  to 5 seconds to unwind before the client closes. Then `open()` raises
+  `TimeoutError`.
 - `Neo4jSessionManager(bridge=...)`. The manager runs its memory I/O on
   that background loop and needs `memory_client=`. The client must
   already be connected on that loop, or the manager raises `ValueError`. It closes neither the

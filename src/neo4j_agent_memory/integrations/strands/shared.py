@@ -83,7 +83,9 @@ class SharedMemory:
 
         Blocks until the client is connected. ``request_timeout`` bounds the
         connect and closing the client. It is also the default
-        ``request_timeout`` of each manager this object builds.
+        ``request_timeout`` of each manager this object builds. A connect
+        that runs out of time is cancelled and gets up to 5 seconds to
+        unwind before the client closes.
 
         ``background_hook`` goes to every manager this object builds. It
         is called with a short name when a deferred extraction or a
@@ -92,6 +94,8 @@ class SharedMemory:
         thread-safe and fast. See ``Neo4jSessionManager``.
 
         Raises:
+            TimeoutError: Connecting took longer than ``request_timeout``.
+                The client is closed and the loop is stopped first.
             Exception: Connecting failed. The client is closed and the loop
                 is stopped before the error propagates.
         """
@@ -100,7 +104,9 @@ class SharedMemory:
         bridge = AsyncBridge(timeout=request_timeout)
         client = MemoryClient(settings)
         try:
-            bridge.run(client.connect(), request_timeout)
+            # _connect bounds itself. The outer bound adds the unwind and
+            # one request_timeout to cover scheduling, as close does.
+            bridge.run(_connect(client, request_timeout), 2 * request_timeout + _UNWIND_SECONDS)
         except BaseException:
             _close_failed_client(client, bridge, request_timeout)
             raise
@@ -222,6 +228,21 @@ class SharedMemory:
         ``request_timeout`` to cover scheduling.
         """
         return timeout + _UNWIND_SECONDS + self._request_timeout
+
+
+async def _connect(client: MemoryClient, timeout: float) -> None:
+    """Connect ``client`` within ``timeout`` seconds. Runs on the loop.
+
+    A connect that runs out of time is cancelled and gets
+    ``_UNWIND_SECONDS`` to unwind, so it ends before the client closes.
+    """
+    task = asyncio.ensure_future(client.connect())
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        task.cancel()
+        await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
+        raise TimeoutError(f"Connecting the memory client took longer than {timeout}s.")
+    task.result()
 
 
 def _close_failed_client(client: MemoryClient, bridge: AsyncBridge, timeout: float) -> None:

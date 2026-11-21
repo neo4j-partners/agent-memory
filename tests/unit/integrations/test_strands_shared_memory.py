@@ -194,6 +194,35 @@ class TestClosingSharedMemory:
         assert not fake.is_connected
         assert _bridge_threads() == threads_before
 
+    def test_a_connect_that_times_out_ends_before_the_client_closes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeMemoryClient()
+        order: list[str] = []
+        close = fake.close
+
+        async def open_then_hang() -> None:
+            fake._connected = True  # the driver is open
+            try:
+                await asyncio.sleep(30)
+            finally:
+                order.append("connect ended")
+
+        async def record_close() -> None:
+            order.append("close")
+            await close()
+
+        monkeypatch.setattr(fake, "connect", open_then_hang)
+        monkeypatch.setattr(fake, "close", record_close)
+        monkeypatch.setattr("neo4j_agent_memory.MemoryClient", lambda _settings: fake)
+        threads_before = _bridge_threads()
+
+        with pytest.raises(TimeoutError):
+            SharedMemory.open(_SETTINGS, request_timeout=0.1)
+        assert order == ["connect ended", "close"]
+        assert not fake.is_connected
+        assert _bridge_threads() == threads_before
+
     def test_a_close_that_fails_after_a_failed_connect_is_logged(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
