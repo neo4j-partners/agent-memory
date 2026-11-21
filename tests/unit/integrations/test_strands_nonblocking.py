@@ -835,6 +835,63 @@ class TestToolMirroringOutlivesItsWait:
         assert [c["step_id"] for c in reasoning.tool_calls] == [s["id"] for s in reasoning.steps]
 
 
+class TestDrainCoalescing:
+    """A flush joins the running drain instead of queuing another."""
+
+    async def test_a_flush_during_a_drain_joins_it(self) -> None:
+        client = _slow_client(0.2)
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _buffered(manager, "one")
+        manager._release_pending()
+        first = manager._submit_drain()
+        await asyncio.sleep(0.05)  # the drain is writing "one"
+        manager.append_message({"role": "user", "content": [{"text": "two"}]}, agent)
+        manager._release_pending()
+
+        assert manager._submit_drain() is first
+        await asyncio.wrap_future(first)
+        assert _stored(client) == [("user", "one"), ("user", "two")]
+        await manager.aclose()
+
+    async def test_a_flush_after_the_drain_found_the_queue_empty_starts_another(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _buffered(manager, "one")
+        manager._release_pending()
+        first = manager._submit_drain()
+        await asyncio.wrap_future(first)
+        manager.append_message({"role": "user", "content": [{"text": "two"}]}, agent)
+        manager._release_pending()
+
+        second = manager._submit_drain()
+        assert second is not None and second is not first
+        await asyncio.wrap_future(second)
+        assert _stored(client) == [("user", "one"), ("user", "two")]
+        await manager.aclose()
+
+    async def test_a_refused_submit_leaves_no_drain_to_join(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager = Neo4jSessionManager("sess-1", memory_client=FakeMemoryClient())
+        _buffered(manager, "one")
+        manager._release_pending()
+
+        def refuse(coro: Any) -> Any:
+            coro.close()
+            raise RuntimeError("AsyncBridge is closed")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(manager._bridge, "submit", refuse)
+            with pytest.raises(RuntimeError, match="closed"):
+                manager._submit_drain()
+        assert manager._drain_run is None
+
+        retried = manager._submit_drain()  # the next flush starts a drain
+        assert retried is not None
+        await asyncio.wrap_future(retried)
+        await manager.aclose()
+
+
 class TestRedactionDuringAWrite:
     async def test_the_redacted_text_replaces_the_written_message(self) -> None:
         client = _slow_client(0.3)

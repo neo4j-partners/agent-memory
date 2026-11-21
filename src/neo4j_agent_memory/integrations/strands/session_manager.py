@@ -97,6 +97,18 @@ def _describe(error: BaseException) -> str:
     return str(error) or type(error).__name__
 
 
+def _copy_outcome(
+    source: concurrent.futures.Future[None], target: concurrent.futures.Future[None]
+) -> None:
+    """Give ``target`` the result, error, or cancellation of ``source``."""
+    if source.cancelled():
+        target.cancel()
+    elif (error := source.exception()) is not None:
+        target.set_exception(error)
+    else:
+        target.set_result(None)
+
+
 class _MessageDropped(Exception):
     """A drain dropped a message after its retry failed. Carries that error."""
 
@@ -195,7 +207,7 @@ class Neo4jSessionManager(SessionManager):
         self._queue_lock = threading.Lock()
         self._drain_lock: asyncio.Lock | None = None  # bridge loop only; one drain at a time
         self._redact_lock: asyncio.Lock | None = None  # bridge loop only; one redaction at a time
-        self._latest_drain: concurrent.futures.Future[None] | None = None  # under _queue_lock
+        self._drain_run: concurrent.futures.Future[None] | None = None  # under _queue_lock
         self._dequeued = 0  # messages that left _ready, stored or dropped; drain only
         self._turns_ended = 0  # AfterInvocationEvents seen
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
@@ -751,21 +763,39 @@ class Neo4jSessionManager(SessionManager):
             )
 
     def _submit_drain(self) -> concurrent.futures.Future[None] | None:
-        """Start a drain of the ready queue on the bridge.
+        """Start a drain of the ready queue on the bridge, or join the running one.
 
-        Returns None when the queue is empty, unless the manager is
-        closing while a drain still runs. Drains run one at a time, so the
-        drain a close submits also waits for that one.
+        A drain that has not yet found the queue empty writes every message
+        queued before then, so a flush joins it instead of starting another.
+        Returns None when the queue is empty, unless the manager is closing
+        while a drain still runs. The bridge is called outside the queue
+        lock.
         """
         with self._queue_lock:
-            running = self._latest_drain is not None and not self._latest_drain.done()
+            run = self._drain_run
+            running = run is not None and not run.done()
             if not self._ready and not (self._closed and running):
                 return None
-            self._latest_drain = self._bridge.submit(self._adrain())
-            return self._latest_drain
+            if run is not None and running:
+                return run
+            run = self._drain_run = concurrent.futures.Future()
+        try:
+            submitted = self._bridge.submit(self._adrain(run))
+        except BaseException as e:
+            with self._queue_lock:
+                if self._drain_run is run:
+                    self._drain_run = None
+            run.set_exception(e)  # a flush that joined in the meantime gets it too
+            raise
+        submitted.add_done_callback(lambda done: _copy_outcome(done, run))
+        return run
 
-    async def _adrain(self) -> None:
+    async def _adrain(self, run: concurrent.futures.Future[None]) -> None:
         """Write the ready queue in order. Runs on the bridge loop.
+
+        ``run`` is the future flushes wait on. The drain stops being the
+        one to join, under the queue lock, as soon as it finds the queue
+        empty or fails. A flush after that starts a new drain.
 
         One drain runs at a time, so concurrent flushes (a hook, ``aclose()``
         and a sync ``close()`` on another thread) cannot reorder or
@@ -790,6 +820,15 @@ class Neo4jSessionManager(SessionManager):
         raises ``_MessageDropped`` at the end. Any other failure marks the
         message as failed, stops the drain, and raises the error as is.
         """
+        try:
+            await self._adrain_locked(run)
+        finally:
+            with self._queue_lock:
+                if self._drain_run is run:
+                    self._drain_run = None
+
+    async def _adrain_locked(self, run: concurrent.futures.Future[None]) -> None:
+        """The body of ``_adrain``, one drain at a time."""
         if self._drain_lock is None:
             self._drain_lock = asyncio.Lock()
         dropped: _MessageDropped | None = None
@@ -797,6 +836,8 @@ class Neo4jSessionManager(SessionManager):
             while True:
                 with self._queue_lock:
                     if not self._ready:
+                        if self._drain_run is run:
+                            self._drain_run = None
                         break
                     entry = self._ready[0]
                 try:
