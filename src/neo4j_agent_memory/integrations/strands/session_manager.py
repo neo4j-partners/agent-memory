@@ -828,6 +828,7 @@ class Neo4jSessionManager(SessionManager):
             unfinished = len(self._turn)
             if closing and state == "running":
                 self._turn.clear()
+                self._resume_from = None
         if not (closing and unfinished):
             return
         if state == "paused":

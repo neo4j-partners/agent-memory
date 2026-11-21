@@ -14,6 +14,7 @@ import logging
 import tomllib
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -475,6 +476,28 @@ class TestAnInterruptedTurn:
         assert "sess-1" in warning
         assert "interrupt" in warning
         assert "1 message" in warning
+
+    async def test_a_resume_cleared_by_close_reports_nothing_discarded(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=client, extract_entities=False, on_persist_error="warn"
+        )
+        agent = _buffered(manager)
+        agent._interrupt_state = SimpleNamespace(activated=True)
+        await manager._on_before_invocation(turn_ended(agent))
+        manager.append_message({"role": "user", "content": [{"text": "delete it"}]}, agent)
+        await manager._on_after_invocation(turn_ended(agent, "interrupt"))
+        await manager._on_before_invocation(turn_ended(agent))  # the resume
+        manager.append_message({"role": "user", "content": [{"text": "yes"}]}, agent)
+        await manager.aclose()  # drops the running turn
+
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
+            await manager._on_after_invocation(turn_ended(agent, None))  # the resume fails
+
+        assert _records(caplog, "INFO") == []
+        assert _stored(client) == []
 
 
 class TestACallThatStartsWhileATurnRuns:
