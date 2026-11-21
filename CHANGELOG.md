@@ -67,7 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It is called with a short name, such as `"extract:<session_id>"`, when
   a deferred extraction or a tool-call recording starts. It returns a
   function that runs once when that task ends, whether it succeeded,
-  failed, or was cancelled. Both run on the background thread. An error
+  failed, or was cancelled. A task that ignores the cancel when the
+  background loop stops still gets its done call, with a WARNING. Both
+  run on the background thread. An error
   from either is logged as a WARNING and never fails a write. On
   AgentCore Runtime, wire it to `app.add_async_task()` and
   `app.complete_async_task()`, so the session stays busy while the work

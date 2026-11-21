@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import inspect
+import logging
 from typing import Any
 
 import pytest
@@ -59,6 +60,39 @@ class TestAsyncBridge:
             assert bridge.run(scenario()) == [None, "a", "b", None]
         finally:
             bridge.close()
+
+    def test_when_done_runs_once_even_for_a_task_that_ignores_shutdown(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from neo4j_agent_memory.integrations import base
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        monkeypatch.setattr(base, "_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+        caplog.set_level(logging.WARNING, logger="neo4j_agent_memory.integrations.base")
+        bridge = _AsyncBridge()
+        calls: list[str] = []
+
+        async def stubborn() -> None:
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    continue  # ignores every cancel
+
+        async def scenario() -> None:
+            quick = asyncio.create_task(asyncio.sleep(0), name="quick")
+            bridge.when_done(quick, lambda: calls.append("quick"))
+            stuck = asyncio.create_task(stubborn(), name="stuck")
+            bridge.when_done(stuck, lambda: calls.append("stuck"))
+            await quick
+            await asyncio.sleep(0)  # quick's done callback runs
+
+        bridge.run(scenario())
+        assert calls == ["quick"]
+        bridge.close()
+
+        assert calls == ["quick", "stuck"]
+        assert "Task 'stuck' ignored cancellation" in caplog.text
 
     def test_run_returns_coroutine_result(self) -> None:
         from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge

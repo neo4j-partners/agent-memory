@@ -1458,21 +1458,24 @@ class Neo4jSessionManager(SessionManager):
     def _start_background(self, kind: str, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
         """Run ``coro`` as a task on the bridge loop and report it to the hook.
 
-        The hook gets ``"<kind>:<session_id>"``. Its done function runs from
-        the task's done callback, so it runs once however the task ends,
-        even when the task is cancelled before it starts. An error from
-        either is logged, and the task runs anyway.
+        The task and the hook both get ``"<kind>:<session_id>"`` as a name.
+        The hook's done function runs once however the task ends, even
+        when the task is cancelled before it starts. A task that ignores
+        the bridge's shutdown cancel gets its done function at shutdown,
+        with a WARNING. An error from the hook or the done function is
+        logged, and the task runs anyway.
         """
+        name = f"{kind}:{self.session_id}"
         task = asyncio.ensure_future(coro)
+        task.set_name(name)
         if (hook := self._background_hook) is None:
             return task
-        name = f"{kind}:{self.session_id}"
         try:
             done = hook(name)
         except Exception as e:
             logger.warning("background_hook failed for task %r: %s", name, _describe(e))
             return task
-        task.add_done_callback(lambda _: _report_done(name, done))
+        self._bridge.when_done(task, lambda: _report_done(name, done))
         return task
 
     async def _arecord_tool_uses(self, blocks: list[ToolUse]) -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import logging
 import threading
 from collections.abc import Callable, Coroutine
 from functools import wraps
@@ -16,6 +17,8 @@ from typing import Any, ParamSpec, TypeVar
 
 P = ParamSpec("P")
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 # Shared executor for all integrations to avoid per-call overhead
 # Using a module-level executor with lazy initialization
@@ -94,6 +97,8 @@ class AsyncBridge:
         self._stopped = False  # under _futures_lock
         # The last task chained under each key. Loop thread only.
         self._tails: dict[str, asyncio.Task[Any]] = {}
+        # Callbacks from when_done() that have not run yet. Loop thread only.
+        self._when_done: dict[object, tuple[asyncio.Task[Any], Callable[[], None]]] = {}
 
     @property
     def closed(self) -> bool:
@@ -121,6 +126,34 @@ class AsyncBridge:
         """Forget ``task`` as the tail of ``key``, unless a later task replaced it."""
         if self._tails.get(key) is task:
             del self._tails[key]
+
+    def when_done(self, task: asyncio.Task[Any], callback: Callable[[], None]) -> None:
+        """Call ``callback`` exactly once, when ``task`` ends.
+
+        A task that ignores the shutdown cancel is still pending when the
+        loop closes, and its done callbacks never run. Shutdown then calls
+        ``callback`` itself and logs a WARNING that names the task. Runs on
+        the loop thread only.
+        """
+        token = object()
+        self._when_done[token] = (task, callback)
+        task.add_done_callback(lambda _: self._call_when_done(token))
+
+    def _call_when_done(self, token: object) -> None:
+        """Run the callback registered under ``token``, unless it already ran."""
+        if (entry := self._when_done.pop(token, None)) is not None:
+            entry[1]()
+
+    def _call_stranded(self) -> None:
+        """Run the callbacks of tasks that are still pending at shutdown."""
+        for token in list(self._when_done):
+            task, _ = self._when_done[token]
+            logger.warning(
+                "Task %r ignored cancellation and is dropped as the AsyncBridge loop "
+                "closes. Its done callback runs now.",
+                task.get_name(),
+            )
+            self._call_when_done(token)
 
     @property
     def on_loop_thread(self) -> bool:
@@ -178,7 +211,10 @@ class AsyncBridge:
                     # or loop.close() destroys it while it is pending.
                     _cancel_tasks(loop)
                 finally:
-                    loop.close()
+                    try:
+                        self._call_stranded()
+                    finally:
+                        loop.close()
 
     def _forget(self, future: concurrent.futures.Future[Any]) -> None:
         with self._futures_lock:

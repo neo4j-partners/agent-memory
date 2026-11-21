@@ -400,6 +400,34 @@ class TestBackgroundHook:
         assert len(hook.names("start")) == 2
         hook.assert_paired()
 
+    async def test_an_extraction_that_ignores_cancellation_still_ends_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from neo4j_agent_memory.integrations import base
+        from neo4j_agent_memory.integrations.strands import session_manager
+
+        monkeypatch.setattr(base, "_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(session_manager, "_UNWIND_SECONDS", 0.05)
+        client = FakeMemoryClient()
+
+        async def stubborn(message: Message, **kwargs: Any) -> None:
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    continue  # ignores every cancel
+
+        client.short_term.extract_entities_from_message = stubborn
+        hook = _Hook()
+        manager = _deferring(client, background_hook=hook)
+        await _agent(manager, "A1").invoke_async("Q1")
+        monkeypatch.setattr(manager, "_drain_timeout", lambda: 0.05)
+
+        await manager.aclose()  # it owns its bridge, so it closes it
+
+        assert hook.names("start") == ["extract:sess-1", "extract:sess-1"]
+        hook.assert_paired()
+
     async def test_a_hook_that_raises_is_logged_and_the_work_goes_on(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
