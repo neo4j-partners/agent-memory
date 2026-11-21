@@ -115,8 +115,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so it discarded the prompt of the call it overlapped. The manager now
   records the call that opened the turn by its `invocation_state`. Only
   that call's end decides the turn. An overlapping call's messages fold
-  into it with a warning. This has three limits. If the first call
+  into it with a warning. This has four limits. If the first call
   fails, the overlapping call's messages are discarded with its turn. If
+  the first call ends while an overlapping call still runs, its turn is
+  written with the overlapping call's prompt. If that call then fails,
+  the rest of its messages are discarded, so its prompt is stored without
+  a reply. This can happen only in `UNSAFE_REENTRANT` mode. If
   `structured_output_async` starts first and `invoke_async` overlaps it,
   the structured call decides the turn. It reports no result, so the
   whole turn is discarded. If a `BeforeInvocationEvent` hook raises in an
