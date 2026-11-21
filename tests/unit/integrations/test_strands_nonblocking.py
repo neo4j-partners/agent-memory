@@ -1039,6 +1039,41 @@ class TestDrainCoalescing:
         (conversation,) = client.short_term.conversations.values()
         assert [m.content for m in conversation.messages] == ["one", "two"]
 
+    @pytest.mark.parametrize("mode", ["warn", "raise"])
+    async def test_a_hook_whose_drain_fails_during_close_leaves_the_report_to_close(
+        self, mode: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        original = client.short_term.add_message
+        calls = 0
+
+        async def add(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await asyncio.sleep(0.2)
+                raise ConnectionError("transient")
+            return await original(*args, **kwargs)
+
+        client.short_term.add_message = add  # type: ignore[method-assign]
+        manager = Neo4jSessionManager(
+            "sess-1",
+            memory_client=client,
+            request_timeout=1.0,
+            extract_entities=False,
+            on_persist_error=mode,
+        )
+        _buffered(manager, "one", "two")
+        hook = asyncio.ensure_future(manager._aflush_ready())  # waits on the drain writing "one"
+        await asyncio.sleep(0.05)
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            closer = asyncio.ensure_future(asyncio.to_thread(manager.close))
+            await hook  # the drain fails while close waits to retry "one"
+            await closer
+
+        assert _stored(client) == [("user", "one"), ("user", "two")]
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
     async def test_a_flush_after_the_drain_found_the_queue_empty_starts_another(self) -> None:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)

@@ -644,12 +644,13 @@ class Neo4jSessionManager(SessionManager):
         class, so it must not flush the buffer."""
         return None
 
-    def _flush_buffer(self) -> None:
+    def _flush_buffer(self, *, closing: bool = False) -> None:
         """Persist every buffered message, blocking until done.
 
         For ``close()`` and other sync callers. Hooks await
         ``_aflush_buffer`` instead. A failure is handled by
-        ``on_persist_error`` (see ``_wait_failed``).
+        ``on_persist_error`` (see ``_wait_failed``). ``closing`` is True
+        only for the flush of ``close()`` itself.
         """
         self._release_pending()
         future: concurrent.futures.Future[None] | None = None
@@ -658,14 +659,14 @@ class Neo4jSessionManager(SessionManager):
             if future is not None:
                 future.result(timeout=self._drain_timeout())
         except Exception as e:
-            self._wait_failed(future, e)
+            self._wait_failed(future, e, closing=closing)
 
-    async def _aflush_buffer(self) -> None:
+    async def _aflush_buffer(self, *, closing: bool = False) -> None:
         """Persist every buffered message without blocking the caller's loop."""
         self._release_pending()
-        await self._aflush_ready()
+        await self._aflush_ready(closing=closing)
 
-    async def _aflush_ready(self) -> None:
+    async def _aflush_ready(self, *, closing: bool = False) -> None:
         """Persist the ready queue in order, leaving the latest message buffered.
 
         The writes run on the bridge and are shielded: cancelling the
@@ -681,7 +682,7 @@ class Neo4jSessionManager(SessionManager):
             if future is not None:
                 await self._bridge.wait(future, self._drain_timeout(), shield=True)
         except Exception as e:
-            self._wait_failed(future, e)
+            self._wait_failed(future, e, closing=closing)
 
     def _drain_timeout(self) -> float:
         """How long a caller waits for a drain.
@@ -701,7 +702,11 @@ class Neo4jSessionManager(SessionManager):
         return self._request_timeout * steps * (queued + 1)
 
     def _wait_failed(
-        self, future: concurrent.futures.Future[None] | None, error: Exception
+        self,
+        future: concurrent.futures.Future[None] | None,
+        error: Exception,
+        *,
+        closing: bool,
     ) -> None:
         """Handle an error from a flush's wait for its drain.
 
@@ -710,6 +715,9 @@ class Neo4jSessionManager(SessionManager):
         after the wait ran out, so nothing failed. A drain that failed is
         reported with its own error, which may have come just after the
         wait ran out. Any other error is a failed flush.
+
+        ``closing`` is True only for the wait of ``close()`` itself. Only
+        that wait reports messages left unwritten at close.
         """
         if future is None or future.done():
             if future is not None and not future.cancelled():
@@ -718,11 +726,11 @@ class Neo4jSessionManager(SessionManager):
                     return
                 if isinstance(cause, Exception):
                     error = cause
-            self._persist_failed(error)
+            self._persist_failed(error, closing=closing)
             return
         with self._queue_lock:
             unwritten = len(self._ready)
-        if self._closed:
+        if closing:
             logger.error(
                 "Closing session %r before its memory writes finished. "
                 "%d message(s) were not written.",
@@ -736,20 +744,32 @@ class Neo4jSessionManager(SessionManager):
                 self.session_id,
             )
 
-    def _persist_failed(self, error: Exception) -> None:
+    def _persist_failed(self, error: Exception, *, closing: bool) -> None:
         """Apply ``on_persist_error`` to a failed flush.
 
-        A failure at close leaves its messages unwritten for good, so it is
-        logged as an ERROR in both modes. ``"raise"`` then raises
-        SessionException. ``"warn"`` logs a warning for a failure before
-        close. A drop gets no warning, since the drain logged it as an
-        error.
+        A failure in the flush of ``close()`` leaves its messages unwritten
+        for good, so it is logged as an ERROR in both modes. ``"raise"``
+        then raises SessionException. ``"warn"`` logs a warning for a
+        failure before close. A drop gets no warning, since the drain
+        logged it as an error.
+
+        Another flush that fails while a close runs leaves its message
+        queued. The close retries it and reports the outcome, so this
+        flush only logs a warning, in both modes.
         """
         dropped = isinstance(error, _MessageDropped)
         cause = error.error if isinstance(error, _MessageDropped) else error
+        if self._closed and not closing and not dropped:
+            logger.warning(
+                "Failed to persist message for session %r. It stays queued, "
+                "and the close that is running retries it: %s",
+                self.session_id,
+                _describe(cause),
+            )
+            return
         if dropped:
             detail = "a message was dropped after its write failed"
-        elif self._closed:
+        elif closing:
             with self._queue_lock:
                 unwritten = len(self._ready)
             detail = f"{unwritten} message(s) were not written before close"
@@ -765,7 +785,7 @@ class Neo4jSessionManager(SessionManager):
             raise SessionException(
                 f"Failed to persist message for session {self.session_id!r}; {detail}"
             ) from cause
-        if not dropped and not self._closed:
+        if not dropped and not closing:
             logger.warning(
                 "Failed to persist message for session %r. It stays queued, "
                 "and the next flush retries it: %s",
@@ -1163,7 +1183,7 @@ class Neo4jSessionManager(SessionManager):
         failure: BaseException | None = None
         try:
             try:
-                await self._aflush_buffer()
+                await self._aflush_buffer(closing=True)
             except BaseException as e:
                 failure = e
             try:
@@ -1209,7 +1229,7 @@ class Neo4jSessionManager(SessionManager):
         failure: BaseException | None = None
         try:
             try:
-                self._flush_buffer()
+                self._flush_buffer(closing=True)
             except BaseException as e:
                 failure = e
             try:

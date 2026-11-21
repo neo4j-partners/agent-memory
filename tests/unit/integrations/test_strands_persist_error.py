@@ -90,7 +90,7 @@ class TestWaitThatRunsOut:
         drain: concurrent.futures.Future[None] = concurrent.futures.Future()
         drain.set_result(None)  # it finished between the timeout and the check
 
-        manager._wait_failed(drain, TimeoutError())  # no raise
+        manager._wait_failed(drain, TimeoutError(), closing=False)  # no raise
         await manager.aclose()
 
     async def test_a_drain_that_fails_just_after_the_wait_reports_its_own_error(
@@ -106,7 +106,7 @@ class TestWaitThatRunsOut:
         drain.set_exception(_MessageDropped(cause))  # it failed after the timeout
 
         with pytest.raises(SessionException, match="dropped") as raised:
-            manager._wait_failed(drain, TimeoutError())
+            manager._wait_failed(drain, TimeoutError(), closing=False)
         assert raised.value.__cause__ is cause
         await manager.aclose()
 
