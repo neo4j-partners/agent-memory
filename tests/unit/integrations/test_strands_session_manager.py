@@ -606,6 +606,21 @@ class TestInitialize:
         finally:
             manager.close()
 
+    def test_a_second_agent_on_one_manager_raises(self) -> None:
+        from strands import Agent
+        from strands.types.exceptions import SessionException
+
+        from tests.unit.integrations.test_strands_nonblocking import ScriptedModel
+
+        manager, _ = _make_manager(nams_mode=False)
+        try:
+            first = Agent(model=ScriptedModel(), session_manager=manager, callback_handler=None)
+            manager.initialize(first)  # the same agent again is allowed
+            with pytest.raises(SessionException, match="another Agent"):
+                Agent(model=ScriptedModel(), session_manager=manager, callback_handler=None)
+        finally:
+            manager.close()
+
     def test_initialize_wraps_backend_errors_in_session_exception(self) -> None:
         from strands.types.exceptions import SessionException
 

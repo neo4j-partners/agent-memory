@@ -339,6 +339,7 @@ class Neo4jSessionManager(SessionManager):
         self._owner_locks = False  # the owner holds the agent's invocation lock
         self._open_calls = 0
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
+        self._agent: Agent | None = None  # set once initialize() succeeds
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
         self._tool_record: asyncio.Task[None] | None = None  # latest mirroring; bridge loop only
@@ -512,8 +513,18 @@ class Neo4jSessionManager(SessionManager):
         user message. User messages that never got a reply are left out of
         the agent's history, with a warning. Stored messages are not
         changed.
+
+        Raises:
+            SessionException: The manager is closed, loading failed, or the
+                manager already serves another Agent. One manager tracks
+                one Agent's turns, so a second Agent would discard them.
         """
         self._check_open()
+        if self._agent is not None and self._agent is not agent:
+            raise SessionException(
+                f"Session manager for session {self.session_id!r} is already "
+                "attached to another Agent. Give each Agent its own manager."
+            )
         self._check_memory_manager_coexistence(agent)
         preloaded = self._restored is not None
         if self._restored is not None:
@@ -545,6 +556,7 @@ class Neo4jSessionManager(SessionManager):
                 self._release_turn()
             else:
                 self._flush_buffer()
+        self._agent = agent
 
     def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
         """Wire base persistence hooks, then our turn and injection hooks.
