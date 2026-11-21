@@ -8,6 +8,7 @@ its reply. A turn paused by an interrupt stays buffered until it resumes.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -260,3 +261,37 @@ class TestTheNextCallWritesWhatIsQueued:
             assert "backend down" in warning
         finally:
             await manager.aclose()
+
+    async def test_a_write_that_fails_after_the_wait_runs_out_is_retried(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        original = client.short_term.add_message
+        failures: list[None] = []
+
+        async def slow_then_fail_once(*args: Any, **kwargs: Any) -> Any:
+            if not failures:
+                failures.append(None)
+                await asyncio.sleep(0.2)
+                raise RuntimeError("backend down")
+            return await original(*args, **kwargs)
+
+        client.short_term.add_message = slow_then_fail_once  # type: ignore[method-assign]
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=client, on_persist_error="warn", extract_entities=False
+        )
+        monkeypatch.setattr(manager, "_drain_timeout", lambda: 0.05)
+        agent = _buffered(manager)
+        try:
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await manager._on_before_invocation(turn_ended(agent))
+                manager.append_message({"role": "user", "content": [{"text": "Q1"}]}, agent)
+                await manager._on_after_invocation(turn_ended(agent))  # stops waiting
+                await asyncio.sleep(0.4)  # the write fails after the wait ran out
+
+                await manager._on_before_invocation(turn_ended(agent))  # retries Q1
+        finally:
+            await manager.aclose()
+
+        assert _stored(client) == [("user", "Q1")]
+        assert _records(caplog, "ERROR") == []

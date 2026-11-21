@@ -1185,7 +1185,7 @@ class TestRedactionDuringAWrite:
         manager._release_turn()
         await manager._aflush_ready()  # writes "kept"; a write of "lost" fails
         if latest == "dropped":
-            manager._turns_ended += 1  # "lost" is now from an earlier turn
+            manager._turns_written += 1  # "lost" is now from an earlier turn
             await manager._aflush_ready()  # fails again, and drops "lost"
             client.short_term.add_message = original  # type: ignore[method-assign]
 

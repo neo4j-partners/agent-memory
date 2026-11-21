@@ -239,7 +239,10 @@ class Neo4jSessionManager(SessionManager):
         self._redact_lock: asyncio.Lock | None = None  # bridge loop only; one redaction at a time
         self._drain_run: concurrent.futures.Future[None] | None = None  # under _queue_lock
         self._dequeued = 0  # messages that left _ready, stored or dropped; drain only
-        self._turns_ended = 0  # AfterInvocationEvents seen
+        self._turns_ended = 0  # AfterInvocationEvents seen; numbers the queued turns
+        # Turns whose end-of-turn drain has finished. A message queued before
+        # then is dropped if a later write of it fails.
+        self._turns_written = 0  # under _queue_lock
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
@@ -517,7 +520,8 @@ class Neo4jSessionManager(SessionManager):
         ``"raise"`` raises SessionException. ``"warn"`` logs one ERROR with
         their number, as for any other write that fails at close.
         """
-        if discarded := self._end_turn(event.result):
+        discarded, turn = self._end_turn(event.result)
+        if discarded:
             logger.info(
                 "Session %r: the agent call ended without a result, so its "
                 "turn's %d message(s) were not written.",
@@ -537,27 +541,33 @@ class Neo4jSessionManager(SessionManager):
                 unwritten,
             )
             return
-        try:
-            await self._aflush_ready()
-        finally:
-            self._turns_ended += 1  # messages queued before now are dropped if they fail
+        await self._aflush_ready(ends_turn=turn)
 
-    def _end_turn(self, result: AgentResult | None) -> int:
+    def _end_turn(self, result: AgentResult | None) -> tuple[int, int]:
         """Queue, keep, or discard the turn by its result.
 
-        Returns how many messages were discarded.
+        Returns how many messages were discarded, and the number of the
+        turn that ended. See ``_on_after_invocation``.
         """
         with self._queue_lock:
+            turn = self._turns_ended
+            discarded = 0
             if result is not None and result.stop_reason == "interrupt":
                 self._turn_state = "paused"
-                return 0
-            self._turn_state = "idle"
-            if result is not None:
-                self._release_turn_locked()
-                return 0
-            discarded = len(self._turn)
-            self._turn.clear()
-            return discarded
+            else:
+                self._turn_state = "idle"
+                if result is None:
+                    discarded = len(self._turn)
+                    self._turn.clear()
+                else:
+                    self._release_turn_locked()
+            self._turns_ended += 1  # after the release, which numbers the messages
+            return discarded, turn
+
+    def _turn_written(self, turn: int) -> None:
+        """Mark ``turn``'s end-of-turn drain finished. Any thread."""
+        with self._queue_lock:
+            self._turns_written = max(self._turns_written, turn + 1)
 
     async def _on_message_added(self, event: MessageAddedEvent) -> None:
         await self._inject_context(event.message)
@@ -774,7 +784,7 @@ class Neo4jSessionManager(SessionManager):
         self._release_idle_turn(closing=closing)
         await self._aflush_ready(closing=closing)
 
-    async def _aflush_ready(self, *, closing: bool = False) -> None:
+    async def _aflush_ready(self, *, closing: bool = False, ends_turn: int | None = None) -> None:
         """Persist the ready queue in order, leaving the current turn buffered.
 
         The writes run on the bridge and are shielded: cancelling the
@@ -783,6 +793,11 @@ class Neo4jSessionManager(SessionManager):
 
         A failure is handled by ``on_persist_error`` (see
         ``_wait_failed``).
+
+        ``ends_turn`` is the number of the turn this flush ends. The turn
+        counts as written when the drain finishes, not when the wait does.
+        A wait that runs out leaves the drain going, and a message of this
+        turn that fails late still gets its retry.
         """
         future: concurrent.futures.Future[None] | None = None
         try:
@@ -791,6 +806,12 @@ class Neo4jSessionManager(SessionManager):
                 await self._bridge.wait(future, self._drain_timeout(), shield=True)
         except Exception as e:
             self._wait_failed(future, e, closing=closing)
+        finally:
+            if ends_turn is not None:
+                if future is None:
+                    self._turn_written(ends_turn)
+                else:
+                    future.add_done_callback(lambda _: self._turn_written(ends_turn))
 
     def _drain_timeout(self) -> float:
         """How long a caller waits for a drain.
@@ -984,7 +1005,7 @@ class Neo4jSessionManager(SessionManager):
                 try:
                     written, stored = await self._awrite(entry)
                 except Exception as e:
-                    stale = entry.turn < self._turns_ended
+                    stale = entry.turn < self._turns_written
                     if not stale and not (self._closed and entry.failed):
                         entry.failed = True
                         raise
