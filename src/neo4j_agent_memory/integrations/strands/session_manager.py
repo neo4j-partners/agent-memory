@@ -940,8 +940,10 @@ class Neo4jSessionManager(SessionManager):
                 self.session_id,
             )
             return stored
+        # Marked first, so a delete that commits and then fails or times
+        # out still keeps the deleted text from a deferred extraction.
+        self._redacted_ids.add(stored.id)
         await self._client.short_term.delete_message(stored.id)
-        self._redacted_ids.add(stored.id)  # a deferred extraction skips it
         text = _message_text(redacted) or "[REDACTED]"
         return await self._aadd_message(redacted.get("role", "user"), text)
 

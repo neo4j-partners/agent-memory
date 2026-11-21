@@ -89,6 +89,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Strands redaction whose delete commits and then fails or times out
+  no longer lets a deferred extraction read the deleted text. The
+  redaction now marks the message before the delete runs.
 - Deferred entity extractions of one session now run in write order
   across managers that share a bridge. Before, each manager kept its own
   chain, so two managers of one session id on `SharedMemory` could

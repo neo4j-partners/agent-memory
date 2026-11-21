@@ -23,6 +23,7 @@ from strands import Agent  # noqa: E402
 from neo4j_agent_memory.integrations.base import AsyncBridge  # noqa: E402
 from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E402
     Neo4jSessionManager,
+    SessionException,
 )
 from neo4j_agent_memory.memory.short_term import Message, MessageRole  # noqa: E402
 from tests.unit.integrations.strands_fakes import FakeMemoryClient  # noqa: E402
@@ -159,6 +160,36 @@ class TestDeferredExtraction:
 
         assert _contents(client) == ["Q1", "secret 123", "[REDACTED]"]
         assert gate.done == ["Q1"]
+
+    @pytest.mark.parametrize("delete", ["stalls after it commits", "fails"])
+    async def test_a_redaction_whose_delete_does_not_finish_skips_the_extraction(
+        self, delete: str
+    ) -> None:
+        client = FakeMemoryClient()
+        gate = _Gate(client)
+        manager = _deferring(client, request_timeout=0.2)
+        agent = _agent(manager, "secret 123")
+        committed = client.short_term.delete_message
+
+        async def unfinished_delete(message_id: Any, **kwargs: Any) -> bool:
+            await committed(message_id)
+            if delete == "fails":
+                raise RuntimeError("connection reset")
+            await asyncio.sleep(30)  # the request_timeout cancels it
+            return True
+
+        client.short_term.delete_message = unfinished_delete
+
+        await agent.invoke_async("Q1")
+        await _eventually(lambda: gate.started == ["Q1"])  # the reply's extraction waits
+        with pytest.raises(SessionException):
+            manager.redact_latest_message(
+                {"role": "assistant", "content": [{"text": "[REDACTED]"}]}, agent
+            )
+        gate.opened.set()
+        await manager.aclose()
+
+        assert gate.started == ["Q1"]
 
     @pytest.mark.parametrize("backend", ["nams", "no extraction"])
     async def test_no_extraction_starts_when_the_drain_would_not_extract(
