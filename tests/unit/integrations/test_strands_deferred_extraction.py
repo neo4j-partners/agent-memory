@@ -180,6 +180,23 @@ class TestDeferredExtraction:
 
         assert _contents(client) == ["Q1", "secret 123", "[REDACTED]"]
         assert gate.done == ["Q1"]
+        assert manager._awaiting_extraction == set()  # the skip forgot the id
+
+    async def test_an_extraction_forgets_its_message_once_checked(self) -> None:
+        client = FakeMemoryClient()
+        gate = _Gate(client)
+        manager = _deferring(client)
+        agent = _agent(manager, "A1", "A2")
+
+        await agent.invoke_async("Q1")
+        await _eventually(lambda: gate.started == ["Q1"])  # the rest wait behind Q1
+        await agent.invoke_async("Q2")
+        assert len(manager._awaiting_extraction) == 3  # A1, Q2, A2 not yet checked
+        gate.opened.set()
+        await manager.aclose()
+
+        assert gate.done == ["Q1", "A1", "Q2", "A2"]
+        assert manager._awaiting_extraction == set()
 
     @pytest.mark.parametrize("delete", ["stalls after it commits", "fails"])
     async def test_a_redaction_whose_delete_does_not_finish_skips_the_extraction(

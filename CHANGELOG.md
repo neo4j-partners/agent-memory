@@ -59,7 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run one at a time, in write order, and each is bounded by
   `request_timeout`. A failed extraction is logged as a WARNING, as
   before. A late redaction that deletes a message before its extraction
-  starts skips that extraction. A manager that owns its background loop
+  starts skips that extraction. The backlog of extractions has no cap.
+  Extractions slower than the message rate let it grow for as long as
+  the manager lives. A manager that owns its background loop
   waits for its extractions at close, as long as it waits for a drain.
   The rest are cancelled, and a WARNING gives their number. A manager
   from `SharedMemory` does not wait. The option does nothing on NAMS.

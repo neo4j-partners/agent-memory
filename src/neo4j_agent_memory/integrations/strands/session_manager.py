@@ -216,13 +216,13 @@ class Neo4jSessionManager(SessionManager):
     one session run one at a time, in write order. Each is bounded by
     ``request_timeout``, and a failure is logged as a WARNING. A late
     redaction that deletes a message before its extraction starts skips
-    that extraction. A manager that owns its bridge waits for the
-    extractions at close, as long as it waits for a drain. It then
-    cancels the rest before it closes the client, and a WARNING gives
-    their number. A
-    manager on a shared bridge does not wait. ``SharedMemory`` waits for
-    them when it closes. NAMS extracts on the server, so the option does
-    nothing there.
+    that extraction. The backlog has no cap. Extractions slower than the
+    message rate let it grow for as long as the manager lives. A manager
+    that owns its bridge waits for the extractions at close, as long as
+    it waits for a drain. It then cancels the rest before it closes the
+    client, and a WARNING gives their number. A manager on a shared
+    bridge does not wait. ``SharedMemory`` waits for them when it closes.
+    NAMS extracts on the server, so the option does nothing there.
 
     ``background_hook`` reports the work that outlives a write. It is
     called with a short name, such as ``"extract:<session_id>"``, when a
@@ -328,7 +328,7 @@ class Neo4jSessionManager(SessionManager):
         self._live_tool_records: set[asyncio.Task[None]] = set()  # unfinished; bridge loop only
         self._extraction: asyncio.Task[None] | None = None  # own latest deferred; bridge loop only
         self._live_extractions: set[asyncio.Task[None]] = set()  # unfinished; bridge loop only
-        self._redacted_ids: set[UUID] = set()  # ids a redaction deleted; bridge loop only
+        self._awaiting_extraction: set[UUID] = set()  # deferred, not yet checked; bridge loop only
         self._closed = False
         self._closing: concurrent.futures.Future[None] | None = None  # done when close ends
         self._warned_double_injection = False
@@ -942,9 +942,9 @@ class Neo4jSessionManager(SessionManager):
                 self.session_id,
             )
             return stored
-        # Marked first, so a delete that commits and then fails or times
+        # Dropped first, so a delete that commits and then fails or times
         # out still keeps the deleted text from a deferred extraction.
-        self._redacted_ids.add(stored.id)
+        self._awaiting_extraction.discard(stored.id)
         await self._client.short_term.delete_message(stored.id)
         text = _message_text(redacted) or "[REDACTED]"
         return await self._aadd_message(redacted.get("role", "user"), text)
@@ -1421,6 +1421,7 @@ class Neo4jSessionManager(SessionManager):
         """
         if not self._extract_entities or self._is_nams:
             return
+        self._awaiting_extraction.add(stored.id)
         task = self._bridge.chain(
             f"extract:{self.session_id}",
             lambda previous: self._start_background(
@@ -1436,8 +1437,10 @@ class Neo4jSessionManager(SessionManager):
     ) -> None:
         """Wait for the ``previous`` extraction, then extract ``stored``.
 
-        A late redaction may have deleted the message first. The check
-        holds the redaction lock, so it sees every redaction that finished.
+        A late redaction may have deleted the message first. It then took
+        the message out of ``_awaiting_extraction``. The check holds the
+        redaction lock, so it sees every redaction that finished. The check
+        takes the message out too, so the set holds only the backlog.
         The extraction runs without the lock, since the next drain needs
         it. A redaction that lands during the extraction leaves the
         entities in place, as it does when the drain extracts.
@@ -1445,7 +1448,7 @@ class Neo4jSessionManager(SessionManager):
         if previous is not None:
             await asyncio.wait({previous})
         async with self._redaction_lock():
-            if stored.id in self._redacted_ids:
+            if stored.id not in self._awaiting_extraction:
                 logger.debug(
                     "Skipped entity extraction for message %s of session %r. "
                     "A redaction deleted it first.",
@@ -1453,6 +1456,7 @@ class Neo4jSessionManager(SessionManager):
                     self.session_id,
                 )
                 return
+            self._awaiting_extraction.discard(stored.id)
         await self._aextract(stored)
 
     def _start_background(self, kind: str, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
