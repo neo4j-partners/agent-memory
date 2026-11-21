@@ -88,6 +88,40 @@ class TestAsyncBridge:
         bridge.close()  # second close must not raise
         assert not thread.is_alive()
 
+    def test_run_after_close_raises_and_starts_no_thread(self) -> None:
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        bridge = _AsyncBridge()
+
+        async def noop() -> None:
+            return None
+
+        bridge.run(noop())
+        bridge.close()
+        assert bridge.closed
+        coro = noop()
+        with pytest.raises(RuntimeError, match="AsyncBridge is closed"):
+            bridge.run(coro)
+        assert bridge._thread is None
+        assert bridge._loop is None
+        # The refused coroutine is closed, so no "never awaited" warning fires.
+        assert coro.cr_frame is None
+
+    def test_close_before_first_use_also_refuses_run(self) -> None:
+        from neo4j_agent_memory.integrations.strands.session_manager import _AsyncBridge
+
+        bridge = _AsyncBridge()
+        bridge.close()
+
+        async def noop() -> None:
+            return None
+
+        coro = noop()
+        with pytest.raises(RuntimeError, match="AsyncBridge is closed"):
+            bridge.run(coro)
+        coro.close()
+        assert bridge._thread is None
+
 
 class TestMappingHelpers:
     def test_message_text_concatenates_text_blocks(self) -> None:
@@ -460,6 +494,40 @@ class TestCloseSemantics:
         with manager:
             manager.initialize(_fake_agent())
         assert client.close_calls == 1
+
+    def test_initialize_after_close_raises_session_exception(self) -> None:
+        from strands.types.exceptions import SessionException
+
+        manager, client = _make_manager()
+        manager.close()
+        with pytest.raises(SessionException, match="closed"):
+            manager.initialize(_fake_agent())
+        assert client.connect_calls == 0
+        assert manager._bridge._thread is None
+
+    def test_append_after_close_raises_session_exception(self) -> None:
+        from strands.types.exceptions import SessionException
+
+        manager, client = _make_manager()
+        agent = _fake_agent()
+        manager.initialize(agent)
+        manager.close()
+        with pytest.raises(SessionException, match="closed"):
+            manager.append_message({"role": "user", "content": [{"text": "late"}]}, agent)
+        assert client.short_term.add_message_calls == []
+        assert manager._bridge._thread is None
+
+    def test_redact_after_close_raises_session_exception(self) -> None:
+        from strands.types.exceptions import SessionException
+
+        manager, _ = _make_manager()
+        agent = _fake_agent()
+        manager.initialize(agent)
+        manager.close()
+        with pytest.raises(SessionException, match="closed"):
+            manager.redact_latest_message(
+                {"role": "user", "content": [{"text": "[REDACTED]"}]}, agent
+            )
 
 
 class TestRedaction:

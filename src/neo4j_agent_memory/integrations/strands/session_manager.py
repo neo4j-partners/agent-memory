@@ -210,6 +210,11 @@ class Neo4jSessionManager(SessionManager):
         )
         return [_to_strands_message(m) for m in conversation.messages]
 
+    def _check_open(self) -> None:
+        """Raise SessionException if ``close()`` has already run."""
+        if self._closed:
+            raise SessionException(f"Session manager for session {self.session_id!r} is closed")
+
     def _ensure_session(self) -> str:
         """Resolve the conversation key on demand (lazy; does NOT load history)."""
         return self._conversation_key or self._bridge.run(self._aresolve_key())
@@ -268,6 +273,7 @@ class Neo4jSessionManager(SessionManager):
 
     def initialize(self, agent: Agent, **kwargs: Any) -> None:
         """Restore the agent's conversation history from the graph."""
+        self._check_open()
         self._check_memory_manager_coexistence(agent)
         try:
             restored = self._bridge.run(self._ainitialize())
@@ -358,6 +364,7 @@ class Neo4jSessionManager(SessionManager):
         rewrite the latest message before it ever reaches the backend
         (NAMS has no message update/delete endpoint).
         """
+        self._check_open()
         self._flush_buffer()
         self._pending = copy.deepcopy(message)
 
@@ -375,6 +382,7 @@ class Neo4jSessionManager(SessionManager):
         of restored history); NAMS has no delete/update endpoint, so we
         log a warning.
         """
+        self._check_open()
         if self._pending is not None:
             self._pending = copy.deepcopy(redact_message)
             return

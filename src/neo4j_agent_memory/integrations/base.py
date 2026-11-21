@@ -32,8 +32,11 @@ class AsyncBridge:
     many sequential calls. Use run_sync for stateless one-shot calls; use
     AsyncBridge when the same client instance must serve multiple calls.
 
-    The loop thread starts lazily on first use and is restarted if used
-    again after ``close()`` (cheap, and keeps the API forgiving).
+    The loop thread starts lazily on first use. ``close()`` is final: a
+    later ``run()`` raises ``RuntimeError`` instead of starting a new
+    thread, so a closed owner cannot leak a loop thread or reuse
+    transports bound to the old loop. A thread that died without
+    ``close()`` is still restarted on the next ``run()``.
     """
 
     def __init__(self, timeout: float = 30.0) -> None:
@@ -41,9 +44,17 @@ class AsyncBridge:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        """True once ``close()`` has been called."""
+        return self._closed
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("AsyncBridge is closed")
             if self._loop is None or self._thread is None or not self._thread.is_alive():
                 self._loop = asyncio.new_event_loop()
                 self._thread = threading.Thread(
@@ -61,7 +72,11 @@ class AsyncBridge:
         awaited value's real type back (e.g. ``run(client.add_message(...))``
         returns ``Message``, not ``Any``).
         """
-        loop = self._ensure_loop()
+        try:
+            loop = self._ensure_loop()
+        except RuntimeError:
+            coro.close()  # never scheduled; avoid a "never awaited" warning
+            raise
         future = asyncio.run_coroutine_threadsafe(coro, loop)
         return future.result(timeout=timeout if timeout is not None else self._timeout)
 
@@ -76,10 +91,11 @@ class AsyncBridge:
         call ``loop.close()`` — closing a still-running loop raises
         ``RuntimeError``. The thread is a daemon, so we drop our references
         and let it unwind on its own rather than leave the bridge in a
-        half-closed state. References are always reset, so the bridge stays
-        reusable (``_ensure_loop`` rebuilds the loop on next use).
+        half-closed state. References are always reset, and the bridge is
+        marked closed so a later ``run()`` raises instead of restarting.
         """
         with self._lock:
+            self._closed = True
             loop = self._loop
             thread = self._thread
             if loop is None:
