@@ -18,6 +18,7 @@ import copy
 import logging
 import threading
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID
 
@@ -74,6 +75,15 @@ __all__ = ["Neo4jRetrievalConfig", "Neo4jSessionManager"]
 _PERSIST_ERROR_POLICIES = ("raise", "warn")
 
 
+@dataclass(slots=True)
+class _Queued:
+    """A message in the write queue, with the state its drop rule needs."""
+
+    message: StrandsMessage
+    turn: int  # the value of _turns_ended when the message was queued
+    failed: bool = False  # a write of it has failed
+
+
 class _MessageDropped(Exception):
     """A drain dropped a message after its retry failed. Carries that error."""
 
@@ -106,12 +116,14 @@ class Neo4jSessionManager(SessionManager):
 
     ``on_persist_error`` sets what a failed memory write does. In both
     modes the failed message stays at the head of the write queue, and
-    every later flush retries it before any later message. A turn flushes
-    several times, so retries in the turn where the write first failed do
-    not count. If the message fails again in a later turn, or at close, it
-    is dropped with an ERROR log that names it by session, role, and
-    position, and the later messages are written. So no message stays
-    queued past the next turn. With ``"raise"`` (the default) each failure
+    the next flush retries it before any later message. A turn flushes
+    several times, so failures in the turn that queued the message do not
+    count. A message queued in an earlier turn is dropped if its write
+    fails. At close, a message whose write already failed once is dropped
+    if it fails again. A dropped message gets an ERROR log that names it
+    by session, role, and position, and the later messages are written.
+    So after a failed flush, only messages from the current turn stay
+    queued. With ``"raise"`` (the default) each failure
     raises ``SessionException`` to the caller, which fails the agent call
     when it happens in a hook. With ``"warn"`` each failure is logged and
     the agent call goes on. Failures to restore history always raise, and
@@ -162,15 +174,13 @@ class Neo4jSessionManager(SessionManager):
             self._client = memory_client
         self._conversation_key: str | None = None
         self._pending: StrandsMessage | None = None  # latest message, still redactable
-        self._ready: deque[StrandsMessage] = deque()  # older messages waiting for a hook to write
+        self._ready: deque[_Queued] = deque()  # older messages waiting for a hook to write
         # _pending and _ready are read and changed on the agent's thread and
         # on the bridge thread, so every access holds this lock.
         self._queue_lock = threading.Lock()
         self._drain_lock: asyncio.Lock | None = None  # bridge loop only; one drain at a time
         self._inflight: concurrent.futures.Future[None] | None = None  # latest drain
-        # Retry accounting for the head of _ready, changed by the drain only.
-        self._head_failed_turn: int | None = None  # turn of the head's first failure
-        self._dequeued = 0  # messages that left _ready, stored or dropped
+        self._dequeued = 0  # messages that left _ready, stored or dropped; drain only
         self._turns_ended = 0  # AfterInvocationEvents seen
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
@@ -423,7 +433,7 @@ class Neo4jSessionManager(SessionManager):
         try:
             await self._aflush_buffer()
         finally:
-            self._turns_ended += 1  # a later failure of a queued message drops it
+            self._turns_ended += 1  # messages queued before now are dropped if they fail
 
     async def _on_message_flush(self, event: MessageAddedEvent) -> None:
         """Write the messages ``append_message`` moved out of the slot."""
@@ -491,7 +501,7 @@ class Neo4jSessionManager(SessionManager):
 
     def _release_pending_locked(self) -> None:
         if self._pending is not None:
-            self._ready.append(self._pending)
+            self._ready.append(_Queued(self._pending, self._turns_ended))
             self._pending = None
 
     def redact_latest_message(
@@ -516,7 +526,7 @@ class Neo4jSessionManager(SessionManager):
                 return
             if self._ready:
                 # Seeded by initialize() after aopen() and not written yet.
-                self._ready[-1] = redacted
+                self._ready[-1].message = redacted
                 return
         if self._last_persisted is None:
             logger.warning(
@@ -596,7 +606,7 @@ class Neo4jSessionManager(SessionManager):
         cause = error.error if isinstance(error, _MessageDropped) else error
         if self._on_persist_error == "raise":
             detail = (
-                "a message was dropped after its retry failed"
+                "a message was dropped after its write failed"
                 if dropped
                 else "the message stays queued for the next flush"
             )
@@ -605,8 +615,8 @@ class Neo4jSessionManager(SessionManager):
             ) from cause
         if not dropped:
             logger.warning(
-                "Failed to persist message for session %r; it stays queued and "
-                "the next flush retries it once: %s",
+                "Failed to persist message for session %r. It stays queued, "
+                "and the next flush retries it: %s",
                 self.session_id,
                 cause,
             )
@@ -638,11 +648,12 @@ class Neo4jSessionManager(SessionManager):
         retry after a write that failed late, for example once the backend
         had stored it, can store the message twice.
 
-        Retries in the turn of the first failure do not count. A failure
-        in a later turn, or during close, drops the message with an ERROR
-        log. The drain then goes on with the later messages and raises
-        ``_MessageDropped`` at the end. Any other failure stops the drain
-        and raises the error as is.
+        A failed write drops its message when the message was queued in an
+        earlier turn, or when the manager is closing and the message failed
+        before. A drop is logged as an ERROR, and the drain goes on with
+        the later messages. If every later message is written, the drain
+        raises ``_MessageDropped`` at the end. Any other failure marks the
+        message as failed, stops the drain, and raises the error as is.
         """
         if self._drain_lock is None:
             self._drain_lock = asyncio.Lock()
@@ -652,16 +663,16 @@ class Neo4jSessionManager(SessionManager):
                 with self._queue_lock:
                     if not self._ready:
                         break
-                    message = self._ready[0]
+                    entry = self._ready[0]
+                message = entry.message
                 stored: StoredMessage | None = None
                 try:
                     if text := _message_text(message):
                         stored = await self._aadd_message(message["role"], text)
                 except Exception as e:
-                    first = self._head_failed_turn is None
-                    if first:
-                        self._head_failed_turn = self._turns_ended
-                    if first or (self._head_failed_turn == self._turns_ended and not self._closed):
+                    stale = entry.turn < self._turns_ended
+                    if not stale and not (self._closed and entry.failed):
+                        entry.failed = True
                         raise
                     logger.error(
                         "Dropped %s message #%d of session %r. Its write failed: %s",
@@ -686,10 +697,9 @@ class Neo4jSessionManager(SessionManager):
             raise dropped
 
     def _pop_head(self) -> None:
-        """Remove the head of the ready queue and reset its retry state."""
+        """Remove the head of the ready queue and count it."""
         with self._queue_lock:
             self._ready.popleft()
-        self._head_failed_turn = None
         self._dequeued += 1
 
     def _wait_for_inflight(self) -> None:

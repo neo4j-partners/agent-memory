@@ -1,9 +1,9 @@
 """The session manager's write failure policy, ``on_persist_error``.
 
-Both modes keep a failed message at the head of the queue and retry it
-on every later flush. Retries in the turn of the first failure do not
-count. A failure in a later turn, or at close, drops the message with an
-ERROR log, and later messages are written. ``"raise"`` (the default)
+Both modes keep a failed message at the head of the queue, and the next
+flush retries it. Failures in the turn that queued the message do not
+count. A failure in a later turn, or a second failure at close, drops the
+message with an ERROR log, and later messages are written. ``"raise"`` (the default)
 raises ``SessionException`` on each failure. ``"warn"`` logs instead.
 Restore failures always raise.
 """
@@ -176,7 +176,29 @@ class TestRetryBound:
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
             await _expect_failure(manager.aclose(), mode)
         assert _records(caplog, "ERROR") == []
-        assert list(manager._ready) == [{"role": "user", "content": [{"text": "last"}]}]
+        assert [entry.message for entry in manager._ready] == [
+            {"role": "user", "content": [{"text": "last"}]}
+        ]
+
+    async def test_a_sustained_outage_keeps_only_the_current_turn_queued(
+        self, mode: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client, switch = _failing_client()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, on_persist_error=mode)  # type: ignore[arg-type]
+        agent = _buffered(manager)
+        switch.down = True
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            for turn in range(5):
+                for role, text in (("user", f"u{turn}"), ("assistant", f"a{turn}")):
+                    manager.append_message({"role": role, "content": [{"text": text}]}, agent)
+                await _expect_failure(manager._on_message_flush(None), mode)  # writes u
+                await _expect_failure(_end_turn(manager), mode)  # writes u, a
+        dropped = [r.getMessage() for r in _records(caplog, "ERROR")]
+        assert len(dropped) == 8  # u0 to a3, each dropped once
+        assert [entry.message["content"][0]["text"] for entry in manager._ready] == ["u4", "a4"]
+        switch.down = False
+        await manager.aclose()
+        assert _stored(client) == [("user", "u4"), ("assistant", "a4")]
 
     async def test_a_success_resets_the_retry(
         self, mode: str, caplog: pytest.LogCaptureFixture
