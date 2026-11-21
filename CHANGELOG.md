@@ -102,7 +102,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so it discarded the prompt of the call it overlapped. The manager now
   records the call that opened the turn by its `invocation_state`. Only
   that call's end decides the turn. An overlapping call's messages fold
-  into it with a warning.
+  into it with a warning. This has three limits. If the first call
+  fails, the overlapping call's messages are discarded with its turn. If
+  `structured_output_async` starts first and `invoke_async` overlaps it,
+  the structured call decides the turn. It reports no result, so the
+  whole turn is discarded. If a `BeforeInvocationEvent` hook raises in an
+  overlapping call, the manager keeps counting that call. A later
+  `structured_output_async` call then leaves its turn open. The next
+  call ends that turn and resets the count.
 - Strands redactions of a stored message now run one at a time. Before,
   two redactions could rewrite the same message at once, and each stored
   its own redacted copy. Each redaction now waits for the one before it
