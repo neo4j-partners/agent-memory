@@ -227,17 +227,39 @@ RETURN node AS m, score
 ORDER BY score DESC
 """
 
+# Delete one message and close the gap it leaves in the conversation chain.
+# The predecessor is linked to the successor, and FIRST_MESSAGE moves to the
+# successor when the head is deleted. Entity and reasoning links are dropped
+# with the message when $cascade is true. When $cascade is false, a message
+# that still has such links is left unchanged, and `blocking` names the link
+# types. No row is returned when the id matches no message.
 DELETE_MESSAGE = """
 MATCH (m:Message {id: $id})
-OPTIONAL MATCH (m)-[r:MENTIONS]->()
-DELETE r, m
-RETURN count(m) > 0 AS deleted
-"""
-
-DELETE_MESSAGE_NO_CASCADE = """
-MATCH (m:Message {id: $id})
-DELETE m
-RETURN count(m) > 0 AS deleted
+OPTIONAL MATCH (m)-[r:MENTIONS|EXTRACTED_FROM|INITIATED_BY|TRIGGERED_BY]-()
+WITH m, collect(DISTINCT type(r)) AS blocking
+WITH m, blocking, ($cascade OR size(blocking) = 0) AS deleted
+// Take the conversation write lock before reading the neighbours, as
+// CREATE_MESSAGE does, so a concurrent append cannot attach to a stale tail.
+OPTIONAL MATCH (conv:Conversation)-[:HAS_MESSAGE]->(m)
+FOREACH (_ IN CASE WHEN deleted AND conv IS NOT NULL THEN [1] ELSE [] END |
+    SET conv.updated_at = datetime()
+)
+WITH DISTINCT m, blocking, deleted
+OPTIONAL MATCH (head:Conversation)-[:FIRST_MESSAGE]->(m)
+OPTIONAL MATCH (prev:Message)-[:NEXT_MESSAGE]->(m)
+OPTIONAL MATCH (m)-[:NEXT_MESSAGE]->(next:Message)
+WITH m, blocking, deleted,
+     collect(DISTINCT head) AS heads,
+     collect(DISTINCT prev) AS prevs,
+     collect(DISTINCT next) AS nexts
+FOREACH (p IN CASE WHEN deleted THEN prevs ELSE [] END |
+    FOREACH (n IN nexts | MERGE (p)-[:NEXT_MESSAGE]->(n))
+)
+FOREACH (h IN CASE WHEN deleted THEN heads ELSE [] END |
+    FOREACH (n IN nexts | MERGE (h)-[:FIRST_MESSAGE]->(n))
+)
+FOREACH (_ IN CASE WHEN deleted THEN [1] ELSE [] END | DETACH DELETE m)
+RETURN deleted, blocking
 """
 
 LIST_SESSIONS = """

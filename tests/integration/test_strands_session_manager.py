@@ -127,3 +127,33 @@ class TestSessionManagerRoundTrip:
             agent2 = SimpleNamespace(messages=[], agent_id="a1")
             m2.initialize(agent2)
             assert agent2.messages == [{"role": "user", "content": [{"text": "[REDACTED]"}]}]
+
+    def test_late_redaction_replaces_persisted_message(self, strands_memory_settings) -> None:
+        from types import SimpleNamespace
+
+        from neo4j_agent_memory.integrations.strands import Neo4jSessionManager
+
+        session_id = f"strands-it-{uuid.uuid4().hex[:8]}"
+        with Neo4jSessionManager(
+            session_id, settings=strands_memory_settings, extract_entities=False
+        ) as m:
+            agent = SimpleNamespace(messages=[], agent_id="a1")
+            m.initialize(agent)
+            m.append_message({"role": "user", "content": [{"text": "hello"}]}, agent)
+            m.append_message({"role": "assistant", "content": [{"text": "SSN 123"}]}, agent)
+            m._flush_buffer()  # already persisted, so redaction takes the late path
+            m.redact_latest_message(
+                {"role": "assistant", "content": [{"text": "[REDACTED]"}]}, agent
+            )
+            m.append_message({"role": "user", "content": [{"text": "thanks"}]}, agent)
+
+        with Neo4jSessionManager(
+            session_id, settings=strands_memory_settings, extract_entities=False
+        ) as m2:
+            agent2 = SimpleNamespace(messages=[], agent_id="a1")
+            m2.initialize(agent2)
+            assert agent2.messages == [
+                {"role": "user", "content": [{"text": "hello"}]},
+                {"role": "assistant", "content": [{"text": "[REDACTED]"}]},
+                {"role": "user", "content": [{"text": "thanks"}]},
+            ]

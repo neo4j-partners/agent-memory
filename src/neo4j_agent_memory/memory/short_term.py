@@ -1391,16 +1391,26 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
         cascade: bool = True,
     ) -> bool:
         """
-        Delete a message by ID.
+        Delete a message by ID and relink the conversation chain around it.
+
+        The previous message is linked to the next one, and the
+        conversation's FIRST_MESSAGE moves to the next message when the
+        first message is deleted. Entities, reasoning traces, and tool calls
+        are never deleted.
 
         Args:
             message_id: The message UUID to delete
-            cascade: If True, also delete MENTIONS relationships to entities.
-                    The entities themselves are not deleted as they may be
-                    referenced by other messages.
+            cascade: If True, also remove the message's MENTIONS,
+                EXTRACTED_FROM, INITIATED_BY, and TRIGGERED_BY
+                relationships. If False, a message with any of them is
+                left unchanged and ValueError is raised.
 
         Returns:
             True if message was deleted, False if not found
+
+        Raises:
+            ValueError: If ``cascade`` is False and the message still has
+                entity or reasoning relationships.
         """
         if isinstance(message_id, str):
             try:
@@ -1408,12 +1418,18 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
             except ValueError:
                 return False
 
-        query = queries.DELETE_MESSAGE if cascade else queries.DELETE_MESSAGE_NO_CASCADE
-        results = await self._client.execute_write(query, {"id": str(message_id)})
-
-        if results and results[0].get("deleted"):
-            return True
-        return False
+        results = await self._client.execute_write(
+            queries.DELETE_MESSAGE, {"id": str(message_id), "cascade": cascade}
+        )
+        if not results:
+            return False
+        if not results[0]["deleted"]:
+            blocking = ", ".join(sorted(results[0]["blocking"]))
+            raise ValueError(
+                f"Message {message_id} still has {blocking} relationships. "
+                "Pass cascade=True to remove them with the message."
+            )
+        return True
 
     async def extract_entities_from_session(
         self,
