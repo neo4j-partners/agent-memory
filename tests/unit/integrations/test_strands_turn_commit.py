@@ -9,7 +9,9 @@ its reply. A turn paused by an interrupt stays buffered until it resumes.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -102,6 +104,30 @@ _FULL_APPROVAL_TURN = [
 ]
 
 
+class _StalledModel(ScriptedModel):
+    """A model whose first call never answers. Later calls replay ``turns``."""
+
+    def __init__(self, *turns: list[dict[str, Any]]) -> None:
+        super().__init__(*turns)
+        self.started = asyncio.Event()
+
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        if not self.started.is_set():
+            self.started.set()
+            await asyncio.Event().wait()
+        async for event in super().stream(*args, **kwargs):
+            yield event
+
+
+class _RedactingModel(ScriptedModel):
+    """A model whose guardrail redacts the prompt before it answers."""
+
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        yield {"redactContent": {"redactUserContentMessage": "[REDACTED]"}}
+        async for event in super().stream(*args, **kwargs):
+            yield event
+
+
 class TestASuccessfulTurn:
     async def test_nothing_is_written_until_the_turn_ends(self) -> None:
         client = FakeMemoryClient()
@@ -151,6 +177,23 @@ class TestASuccessfulTurn:
             ("assistant", "A1"),
             ("user", "Q2"),
             ("assistant", "A2"),
+        ]
+
+    async def test_a_redact_content_chunk_rewrites_the_prompt(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = Agent(
+            model=_RedactingModel([{"text": "I cannot help with that."}]),
+            session_manager=manager,
+            callback_handler=None,
+        )
+        try:
+            await agent.invoke_async("my card is 4111")
+        finally:
+            await manager.aclose()
+        assert _stored(client) == [
+            ("user", "[REDACTED]"),
+            ("assistant", "I cannot help with that."),
         ]
 
     async def test_redaction_rewrites_the_latest_buffered_message(self) -> None:
@@ -244,6 +287,43 @@ class TestATurnWithoutAResult:
         (info,) = _records(caplog, "INFO")
         assert "cancelled" in info
         assert "3 message" in info  # the prompt, the tool call, and its result
+
+    async def test_a_task_cancelled_before_its_result_stores_nothing(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        model = _StalledModel([{"text": "A2"}])
+        agent = Agent(model=model, session_manager=manager, callback_handler=None)
+        try:
+            call = asyncio.create_task(agent.invoke_async("Q1"))
+            await model.started.wait()
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            assert _stored(client) == []
+            await agent.invoke_async("Q2")
+        finally:
+            await manager.aclose()
+        assert _stored(client) == [("user", "Q2"), ("assistant", "A2")]
+
+    @pytest.mark.skipif(
+        "events.aclose()" not in inspect.getsource(Agent.stream_async),
+        reason="This Strands leaves an abandoned stream's AfterInvocationEvent to the GC.",
+    )
+    async def test_an_abandoned_stream_stores_nothing(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _agent(manager, [{"text": "A2"}])
+        try:
+            stream = agent.stream_async("Q1")
+            async for _ in stream:
+                if agent.messages:
+                    break  # the caller walks away before the model answers
+            await stream.aclose()
+            assert _stored(client) == []
+            await agent.invoke_async("Q2")
+        finally:
+            await manager.aclose()
+        assert _stored(client) == [("user", "Q2"), ("assistant", "A2")]
 
 
 class TestAStopThatAnswers:
