@@ -590,6 +590,28 @@ def _held_agent(
     )
 
 
+class _GatedModel(ScriptedModel):
+    """A model whose answers wait for ``answer`` and whose summary waits for ``summary``."""
+
+    def __init__(self, *turns: list[dict[str, Any]]) -> None:
+        super().__init__(*turns)
+        self.answer = asyncio.Event()
+        self.summary = asyncio.Event()
+        self.answering = asyncio.Event()
+        self.summarizing = asyncio.Event()
+
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        self.answering.set()
+        await self.answer.wait()
+        async for event in super().stream(*args, **kwargs):
+            yield event
+
+    async def structured_output(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        self.summarizing.set()
+        await self.summary.wait()
+        yield {"output": _Summary(text="a summary")}
+
+
 class TestCallsThatOverlap:
     @pytest.mark.parametrize("mode", list(ConcurrentInvocationMode))
     async def test_structured_output_during_a_call_leaves_its_turn(
@@ -731,6 +753,34 @@ class TestATurnWhoseEndWasMissed:
         assert _stored(client)[2:] == [("user", "Q2"), ("assistant", "A2")]
         (warning,) = _records(caplog, "WARNING")
         assert "sess-1" in warning
+
+    async def test_structured_output_running_when_a_left_over_turn_is_discarded_still_counts(
+        self,
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        model = _GatedModel([{"text": "A0"}], [{"text": "A1"}])
+        agent = Agent(model=model, session_manager=manager, callback_handler=None)
+        agent.hooks.add_callback(AfterInvocationEvent, _once(_crash))  # runs before ours
+        try:
+            model.answer.set()
+            with pytest.raises(RuntimeError, match="hook failed"):
+                await agent.invoke_async("Q0")
+            model.answer.clear()
+            summary = asyncio.create_task(agent.structured_output_async(_Summary, "Summarize."))
+            await model.summarizing.wait()
+            model.answering.clear()
+            call = asyncio.create_task(agent.invoke_async("Q1"))
+            await model.answering.wait()
+
+            model.summary.set()
+            await summary  # ends while Q1 runs
+            model.answer.set()
+            await call
+        finally:
+            await manager.aclose()
+
+        assert _stored(client) == [("user", "Q1"), ("assistant", "A1")]
 
     async def test_a_resume_after_an_interrupt_whose_end_was_missed_writes_the_whole_turn(
         self, caplog: pytest.LogCaptureFixture

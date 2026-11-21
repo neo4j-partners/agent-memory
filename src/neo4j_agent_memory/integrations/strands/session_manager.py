@@ -624,7 +624,9 @@ class Neo4jSessionManager(SessionManager):
                     discarded = self._discard_failed_turn_locked(event.agent)
                 self._owner = None
                 self._owner_task = None
-                self._open_calls = 0
+                # Only the owner's call is gone. A call that overlapped it,
+                # such as structured_output_async, may still be running.
+                self._open_calls = max(self._open_calls - 1, 0)
                 state = self._turn_state
             if state == "idle":
                 self._release_turn_locked()
