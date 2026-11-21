@@ -18,7 +18,7 @@ import copy
 import logging
 import threading
 from collections import deque
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 from neo4j_agent_memory.integrations.base import AsyncBridge as _AsyncBridge
@@ -70,6 +70,16 @@ _COEXISTENCE_HINT = (
 
 __all__ = ["Neo4jRetrievalConfig", "Neo4jSessionManager"]
 
+_PERSIST_ERROR_POLICIES = ("raise", "warn")
+
+
+class _MessageDropped(Exception):
+    """A drain dropped a message after its retry failed. Carries that error."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(str(error))
+        self.error = error
+
 
 class Neo4jSessionManager(SessionManager):
     """Strands SessionManager persisting conversations to neo4j-agent-memory.
@@ -92,6 +102,19 @@ class Neo4jSessionManager(SessionManager):
     (``FileSessionManager`` / ``S3SessionManager`` / ``RepositorySessionManager``);
     the "shared brain" pattern this manager is built for is N independent
     ``Agent`` instances, each with its own manager, over one graph.
+
+    ``on_persist_error`` sets what a failed memory write does. In both
+    modes the failed message stays at the head of the write queue, and
+    every later flush retries it before any later message. A turn flushes
+    several times, so retries in the turn where the write first failed do
+    not count. If the message fails again in a later turn, or at close, it
+    is dropped with an ERROR log that names it by session, role, and
+    position, and the later messages are written. So no message stays
+    queued past the next turn. With ``"raise"`` (the default) each failure
+    raises ``SessionException`` to the caller, which fails the agent call
+    when it happens in a hook. With ``"warn"`` each failure is logged and
+    the agent call goes on. Failures to restore history always raise, and
+    failures to retrieve context are always warnings.
     """
 
     def __init__(
@@ -106,11 +129,17 @@ class Neo4jSessionManager(SessionManager):
         record_tool_calls: bool = False,
         request_timeout: float = 30.0,
         restore_limit: int | None = None,
+        on_persist_error: Literal["raise", "warn"] = "raise",
     ) -> None:
         if (memory_client is None) == (settings is None):
             raise ValueError(
                 "Provide exactly one of memory_client= or settings= to Neo4jSessionManager."
             )
+        if on_persist_error not in _PERSIST_ERROR_POLICIES:
+            raise ValueError(
+                f"on_persist_error must be 'raise' or 'warn', not {on_persist_error!r}."
+            )
+        self._on_persist_error = on_persist_error
         self.session_id = session_id
         self._user_id = user_id
         self._retrieval_config = retrieval_config
@@ -138,6 +167,10 @@ class Neo4jSessionManager(SessionManager):
         self._queue_lock = threading.Lock()
         self._drain_lock: asyncio.Lock | None = None  # bridge loop only; one drain at a time
         self._inflight: concurrent.futures.Future[None] | None = None  # latest drain
+        # Retry accounting for the head of _ready, changed by the drain only.
+        self._head_failed_turn: int | None = None  # turn of the head's first failure
+        self._dequeued = 0  # messages that left _ready, stored or dropped
+        self._turns_ended = 0  # AfterInvocationEvents seen
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
@@ -386,7 +419,10 @@ class Neo4jSessionManager(SessionManager):
             if not buffered:
                 return
             self._check_open()
-        await self._aflush_buffer()
+        try:
+            await self._aflush_buffer()
+        finally:
+            self._turns_ended += 1  # a later failure of a queued message drops it
 
     async def _on_message_flush(self, event: MessageAddedEvent) -> None:
         """Write the messages ``append_message`` moved out of the slot."""
@@ -516,8 +552,8 @@ class Neo4jSessionManager(SessionManager):
         """Persist every buffered message, blocking until done.
 
         For ``close()`` and other sync callers. Hooks await
-        ``_aflush_buffer`` instead. Raises SessionException on failure, and
-        the failed message stays queued (see ``_adrain``).
+        ``_aflush_buffer`` instead. A failure is handled by
+        ``on_persist_error`` (see ``_persist_failed``).
         """
         self._release_pending()
         try:
@@ -525,9 +561,7 @@ class Neo4jSessionManager(SessionManager):
             if future is not None:
                 future.result(timeout=self._request_timeout)
         except Exception as e:
-            raise SessionException(
-                f"Failed to persist message for session {self.session_id!r}"
-            ) from e
+            self._persist_failed(e)
 
     async def _aflush_buffer(self) -> None:
         """Persist every buffered message without blocking the caller's loop."""
@@ -541,17 +575,40 @@ class Neo4jSessionManager(SessionManager):
         or a timeout, stops only the wait. The write itself runs to
         completion, and ``close()`` waits for it.
 
-        Raises SessionException on failure. The failed message stays at the
-        head of the queue, and the next flush retries it (see ``_adrain``).
+        A failure is handled by ``on_persist_error`` (see
+        ``_persist_failed``).
         """
         try:
             future = self._submit_drain()
             if future is not None:
                 await self._bridge.wait(future, shield=True)
         except Exception as e:
+            self._persist_failed(e)
+
+    def _persist_failed(self, error: Exception) -> None:
+        """Apply ``on_persist_error`` to a failed flush.
+
+        ``"raise"`` raises SessionException. ``"warn"`` logs a warning, or
+        nothing for a drop, since the drain already logged it as an error.
+        """
+        dropped = isinstance(error, _MessageDropped)
+        cause = error.error if isinstance(error, _MessageDropped) else error
+        if self._on_persist_error == "raise":
+            detail = (
+                "a message was dropped after its retry failed"
+                if dropped
+                else "the message stays queued for the next flush"
+            )
             raise SessionException(
-                f"Failed to persist message for session {self.session_id!r}"
-            ) from e
+                f"Failed to persist message for session {self.session_id!r}; {detail}"
+            ) from cause
+        if not dropped:
+            logger.warning(
+                "Failed to persist message for session %r; it stays queued and "
+                "the next flush retries it once: %s",
+                self.session_id,
+                cause,
+            )
 
     def _submit_drain(self) -> concurrent.futures.Future[None] | None:
         """Start a drain of the ready queue on the bridge, or None if it is empty."""
@@ -575,26 +632,59 @@ class Neo4jSessionManager(SessionManager):
         message. Neither backend lets the caller set a message id, so a
         retry after a write that failed late, for example once the backend
         had stored it, can store the message twice.
+
+        Retries in the turn of the first failure do not count. A failure
+        in a later turn, or during close, drops the message with an ERROR
+        log. The drain then goes on with the later messages and raises
+        ``_MessageDropped`` at the end. Any other failure stops the drain
+        and raises the error as is.
         """
         if self._drain_lock is None:
             self._drain_lock = asyncio.Lock()
+        dropped: _MessageDropped | None = None
         async with self._drain_lock:
             while True:
                 with self._queue_lock:
                     if not self._ready:
-                        return
+                        break
                     message = self._ready[0]
-                if text := _message_text(message):
-                    self._last_persisted = await self._aadd_message(
-                        message["role"], text, extract=self._extract_entities
+                try:
+                    if text := _message_text(message):
+                        self._last_persisted = await self._aadd_message(
+                            message["role"], text, extract=self._extract_entities
+                        )
+                except Exception as e:
+                    first = self._head_failed_turn is None
+                    if first:
+                        self._head_failed_turn = self._turns_ended
+                    if first or (self._head_failed_turn == self._turns_ended and not self._closed):
+                        raise
+                    logger.error(
+                        "Dropped %s message #%d of session %r after its retry "
+                        "failed. It was not stored: %s",
+                        message.get("role", "unknown"),
+                        self._dequeued + 1,
+                        self.session_id,
+                        e,
                     )
-                with self._queue_lock:
-                    self._ready.popleft()
+                    dropped = _MessageDropped(e)
+                    self._pop_head()
+                    continue
+                self._pop_head()
                 if blocks := self._tool_uses(message):
                     try:
                         await self._arecord_tool_uses(blocks)
                     except Exception as e:
                         logger.warning("Failed to mirror tool calls to reasoning memory: %s", e)
+        if dropped is not None:
+            raise dropped
+
+    def _pop_head(self) -> None:
+        """Remove the head of the ready queue and reset its retry state."""
+        with self._queue_lock:
+            self._ready.popleft()
+        self._head_failed_turn = None
+        self._dequeued += 1
 
     def _wait_for_inflight(self) -> None:
         """Let the latest drain finish before the client closes. Blocking."""

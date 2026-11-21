@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LiteLLMProvider(send_temperature=...)`. With `send_temperature=False`,
   the provider never sends a temperature, whether it comes from a call or
   from the constructor.
+- `Neo4jSessionManager(on_persist_error=...)`. With `"raise"`, the
+  default, a failed memory write raises `SessionException` as before.
+  With `"warn"`, it logs a warning and the agent call goes on. In both
+  modes the failed message stays queued, and later flushes retry it.
+  Retries in the turn where it first failed do not count. If it fails
+  again in a later turn, or at close, it is dropped with an ERROR log
+  that names its session, role, and position, and the later messages are
+  written. No message stays queued past the next turn. Failures to
+  restore history still raise.
 
 ### Fixed
 

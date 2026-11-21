@@ -110,8 +110,9 @@ anchor:_constructor_reference[]
 |`retrieval_config` |`None` |A `Neo4jRetrievalConfig` turns on per-turn context injection. `None` means persistence only.
 |`extract_entities` |`True` |Runs entity extraction on stored messages (Bolt only; NAMS extracts server-side).
 |`record_tool_calls` |`False` |Records observed tool-use blocks in reasoning memory for audit.
-|`request_timeout` |`30.0` |Seconds to wait for each backend call. A write that times out raises `SessionException`.
+|`request_timeout` |`30.0` |Seconds to wait for each backend call. A write that times out is handled by `on_persist_error`.
 |`restore_limit` |`None` |Maximum messages restored into the agent. `None` uses the backend default; Bolt returns up to 1000.
+|`on_persist_error` |`"raise"` |What a failed memory write does. `"raise"` raises `SessionException` to the agent call. `"warn"` logs a warning, and the agent call goes on. In both modes the message stays queued, and later flushes retry it before any later message. Retries in the turn where it first failed do not count. If it fails again in a later turn, or at close, it is dropped with an ERROR log that names its session, role, and position. So no message stays queued past the next turn. Failures to restore history always raise.
 |===
 
 `Neo4jSessionManager.for_nams(session_id, **kwargs)` builds a manager for the hosted service from `MEMORY_API_KEY` and optional `MEMORY_ENDPOINT`; `Neo4jMemoryStore.for_nams(config)` does the same for a store. The Bolt program above uses settings instead.
