@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -180,7 +181,7 @@ class BedrockProvider:
       ``"auto"``. Once a retry works, it logs one warning and sends
       ``"auto"`` from then on. This switch is a one-way latch shared by
       all calls on the provider. Calls made concurrently before it is set
-      can each pay one rejected request, and only one warning is logged.
+      can each pay one rejected request. One warning is logged per provider.
       ``"tool"`` always forces the tool and never falls back. ``"auto"``
       lets the model choose. If the model answers in
       text instead, the provider parses that text as JSON. When it does
@@ -226,7 +227,9 @@ class BedrockProvider:
         self._send_temperature = send_temperature
         self._tool_choice = tool_choice
         # Set when Bedrock rejects a forced toolChoice under tool_choice=None.
+        # The lock makes the check-and-set atomic for calls on other threads.
         self._fall_back_to_auto = False
+        self._fall_back_lock = threading.Lock()
         self._client: Any | None = None
 
     def _inference_config(self, temperature: float | None, max_tokens: int) -> dict[str, Any]:
@@ -426,8 +429,10 @@ class BedrockProvider:
             response: dict[str, Any] = await asyncio.to_thread(client.converse, **auto)
         except Exception as exc:
             raise exc from rejection
-        if not self._fall_back_to_auto:
+        with self._fall_back_lock:
+            first = not self._fall_back_to_auto
             self._fall_back_to_auto = True
+        if first:
             logger.warning(
                 "Bedrock model %s rejected a forced toolChoice, so this provider "
                 "now sends toolChoice auto. Pass tool_choice='auto' to skip the "

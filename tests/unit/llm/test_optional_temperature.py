@@ -12,6 +12,9 @@ choose). Each test asserts the request a stubbed client received.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -214,6 +217,36 @@ async def test_bedrock_rejected_forced_tool_choice_falls_back_to_auto(
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
     assert "toolChoice" in warnings[0].getMessage()
+
+
+class _SlowFalse:
+    """A falsy latch value whose truth test takes long enough for threads to overlap."""
+
+    def __bool__(self) -> bool:
+        time.sleep(0.2)
+        return False
+
+
+def test_bedrock_warns_once_across_threads(caplog: pytest.LogCaptureFixture) -> None:
+    """Two threads that fall back at once log one warning between them."""
+    from neo4j_agent_memory.llm.adapters import bedrock as adapter
+
+    provider, _ = _rejecting_provider(_TOOL_CHOICE_REJECTION)
+    provider._fall_back_to_auto = _SlowFalse()
+
+    def call() -> None:
+        asyncio.run(provider.complete_structured(_MESSAGES, _Extraction))
+
+    with caplog.at_level("WARNING", logger=adapter.__name__):
+        threads = [threading.Thread(target=call) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert provider._fall_back_to_auto is True
 
 
 # The message Bedrock returns for a forced choice on Claude Sonnet 5.5.
