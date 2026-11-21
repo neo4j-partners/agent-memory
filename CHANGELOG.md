@@ -130,7 +130,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole turn is discarded. If a `BeforeInvocationEvent` hook raises in an
   overlapping call, the manager keeps counting that call. A later
   `structured_output_async` call then leaves its turn open. The next
-  call ends that turn and resets the count.
+  call ends that turn and resets the count. In `UNSAFE_REENTRANT` mode,
+  an overlapping `structured_output_async` call whose
+  AfterInvocationEvent never reaches the manager can leave the manager
+  counting that call too.
 - A Strands call whose AfterInvocationEvent never reached the manager no
   longer keeps its turn open. A hook that raises before the manager's
   hook skips it, and so does a hook that raises after the manager's
@@ -143,9 +146,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the number of messages discarded. Messages appended outside a call
   while the turn was left open, such as a direct `agent.tool` call, are
   discarded with it. A left-over turn that stopped at an interrupt is
-  kept instead, so the call that resumes it writes the whole turn.
-  Before, one missed end kept the turn open for the life of the task,
-  and no later turn was written.
+  kept instead, so the call that resumes it writes the whole turn. A
+  resume that stops at a second interrupt and whose end is missed loses
+  the assistant message it added. Before, one missed end kept the turn
+  open for the life of the task, and no later turn was written.
+  `UNSAFE_REENTRANT` mode still has this limit when one task awaits its
+  calls one after another. Close then logs those messages as unwritten.
 - Strands redactions of a stored message now run one at a time. Before,
   two redactions could rewrite the same message at once, and each stored
   its own redacted copy. Each redaction now waits for the one before it
