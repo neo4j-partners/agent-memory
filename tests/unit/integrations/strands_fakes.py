@@ -250,8 +250,17 @@ class FakeShortTerm:
         )
         if session_id not in self.conversations:
             await self.create_conversation(session_id=session_id)
-        msg = Message(role=MessageRole(role), content=content)
-        self.conversations[session_id].messages.append(msg)
+        messages = self.conversations[session_id].messages
+        message_id = kwargs.get("message_id")
+        # Like Bolt: a retry with the id of a stored message stores nothing.
+        if message_id is not None and any(str(m.id) == str(message_id) for m in messages):
+            return Message(id=uuid.UUID(str(message_id)), role=MessageRole(role), content=content)
+        msg = Message(
+            role=MessageRole(role),
+            content=content,
+            **({} if message_id is None else {"id": uuid.UUID(str(message_id))}),
+        )
+        messages.append(msg)
         return msg
 
     async def extract_entities_from_message(

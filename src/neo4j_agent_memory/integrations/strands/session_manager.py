@@ -18,9 +18,9 @@ import copy
 import logging
 import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from neo4j_agent_memory.integrations.base import AsyncBridge as _AsyncBridge
 from neo4j_agent_memory.integrations.strands._messages import (
@@ -82,6 +82,14 @@ class _Queued:
     message: StrandsMessage
     turn: int  # the value of _turns_ended when the message was queued
     failed: bool = False  # a write of it has failed
+    # Stable across retries, so Bolt stores the message once however often
+    # its write is retried.
+    id: str = field(default_factory=lambda: str(uuid4()))
+    # The latest write and the content it writes. Bridge loop only. A drain
+    # that stops waiting leaves the write running, and the next drain
+    # awaits it instead of writing again.
+    write: asyncio.Task[StoredMessage] | None = None
+    written: StrandsMessage | None = None
 
 
 def _describe(error: BaseException) -> str:
@@ -727,14 +735,12 @@ class Neo4jSessionManager(SessionManager):
         a separate step. A failed extraction is logged and leaves the
         message stored, so it never causes a second write.
 
-        Delivery is at least once. A failed write leaves its message at the
-        head of the queue for the next drain to retry, ahead of every later
-        message. Neither backend lets the caller set a message id, so a
-        retry after a write that failed late, for example once the backend
-        had stored it, can store the message twice.
+        A failed write leaves its message at the head of the queue for the
+        next drain to retry, ahead of every later message. A retry does
+        not store the message twice. See ``_awrite``.
 
-        Each step is bounded by ``request_timeout``. A write that times
-        out is a failed write.
+        Each wait is bounded by ``request_timeout``. A write that times
+        out is a failed write, though it keeps running.
 
         A failed write drops its message when the message was queued in an
         earlier turn, or when the manager is closing and the message failed
@@ -752,21 +758,18 @@ class Neo4jSessionManager(SessionManager):
                     if not self._ready:
                         break
                     entry = self._ready[0]
-                message = entry.message
-                stored: StoredMessage | None = None
                 try:
-                    if text := _message_text(message):
-                        stored = await asyncio.wait_for(
-                            self._aadd_message(message["role"], text), self._request_timeout
-                        )
+                    written, stored = await self._awrite(entry)
                 except Exception as e:
                     stale = entry.turn < self._turns_ended
                     if not stale and not (self._closed and entry.failed):
                         entry.failed = True
                         raise
+                    if entry.write is not None:
+                        entry.write.cancel()  # a drop ends the write a timeout left running
                     logger.error(
                         "Dropped %s message #%d of session %r. Its write failed: %s",
-                        message.get("role", "unknown"),
+                        entry.message.get("role", "unknown"),
                         self._dequeued + 1,
                         self.session_id,
                         _describe(e),
@@ -775,7 +778,7 @@ class Neo4jSessionManager(SessionManager):
                     self._pop_head()
                     continue
                 latest = self._pop_head(stored)
-                if stored is not None and latest is not message:
+                if stored is not None and latest is not written:
                     stored = await self._aredact_written(stored, latest)
                 if stored is not None:
                     await self._aextract(stored)
@@ -790,6 +793,29 @@ class Neo4jSessionManager(SessionManager):
                         )
         if dropped is not None:
             raise dropped
+
+    async def _awrite(self, entry: _Queued) -> tuple[StrandsMessage, StoredMessage | None]:
+        """Write the entry's message, waiting at most ``request_timeout``.
+
+        Returns the content written and the stored message. The stored
+        message is None for a message with no text, which is not written.
+
+        The write runs as a shielded task kept on the entry. A wait that
+        runs out leaves the write running, and the next drain awaits that
+        write rather than starting another. NAMS assigns message ids on the
+        server, so this is what keeps a slow write from being stored twice
+        there. Bolt also stores the message under the entry's id, so a
+        write that failed after it committed is not stored twice either.
+        """
+        task = entry.write
+        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+            message = entry.message
+            if not (text := _message_text(message)):
+                return message, None
+            task = asyncio.ensure_future(self._aadd_message(message["role"], text, entry.id))
+            entry.write, entry.written = task, message
+        written = cast("StrandsMessage", entry.written)
+        return written, await asyncio.wait_for(asyncio.shield(task), self._request_timeout)
 
     def _pop_head(self, stored: StoredMessage | None = None) -> StrandsMessage:
         """Remove the head of the ready queue, count it, and return its content.
@@ -848,12 +874,15 @@ class Neo4jSessionManager(SessionManager):
             if isinstance(b, dict) and "toolUse" in b
         ]
 
-    async def _aadd_message(self, role: str, text: str) -> StoredMessage:
+    async def _aadd_message(
+        self, role: str, text: str, message_id: str | None = None
+    ) -> StoredMessage:
         """Resolve the session key and add one message. Runs on the bridge loop.
 
         Never extracts. Bolt's ``add_message`` extracts after the write and
         raises with the message stored, so the drain extracts separately
-        (see ``_aextract``).
+        (see ``_aextract``). Bolt stores the message under ``message_id``,
+        and NAMS ignores it.
         """
         return await self._client.short_term.add_message(
             await self._aresolve_key(),
@@ -862,6 +891,7 @@ class Neo4jSessionManager(SessionManager):
             extract_entities=False,
             user_identifier=self._user_id,
             metadata={_SESSION_KEY: self.session_id},
+            message_id=message_id,
         )
 
     async def _aextract(self, stored: StoredMessage) -> None:

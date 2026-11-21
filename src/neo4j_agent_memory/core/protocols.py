@@ -66,6 +66,7 @@ class ShortTermProtocol(Protocol):
         extraction_mode: Literal["auto", "skip", "explicit"] = "auto",
         explicit_mentions: list[Any] | None = None,
         user_identifier: str | None = None,
+        message_id: str | None = None,
     ) -> Message:
         """Append a message to a session and return the stored Message.
 
@@ -76,7 +77,9 @@ class ShortTermProtocol(Protocol):
         ``generate_embedding`` controls whether a vector embedding is
         computed for the message. ``metadata`` attaches arbitrary
         key/value data. ``user_identifier`` scopes the message to a
-        user identity (multi-tenant).
+        user identity (multi-tenant). ``message_id`` stores the message
+        under that id, so a retry with it is not stored twice. Bolt
+        honors it, and NAMS assigns ids on the server and ignores it.
         """
         ...
 

@@ -465,6 +465,86 @@ def _buffered(manager: Neo4jSessionManager, *texts: str) -> SimpleNamespace:
     return agent
 
 
+def _stores_then(client: FakeMemoryClient, *, delay: float = 0.0, fail: bool = False) -> None:
+    """Make the first add_message store its message, then reply late or fail.
+
+    A write whose reply is lost after it committed. Later calls are normal.
+    """
+    original = client.short_term.add_message
+    calls = 0
+
+    async def add(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        stored = await original(*args, **kwargs)
+        if calls == 1:
+            await asyncio.sleep(delay)
+            if fail:
+                raise RuntimeError("connection reset after commit")
+        return stored
+
+    client.short_term.add_message = add  # type: ignore[method-assign]
+
+
+class TestOneStoredCopyPerMessage:
+    """A write that commits but replies late or fails is stored once."""
+
+    async def test_a_bolt_write_that_replies_late_is_stored_once(self) -> None:
+        client = FakeMemoryClient()
+        _stores_then(client, delay=0.4)
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=client, request_timeout=0.2, on_persist_error="warn"
+        )
+        _buffered(manager, "one")
+        manager._release_pending()
+        await manager._aflush_ready()  # the wait runs out at 0.2 s
+        await asyncio.sleep(0.3)  # the write replies at 0.4 s
+        await manager._aflush_ready()  # takes that reply instead of writing again
+        await manager.aclose()
+        assert _stored(client) == [("user", "one")]
+
+    async def test_a_bolt_write_that_fails_after_it_committed_is_stored_once(self) -> None:
+        client = FakeMemoryClient()
+        _stores_then(client, fail=True)
+        manager = Neo4jSessionManager("sess-1", memory_client=client, on_persist_error="warn")
+        _buffered(manager, "one")
+        manager._release_pending()
+        await manager._aflush_ready()  # fails after the message was stored
+        await manager._aflush_ready()  # the retry carries the same id
+        await manager.aclose()
+        ids = [c["message_id"] for c in client.short_term.add_message_calls]
+        assert len(ids) == 2 and ids[0] == ids[1]
+        (conversation,) = client.short_term.conversations.values()
+        assert [m.content for m in conversation.messages] == ["one"]
+
+    async def test_a_nams_write_that_replies_late_is_stored_once(self) -> None:
+        client = FakeMemoryClient(nams_mode=True)
+        wire = client.wire
+        original = wire.request
+
+        async def request(spec: Any, **kwargs: Any) -> Any:
+            reply = await original(spec, **kwargs)  # the service has stored it
+            if spec.bridge_method == "add_message":
+                await asyncio.sleep(0.4)
+            return reply
+
+        wire.request = request  # type: ignore[method-assign]
+        manager = Neo4jSessionManager(
+            "sess-1",
+            memory_client=client,
+            request_timeout=0.2,
+            on_persist_error="warn",
+            extract_entities=False,
+        )
+        _buffered(manager, "one")
+        manager._release_pending()
+        await manager._aflush_ready()  # the wait runs out at 0.2 s
+        await asyncio.sleep(0.3)  # the write replies at 0.4 s
+        await manager._aflush_ready()  # takes that reply instead of writing again
+        await manager.aclose()
+        assert [c.json["content"] for c in wire.calls_for("add_message")] == ["one"]
+
+
 class TestWritesRunToCompletion:
     async def test_cancelling_the_caller_mid_write_keeps_the_turn(self) -> None:
         client = _slow_client(0.3)
@@ -493,33 +573,32 @@ class TestWritesRunToCompletion:
     async def test_a_wait_that_runs_out_leaves_the_write_running(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        client = FakeMemoryClient()
-        original = client.short_term.add_message
-
-        async def ignores_cancel(*args: Any, **kwargs: Any) -> Any:
-            try:
-                await asyncio.sleep(0.6)
-            except asyncio.CancelledError:
-                await asyncio.sleep(1.0)  # a client that finishes its request anyway
-            return await original(*args, **kwargs)
-
-        client.short_term.add_message = ignores_cancel  # type: ignore[method-assign]
-        # Each message takes two steps, the write and its extraction. So the
-        # hook waits 0.2 * 2 * 2 = 0.8 s, and the wait of aclose runs out near
-        # 1.6 s. The write times out at 0.2 s and ends anyway at 1.2 s, which
-        # leaves 0.4 s on each side.
-        manager = Neo4jSessionManager("sess-1", memory_client=client, request_timeout=0.2)
-        _buffered(manager, "one")
+        # Each write takes 0.2 s, inside request_timeout. The hook waits
+        # 0.5 * (1 + 1) = 1.0 s for its one message. Seven more messages
+        # arrive while its drain runs, and the drain writes them too. So the
+        # drain needs 1.6 s, and the hook's wait runs out near 1.0 s.
+        client = _slow_client(0.2)
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=client, request_timeout=0.5, extract_entities=False
+        )
+        agent = _buffered(manager, "one")
+        texts = ["two", "three", "four", "five", "six", "seven", "eight", "nine"]
         try:
             with caplog.at_level(logging.WARNING, logger=_LOGGER):
-                await manager._on_after_invocation(SimpleNamespace(agent=None))  # no raise
+                hook = asyncio.create_task(
+                    manager._on_after_invocation(SimpleNamespace(agent=None))
+                )
+                await asyncio.sleep(0.05)  # the drain is writing "one"
+                for text in texts:  # "two" to "eight" join the queue; "nine" stays buffered
+                    manager.append_message({"role": "user", "content": [{"text": text}]}, agent)
+                await hook  # no raise
             (warning,) = [r for r in caplog.records if r.name == _LOGGER]
             assert "sess-1" in warning.getMessage()
             assert "background" in warning.getMessage()
-            assert _stored(client) == []
+            assert 0 < len(_stored(client)) < 8
         finally:
             await manager.aclose()
-        assert _stored(client) == [("user", "one")]
+        assert _stored(client) == [("user", text) for text in ["one", *texts]]
 
     async def test_concurrent_drains_write_in_order(self) -> None:
         client = _slowing_client(0.3)  # the first write is the slowest

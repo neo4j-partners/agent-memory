@@ -906,6 +906,7 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
         extraction_mode: Literal["auto", "skip", "explicit"] = "auto",
         explicit_mentions: list[Any] | None = None,
         user_identifier: str | None = None,
+        message_id: UUID | str | None = None,
     ) -> Message:
         """
         Add a message to a conversation.
@@ -937,9 +938,15 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
             user_identifier: When provided, scopes the conversation to a
                 :User node via ``(:User)-[:HAS_CONVERSATION]->(:Conversation)``.
                 Required when ``MemorySettings.memory.multi_tenant=True``.
+            message_id: The id to store the message under. Omitted, a new
+                id is generated. A retry with the same id stores nothing
+                when the conversation already holds a message with it, so
+                a write whose reply was lost is not stored twice. The
+                stored message is left as it is. Extraction still runs as
+                requested.
 
         Returns:
-            The created message
+            The created message, with this call's fields.
         """
         # Multi-tenant guardrail.
         self._enforce_multi_tenant(user_identifier)
@@ -960,7 +967,7 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
 
         # Create message
         message = Message(
-            id=uuid4(),
+            id=uuid4() if message_id is None else UUID(str(message_id)),
             role=role,
             content=content,
             conversation_id=conv_id,

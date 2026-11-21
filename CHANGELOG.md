@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool_choice` only to `BedrockProvider`. When it routes to LiteLLM, a
   value other than `None`, `"tool"`, or `"auto"` raises `ValueError`. A
   valid value is dropped, and a WARNING is logged once per process.
+- `ShortTermMemory.add_message(message_id=...)` on bolt. The message is
+  stored under that id. A retry with the same id stores nothing when the
+  conversation already holds the message, so a write whose reply was
+  lost is not stored twice. NAMS assigns ids on the server and ignores
+  the argument.
 - `ShortTermMemory.extract_entities_from_message()` on bolt. It extracts
   entities and relations from one stored message. Call it after
   `add_message(..., extract_entities=False)` to keep extraction apart
@@ -94,9 +99,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout.
 - A `Neo4jSessionManager` message whose write fails now stays at the head
   of the queue, and the next flush retries it before any later message.
-  Before, the failed message was lost. Delivery is at least once. Neither
-  backend lets the caller set a message id, so a write that failed after
-  the backend stored it can be stored twice.
+  Before, the failed message was lost. A retry stores the message once.
+  A write that times out keeps running, and the retry takes its result
+  instead of writing again. On bolt, the retry also carries the same
+  message id, so a write that failed after it committed is not stored
+  twice.
 - Abandoning a Strands stream and then calling `aclose()` no longer raises
   `SessionException` when the stream's generator is finalized. After
   close, the after-invocation hook raises only if messages are still

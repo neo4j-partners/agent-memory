@@ -113,6 +113,13 @@ MATCH (c:Conversation {id: $conversation_id})
 // instead of all reading the same predecessor and forking the chain.
 SET c.updated_at = datetime()
 WITH c
+// A retry with the id of a message this conversation already holds writes
+// nothing and returns no row. So a write whose reply was lost is not stored
+// twice. The check runs after the lock above, so it sees a write of the same
+// id that committed while this one waited.
+OPTIONAL MATCH (prior:Message {id: $id})
+WHERE (c)-[:HAS_MESSAGE]->(prior)
+WITH c WHERE prior IS NULL
 OPTIONAL MATCH (c)-[:HAS_MESSAGE]->(last:Message)
 WHERE NOT (last)-[:NEXT_MESSAGE]->()
 // A chain forked by a pre-fix write exposes more than one tail, and every
