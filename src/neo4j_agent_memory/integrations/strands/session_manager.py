@@ -194,6 +194,7 @@ class Neo4jSessionManager(SessionManager):
         # on the bridge thread, so every access holds this lock.
         self._queue_lock = threading.Lock()
         self._drain_lock: asyncio.Lock | None = None  # bridge loop only; one drain at a time
+        self._redact_lock: asyncio.Lock | None = None  # bridge loop only; one redaction at a time
         self._latest_drain: concurrent.futures.Future[None] | None = None  # under _queue_lock
         self._dequeued = 0  # messages that left _ready, stored or dropped; drain only
         self._turns_ended = 0  # AfterInvocationEvents seen
@@ -539,7 +540,7 @@ class Neo4jSessionManager(SessionManager):
         also rewrites the queue, and the drain applies it once the write
         finishes. Late path: the message is already stored. The Strands
         lifecycle redacts within the same invocation, so this path is
-        defensive. See ``_aredact_stored`` for what each backend does.
+        defensive. See ``_aredact_latest``.
         """
         self._check_open()
         redacted = copy.deepcopy(redact_message)
@@ -550,21 +551,51 @@ class Neo4jSessionManager(SessionManager):
             if self._ready:
                 self._ready[-1].message = redacted
                 return
-            stored = self._last_persisted
-        if stored is None:
+        try:
+            redacted_stored = self._bridge.run(self._aredact_latest(redacted))
+        except Exception as e:
+            raise SessionException(
+                f"Failed to redact latest message for session {self.session_id!r}"
+            ) from e
+        if not redacted_stored:
             logger.warning(
                 "redact_latest_message called for session %s, but its latest "
                 "message was not stored, so there is nothing to redact.",
                 self.session_id,
             )
-            return
-        try:
-            self._last_persisted = self._bridge.run(self._aredact_stored(stored, redacted))
-        except Exception as e:
-            self._last_persisted = None  # id may already be deleted; don't reuse it
-            raise SessionException(
-                f"Failed to redact latest message for session {self.session_id!r}"
-            ) from e
+
+    def _redaction_lock(self) -> asyncio.Lock:
+        """The lock that lets one redaction at a time rewrite a stored message.
+
+        Bridge loop only. The drain holds it from popping a message until
+        any redaction that landed during the write is applied.
+        """
+        if self._redact_lock is None:
+            self._redact_lock = asyncio.Lock()
+        return self._redact_lock
+
+    async def _aredact_latest(self, redacted: StrandsMessage) -> bool:
+        """Redact the latest stored message. Runs on the bridge loop.
+
+        Returns False when the latest message was not stored. The target is
+        read under the redaction lock, so a redaction that waited rewrites
+        the message the one before it stored, not a deleted one. See
+        ``_aredact_stored`` for what each backend does.
+        """
+        async with self._redaction_lock():
+            with self._queue_lock:
+                stored = self._last_persisted
+            if stored is None:
+                return False
+            try:
+                result = await self._aredact_stored(stored, redacted)
+            except BaseException:
+                with self._queue_lock:
+                    self._last_persisted = None  # its id may be deleted already
+                raise
+            with self._queue_lock:
+                self._last_persisted = result
+            return True
 
     async def _aredact_stored(
         self, stored: StoredMessage, redacted: StrandsMessage
@@ -780,11 +811,13 @@ class Neo4jSessionManager(SessionManager):
                         _describe(e),
                     )
                     dropped = _MessageDropped(e)
-                    self._pop_head()
+                    async with self._redaction_lock():
+                        self._pop_head()
                     continue
-                latest = self._pop_head(stored)
-                if stored is not None and latest is not written:
-                    stored = await self._aredact_written(stored, latest)
+                async with self._redaction_lock():
+                    latest = self._pop_head(stored)
+                    if stored is not None and latest is not written:
+                        stored = await self._aredact_written(stored, latest)
                 if stored is not None:
                     await self._aextract(stored)
                 if blocks := self._tool_uses(latest):

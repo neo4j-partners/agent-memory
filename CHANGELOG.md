@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Strands redactions of a stored message now run one at a time. Before,
+  two redactions could rewrite the same message at once, and each stored
+  its own redacted copy. Each redaction now waits for the one before it
+  and rewrites the copy that one stored.
 - Strands tool-call mirroring now completes when its wait runs out.
   Before, the timeout cancelled it. A trace that had started was not
   remembered, so the next message started a second trace. A step could

@@ -888,6 +888,46 @@ class TestRedactionDuringAWrite:
         assert any("nothing to redact" in r.getMessage() for r in caplog.records)
         await manager.aclose()
 
+    async def test_a_late_redaction_waits_for_the_one_the_drain_applies(self) -> None:
+        client = _slow_client(0.3)
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _buffered(manager, "secret 123")
+        manager._release_pending()
+        drain = asyncio.wrap_future(manager._submit_drain())
+        await asyncio.sleep(0.1)  # the write of "secret 123" is in flight
+        first = {"role": "user", "content": [{"text": "[REDACTED 1]"}]}
+        manager.redact_latest_message(first, agent)  # rewrites the queue
+        await asyncio.sleep(0.3)  # the drain is storing "[REDACTED 1]"
+
+        second = {"role": "user", "content": [{"text": "[REDACTED 2]"}]}
+        await asyncio.to_thread(manager.redact_latest_message, second, agent)
+        await drain
+
+        assert _contents(client) == ["[REDACTED 2]"]
+        await manager.aclose()
+
+    async def test_late_redactions_at_once_store_one_message(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _buffered(manager, "secret 123")
+        await manager._aflush_buffer()
+        _commits_then_waits(client.short_term, "add_message", 0.3)
+
+        await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    manager.redact_latest_message,
+                    {"role": "user", "content": [{"text": f"[REDACTED {n}]"}]},
+                    agent,
+                )
+                for n in (1, 2)
+            )
+        )
+
+        assert len(_contents(client)) == 1
+        assert _contents(client)[0].startswith("[REDACTED")
+        await manager.aclose()
+
     async def test_a_failed_redaction_is_logged_as_an_error(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
