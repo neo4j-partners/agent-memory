@@ -38,8 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message whose write already failed is dropped if it fails again. A
   dropped message gets an ERROR log that names its session, role, and
   position, and the later messages are written. After a failed flush,
-  only messages from the current turn stay queued. Failures to restore
-  history still raise.
+  only messages from the current turn stay queued. A failure at close
+  leaves messages unwritten for good, so in both modes it is logged as
+  an ERROR with their number. Failures to restore history still raise.
 
 ### Fixed
 

@@ -166,19 +166,28 @@ class TestRetryBound:
         (error,) = _records(caplog, "ERROR")
         assert "user message #1" in error.getMessage()
 
-    async def test_a_first_failure_at_close_is_not_dropped(
-        self, mode: str, caplog: pytest.LogCaptureFixture
+    @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
+    async def test_a_first_failure_at_close_reports_what_is_unwritten(
+        self, mode: str, use_async: bool, caplog: pytest.LogCaptureFixture
     ) -> None:
         client, switch = _failing_client()
         manager = Neo4jSessionManager("sess-1", memory_client=client, on_persist_error=mode)  # type: ignore[arg-type]
-        _buffered(manager, "last")
+        _buffered(manager, "a", "b")
         switch.down = True
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
-            await _expect_failure(manager.aclose(), mode)
-        assert _records(caplog, "ERROR") == []
-        assert [entry.message for entry in manager._ready] == [
-            {"role": "user", "content": [{"text": "last"}]}
-        ]
+            close = manager.aclose() if use_async else asyncio.to_thread(manager.close)
+            if mode == "raise":
+                with pytest.raises(SessionException, match="2 message") as info:
+                    await close
+                assert "next flush" not in str(info.value)
+            else:
+                await close
+        (error,) = _records(caplog, "ERROR")
+        assert "sess-1" in error.getMessage()
+        assert "2 message" in error.getMessage()
+        assert "backend down" in error.getMessage()
+        assert _records(caplog, "WARNING") == []
+        assert len(manager._ready) == 2
 
     async def test_a_sustained_outage_keeps_only_the_current_turn_queued(
         self, mode: str, caplog: pytest.LogCaptureFixture
@@ -278,7 +287,7 @@ class TestWarnMode:
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
             manager.close()
         assert _stored(client) == []
-        assert _records(caplog, "WARNING")
+        assert _records(caplog, "ERROR")  # unwritten for good, so not a warning
 
     def test_restore_failures_still_raise(self) -> None:
         client = FakeMemoryClient()

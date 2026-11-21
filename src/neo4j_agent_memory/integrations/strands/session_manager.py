@@ -128,7 +128,9 @@ class Neo4jSessionManager(SessionManager):
     if it fails again. A dropped message gets an ERROR log that names it
     by session, role, and position, and the later messages are written.
     So after a failed flush, only messages from the current turn stay
-    queued. With ``"raise"`` (the default) each failure
+    queued. A failure at close leaves messages unwritten for good, so it
+    is logged as an ERROR with their number in both modes. With
+    ``"raise"`` (the default) each failure
     raises ``SessionException`` to the caller, which fails the agent call
     when it happens in a hook. With ``"warn"`` each failure is logged and
     the agent call goes on. Failures to restore history always raise, and
@@ -645,21 +647,33 @@ class Neo4jSessionManager(SessionManager):
     def _persist_failed(self, error: Exception) -> None:
         """Apply ``on_persist_error`` to a failed flush.
 
-        ``"raise"`` raises SessionException. ``"warn"`` logs a warning, or
-        nothing for a drop, since the drain already logged it as an error.
+        A failure at close leaves its messages unwritten for good, so it is
+        logged as an ERROR in both modes. ``"raise"`` then raises
+        SessionException. ``"warn"`` logs a warning for a failure before
+        close. A drop gets no warning, since the drain logged it as an
+        error.
         """
         dropped = isinstance(error, _MessageDropped)
         cause = error.error if isinstance(error, _MessageDropped) else error
-        if self._on_persist_error == "raise":
-            detail = (
-                "a message was dropped after its write failed"
-                if dropped
-                else "the message stays queued for the next flush"
+        if dropped:
+            detail = "a message was dropped after its write failed"
+        elif self._closed:
+            with self._queue_lock:
+                unwritten = len(self._ready)
+            detail = f"{unwritten} message(s) were not written before close"
+            logger.error(
+                "Closing session %r with %d message(s) not written: %s",
+                self.session_id,
+                unwritten,
+                _describe(cause),
             )
+        else:
+            detail = "the message stays queued for the next flush"
+        if self._on_persist_error == "raise":
             raise SessionException(
                 f"Failed to persist message for session {self.session_id!r}; {detail}"
             ) from cause
-        if not dropped:
+        if not dropped and not self._closed:
             logger.warning(
                 "Failed to persist message for session %r. It stays queued, "
                 "and the next flush retries it: %s",
