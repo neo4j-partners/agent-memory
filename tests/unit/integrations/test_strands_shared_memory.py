@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import threading
 from typing import Any
 
@@ -228,6 +229,55 @@ class TestClosingSharedMemory:
         assert order == ["connect ended", "close"]
         assert not fake.is_connected
         assert _bridge_threads() == threads_before
+
+    async def test_a_cancelled_connect_cancels_the_client_connect(self) -> None:
+        from neo4j_agent_memory.integrations.strands.shared import _connect
+
+        fake = FakeMemoryClient()
+        started = asyncio.Event()
+        order: list[str] = []
+
+        async def hang() -> None:
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            finally:
+                order.append("connect ended")
+
+        fake.connect = hang  # type: ignore[method-assign]
+        task = asyncio.create_task(_connect(fake, 30))  # type: ignore[arg-type]
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert order == ["connect ended"]
+
+    def test_open_stops_a_connect_past_its_bound_before_the_client_closes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeMemoryClient()
+        order: list[str] = []
+        close = fake.close
+
+        async def stuck(_client: Any, _timeout: float) -> None:
+            try:
+                await asyncio.sleep(30)
+            finally:
+                order.append("connect ended")
+
+        async def record_close() -> None:
+            order.append("close")
+            await close()
+
+        shared = sys.modules[SharedMemory.__module__]
+        monkeypatch.setattr(shared, "_connect", stuck)
+        monkeypatch.setattr(shared, "_UNWIND_SECONDS", 0.1)
+        monkeypatch.setattr(fake, "close", record_close)
+        monkeypatch.setattr("neo4j_agent_memory.MemoryClient", lambda _settings: fake)
+
+        with pytest.raises(TimeoutError):
+            SharedMemory.open(_SETTINGS, request_timeout=0.1)
+        assert order == ["connect ended", "close"]
 
     def test_a_close_that_fails_after_a_failed_connect_is_logged(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

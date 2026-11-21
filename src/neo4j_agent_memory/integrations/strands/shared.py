@@ -10,6 +10,7 @@ pool and thread. A server that runs many sessions builds one
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import math
 import threading
@@ -103,11 +104,15 @@ class SharedMemory:
 
         bridge = AsyncBridge(timeout=request_timeout)
         client = MemoryClient(settings)
+        future: concurrent.futures.Future[None] | None = None
         try:
+            future = bridge.submit(_connect(client, request_timeout))
             # _connect bounds itself. The outer bound adds the unwind and
             # one request_timeout to cover scheduling, as close does.
-            bridge.run(_connect(client, request_timeout), 2 * request_timeout + _UNWIND_SECONDS)
+            future.result(timeout=2 * request_timeout + _UNWIND_SECONDS)
         except BaseException:
+            if future is not None:
+                future.cancel()  # so the connect stops before the client closes
             _close_failed_client(client, bridge, request_timeout)
             raise
         return cls(client, bridge, request_timeout, background_hook)
@@ -249,12 +254,19 @@ async def _connect(client: MemoryClient, timeout: float) -> None:
 
     A connect that runs out of time is cancelled and gets
     ``_UNWIND_SECONDS`` to unwind, so it ends before the client closes.
+    When ``_connect`` itself is cancelled, the connect is cancelled the
+    same way.
     """
     task = asyncio.ensure_future(client.connect())
-    done, _ = await asyncio.wait({task}, timeout=timeout)
-    if not done:
-        task.cancel()
-        await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
+    timed_out = False
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        timed_out = not done
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
+    if timed_out:
         raise TimeoutError(f"Connecting the memory client took longer than {timeout}s.")
     task.result()
 
