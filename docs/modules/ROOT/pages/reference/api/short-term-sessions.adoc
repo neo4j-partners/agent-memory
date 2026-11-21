@@ -146,6 +146,33 @@ async def generate_embeddings_batch(
 | `on_progress` | Progress callback (processed_count, total_count)
 |===
 
+=== extract_entities_from_message
+
+Extract entities and relations from one stored message and link them to it.
+
+// contract: memory/short_term.py:ShortTermMemory.extract_entities_from_message
+[source,python]
+----
+async def extract_entities_from_message(
+    message: Message,
+    *,
+    extract_relations: bool=True,
+    generate_embedding: bool=True,
+    user_identifier: str | None=None,
+) -> None: ...
+----
+
+[cols="1,4",options="header"]
+|===
+| Parameter | Description
+| `message` | A message returned by `add_message`
+| `extract_relations` | Whether to also extract and store relations between entities
+| `generate_embedding` | Whether to embed the extracted entity names
+| `user_identifier` | Tenant the message belongs to; scopes resolution candidates when `resolution.scope="user"`
+|===
+
+`add_message` runs the same step after the write when `extract_entities=True`. Call this method after `add_message(..., extract_entities=False)` to keep the two apart. An extraction error then leaves the message stored, and the caller knows it was stored. So a retry does not write it twice. Bolt only.
+
 === extract_entities_from_session
 
 Extract entities and relations from all messages in a session.

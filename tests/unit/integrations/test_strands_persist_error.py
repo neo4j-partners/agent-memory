@@ -262,3 +262,70 @@ class TestRaiseMode:
         finally:
             switch.down = False
             await manager.aclose()
+
+
+def _extractor_down_client() -> FakeMemoryClient:
+    """A bolt fake whose extractor fails, the way bolt fails.
+
+    Bolt's ``add_message(extract_entities=True)`` stores the message and
+    then raises from extraction. ``extract_entities_from_message`` raises
+    too, with the message already stored.
+    """
+    client = FakeMemoryClient()
+    original = client.short_term.add_message
+
+    async def add_message(session_id: str, role: str, content: str, **kwargs: Any) -> Any:
+        stored = await original(session_id, role, content, **kwargs)
+        if kwargs.get("extract_entities", True):
+            raise RuntimeError("extractor down")
+        return stored
+
+    async def extract(message: Any, **kwargs: Any) -> None:
+        raise RuntimeError("extractor down")
+
+    client.short_term.add_message = add_message  # type: ignore[method-assign]
+    client.short_term.extract_entities_from_message = extract  # type: ignore[method-assign]
+    return client
+
+
+class TestExtraction:
+    async def test_a_failed_extraction_does_not_rewrite_the_message(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = _extractor_down_client()
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        _buffered(manager, "one", "two")
+        try:
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await _end_turn(manager)
+                await _end_turn(manager)
+            assert _stored(client) == [("user", "one"), ("user", "two")]
+            assert list(manager._ready) == []
+            assert _records(caplog, "ERROR") == []
+            warnings = [r.getMessage() for r in _records(caplog, "WARNING")]
+            assert len(warnings) == 2
+            assert all("extractor down" in w and "sess-1" in w for w in warnings)
+        finally:
+            await manager.aclose()
+
+    async def test_each_stored_message_is_extracted_once(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, user_id="alice")
+        _buffered(manager, "one", "two")
+        try:
+            await _end_turn(manager)
+            assert [m.content for m in client.short_term.extracted] == ["one", "two"]
+            assert all(c["extract_entities"] is False for c in client.short_term.add_message_calls)
+        finally:
+            await manager.aclose()
+
+    async def test_extract_entities_false_skips_extraction(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        _buffered(manager, "one")
+        try:
+            await _end_turn(manager)
+            assert _stored(client) == [("user", "one")]
+            assert client.short_term.extracted == []
+        finally:
+            await manager.aclose()

@@ -1434,6 +1434,43 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
             )
         return True
 
+    async def extract_entities_from_message(
+        self,
+        message: Message,
+        *,
+        extract_relations: bool = True,
+        generate_embedding: bool = True,
+        user_identifier: str | None = None,
+    ) -> None:
+        """Extract entities and relations from one stored message and link them.
+
+        ``add_message`` runs the same step when ``extract_entities=True``,
+        after the message is written. Call this after
+        ``add_message(..., extract_entities=False)`` to keep the two apart.
+        A failed extraction then leaves a stored message that the caller
+        knows was stored, so a retry does not write it twice.
+
+        Args:
+            message: A message returned by ``add_message``.
+            extract_relations: Whether to also extract and store relations
+                between entities.
+            generate_embedding: Whether to embed the extracted entity names.
+            user_identifier: Tenant the message belongs to, used to scope
+                resolution candidates when ``resolution.scope="user"``.
+                Required when ``MemorySettings.memory.multi_tenant=True``.
+
+        Raises:
+            Exception: Whatever the extractor, embedder, or database raises.
+                The message stays stored.
+        """
+        self._enforce_multi_tenant(user_identifier)
+        await self._extract_and_link_entities(
+            message,
+            extract_relations=extract_relations,
+            user_identifier=user_identifier,
+            embed_entities=generate_embedding,
+        )
+
     async def extract_entities_from_session(
         self,
         session_id: str,

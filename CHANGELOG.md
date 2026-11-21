@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool_choice` only to `BedrockProvider`. When it routes to LiteLLM, a
   value other than `None`, `"tool"`, or `"auto"` raises `ValueError`. A
   valid value is dropped, and a WARNING is logged once per process.
+- `ShortTermMemory.extract_entities_from_message()` on bolt. It extracts
+  entities and relations from one stored message. Call it after
+  `add_message(..., extract_entities=False)` to keep extraction apart
+  from the write. An extraction error then leaves the message stored,
+  and the caller knows that it was stored.
 - `LiteLLMProvider(send_temperature=...)`. With `send_temperature=False`,
   the provider never sends a temperature, whether it comes from a call or
   from the constructor.
@@ -42,10 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the loop. `append_message` now only buffers, and the next hook writes.
 - `Neo4jSessionManager` memory writes now run to completion. Cancelling
   the agent call, or hitting `request_timeout`, stops only the wait. A
-  turn is no longer cut off mid-write, and inline entity extraction
-  finishes. `close()` and `aclose()` wait for a write that is still
+  turn is no longer cut off mid-write. `close()` and `aclose()` wait for
+  a write that is still
   running. Writes from hooks, `aclose()`, and a `close()` on another
   thread run one at a time and keep the message order.
+- A failed entity extraction no longer fails a `Neo4jSessionManager`
+  write. On bolt, the manager now writes each message without extraction
+  and then extracts it in a separate step. An extraction error is logged
+  as a warning, and the message stays stored without entities.
 - `AsyncBridge.close()` now shuts its loop down the way `asyncio.run`
   does. Pending tasks are cancelled and get 5 seconds to unwind, so their
   cleanup code runs. The loop thread closes its own loop. A caller still

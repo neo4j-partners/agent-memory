@@ -18,7 +18,7 @@ import copy
 import logging
 import threading
 from collections import deque
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID
 
 from neo4j_agent_memory.integrations.base import AsyncBridge as _AsyncBridge
@@ -55,6 +55,7 @@ if TYPE_CHECKING:
 
     from neo4j_agent_memory import MemoryClient, MemorySettings
     from neo4j_agent_memory.memory.short_term import Message as StoredMessage
+    from neo4j_agent_memory.memory.short_term import ShortTermMemory
     from neo4j_agent_memory.nams.endpoints import TransportMode
 
 logger = logging.getLogger(__name__)
@@ -535,7 +536,7 @@ class Neo4jSessionManager(SessionManager):
         text = _message_text(redact_message) or "[REDACTED]"
         try:
             self._bridge.run(self._client.short_term.delete_message(self._last_persisted.id))
-            self._store_message(redact_message.get("role", "user"), text, extract=False)
+            self._store_message(redact_message.get("role", "user"), text)
         except Exception as e:
             self._last_persisted = None  # id may already be deleted; don't reuse it
             raise SessionException(
@@ -627,6 +628,10 @@ class Neo4jSessionManager(SessionManager):
         double-write messages. A message leaves the queue only once its
         write has finished.
 
+        A message is written without entity extraction, then extracted as
+        a separate step. A failed extraction is logged and leaves the
+        message stored, so it never causes a second write.
+
         Delivery is at least once. A failed write leaves its message at the
         head of the queue for the next drain to retry, ahead of every later
         message. Neither backend lets the caller set a message id, so a
@@ -648,11 +653,10 @@ class Neo4jSessionManager(SessionManager):
                     if not self._ready:
                         break
                     message = self._ready[0]
+                stored: StoredMessage | None = None
                 try:
                     if text := _message_text(message):
-                        self._last_persisted = await self._aadd_message(
-                            message["role"], text, extract=self._extract_entities
-                        )
+                        stored = await self._aadd_message(message["role"], text)
                 except Exception as e:
                     first = self._head_failed_turn is None
                     if first:
@@ -660,8 +664,7 @@ class Neo4jSessionManager(SessionManager):
                     if first or (self._head_failed_turn == self._turns_ended and not self._closed):
                         raise
                     logger.error(
-                        "Dropped %s message #%d of session %r after its retry "
-                        "failed. It was not stored: %s",
+                        "Dropped %s message #%d of session %r. Its write failed: %s",
                         message.get("role", "unknown"),
                         self._dequeued + 1,
                         self.session_id,
@@ -671,6 +674,9 @@ class Neo4jSessionManager(SessionManager):
                     self._pop_head()
                     continue
                 self._pop_head()
+                if stored is not None:
+                    self._last_persisted = stored
+                    await self._aextract(stored)
                 if blocks := self._tool_uses(message):
                     try:
                         await self._arecord_tool_uses(blocks)
@@ -728,20 +734,46 @@ class Neo4jSessionManager(SessionManager):
             if isinstance(b, dict) and "toolUse" in b
         ]
 
-    def _store_message(self, role: str, text: str, *, extract: bool) -> None:
-        """Persist one message, blocking (tracked for late redaction)."""
-        self._last_persisted = self._bridge.run(self._aadd_message(role, text, extract=extract))
+    def _store_message(self, role: str, text: str) -> None:
+        """Persist one message without extraction, blocking (tracked for late redaction)."""
+        self._last_persisted = self._bridge.run(self._aadd_message(role, text))
 
-    async def _aadd_message(self, role: str, text: str, *, extract: bool) -> StoredMessage:
-        """Resolve the session key and add one message. Runs on the bridge loop."""
+    async def _aadd_message(self, role: str, text: str) -> StoredMessage:
+        """Resolve the session key and add one message. Runs on the bridge loop.
+
+        Never extracts. Bolt's ``add_message`` extracts after the write and
+        raises with the message stored, so the drain extracts separately
+        (see ``_aextract``).
+        """
         return await self._client.short_term.add_message(
             await self._aresolve_key(),
             role,
             text,
-            extract_entities=extract,
+            extract_entities=False,
             user_identifier=self._user_id,
             metadata={_SESSION_KEY: self.session_id},
         )
+
+    async def _aextract(self, stored: StoredMessage) -> None:
+        """Extract entities from a stored message, logging a failure.
+
+        Runs on the bridge loop. NAMS extracts every write server-side, so
+        this does nothing there.
+        """
+        if not self._extract_entities or self._is_nams:
+            return
+        bolt_short_term = cast("ShortTermMemory", self._client.short_term)
+        try:
+            await bolt_short_term.extract_entities_from_message(
+                stored, user_identifier=self._user_id
+            )
+        except Exception as e:
+            logger.warning(
+                "Entity extraction failed for a stored message of session %r. "
+                "The message is stored without entities: %s",
+                self.session_id,
+                e,
+            )
 
     async def _arecord_tool_uses(self, blocks: list[ToolUse]) -> None:
         """Mirror toolUse blocks into reasoning memory. Runs on the bridge loop."""

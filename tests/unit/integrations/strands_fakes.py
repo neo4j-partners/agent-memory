@@ -216,6 +216,8 @@ class FakeShortTerm:
         self.list_conversations_calls: list[dict[str, Any]] = []
         self.get_conversation_calls: int = 0
         self.get_conversation_kwargs: list[dict[str, Any]] = []
+        #: Messages passed to ``extract_entities_from_message``, in call order.
+        self.extracted: list[Message] = []
 
     async def create_conversation(
         self, session_id: str | None = None, **kwargs: Any
@@ -251,6 +253,16 @@ class FakeShortTerm:
         msg = Message(role=MessageRole(role), content=content)
         self.conversations[session_id].messages.append(msg)
         return msg
+
+    async def extract_entities_from_message(
+        self,
+        message: Message,
+        *,
+        extract_relations: bool = True,
+        generate_embedding: bool = True,
+        user_identifier: str | None = None,
+    ) -> None:
+        self.extracted.append(message)
 
     async def bulk_add_messages(
         self,

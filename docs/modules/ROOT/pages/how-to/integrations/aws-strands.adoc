@@ -108,7 +108,7 @@ anchor:_constructor_reference[]
 |`settings` / `memory_client` |`None` |Exactly one. With `settings`, the manager constructs and closes its own client. A `memory_client` must not already be connected on another event loop.
 |`user_id` |`None` |Scopes writes, and the preference lookup used for injection, to one user.
 |`retrieval_config` |`None` |A `Neo4jRetrievalConfig` turns on per-turn context injection. `None` means persistence only.
-|`extract_entities` |`True` |Runs entity extraction on stored messages (Bolt only; NAMS extracts server-side).
+|`extract_entities` |`True` |Runs entity extraction on stored messages (Bolt only; NAMS extracts server-side). Each message is written first and extracted in a separate step. A failed extraction is logged as a warning, and the message stays stored.
 |`record_tool_calls` |`False` |Records observed tool-use blocks in reasoning memory for audit.
 |`request_timeout` |`30.0` |Seconds to wait for each backend call. A write that times out is handled by `on_persist_error`.
 |`restore_limit` |`None` |Maximum messages restored into the agent. `None` uses the backend default; Bolt returns up to 1000.
