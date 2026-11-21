@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Behavior change:** LLM extraction, summarization, and every provider
+  adapter now send no temperature by default, so each model uses its own
+  default. Earlier releases sent `temperature=0.0`. Pass `temperature=0.0`
+  to `LLMEntityExtractor`, or to `complete` and `complete_structured`, to
+  restore the old behavior. `LLMConfig.temperature` also defaults to `None`.
+
 ## [0.8.0] - 2026-10-22
 
 ### Changed

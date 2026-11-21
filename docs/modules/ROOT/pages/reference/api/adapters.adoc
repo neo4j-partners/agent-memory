@@ -110,9 +110,10 @@ def BedrockProvider(
 * Implements `LLMProvider` and `StructuredExtractor`.
 * Uses AWS Bedrock Converse API (works for Anthropic/Titan/Llama under one wrapper).
 * Reads credentials via the boto3 chain (env vars, `~/.aws/credentials`, IAM role, …).
-* `complete_structured` uses Converse `toolConfig` with forced tool choice for Anthropic models; falls back to `schema_aligned_extract` for Titan/Llama.
+* `complete_structured` uses Converse `toolConfig` for Anthropic models. By default it forces the tool choice; `tool_choice` below changes that. Titan and Llama models use `schema_aligned_extract`.
+* Anthropic models are detected by an `anthropic.` id, with or without an inference-profile prefix such as `us.`, `eu.` or `global.`. Model ARNs are checked the same way. An application inference profile ARN does not name its model, so it uses `schema_aligned_extract`.
 * `send_temperature=False` never sends a temperature, even when a caller passes one. A `temperature` of `None` is never sent either way.
-* `tool_choice` controls `complete_structured` on Anthropic models. `None` or `"tool"` forces the `submit_extraction` tool. `"auto"` lets the model choose. When the model answers in text, the provider falls back to `schema_aligned_extract`.
+* `tool_choice` controls `complete_structured` on Anthropic models. `None` or `"tool"` forces the `submit_extraction` tool. `"auto"` lets the model choose. When the model answers in text, the provider parses that text as JSON first. If it does not validate, `schema_aligned_extract` retries, and the first reply counts toward `max_retries`.
 * Claude Sonnet 5.5 and similar models reject both a temperature and a forced tool choice. Construct the provider with `send_temperature=False` and `tool_choice="auto"` for these models.
 
 == `BedrockEmbeddingProvider`
