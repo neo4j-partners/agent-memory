@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Strands hooks are now coroutines that await memory I/O on the manager's
   background loop. A slow write no longer stalls other sessions that share
   the loop. `append_message` now only buffers, and the next hook writes.
+- `Neo4jSessionManager` memory writes now run to completion. Cancelling
+  the agent call, or hitting `request_timeout`, stops only the wait. A
+  turn is no longer cut off mid-write, and inline entity extraction
+  finishes. `close()` and `aclose()` wait for a write that is still
+  running. Writes from hooks, `aclose()`, and a `close()` on another
+  thread run one at a time and keep the message order.
 
 ### Changed
 

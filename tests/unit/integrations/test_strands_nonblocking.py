@@ -10,6 +10,7 @@ A ticker task on the agent's loop must keep ticking while memory I/O runs.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -334,6 +335,114 @@ class TestPersistenceThroughTheAgent:
             assert isinstance(failure.__cause__, TimeoutError)
         finally:
             manager._bridge.close()
+
+
+# ---------------------------------------------------------------------------
+# Writes run to completion, one drain at a time
+# ---------------------------------------------------------------------------
+
+
+def _slowing_client(*delays: float) -> FakeMemoryClient:
+    """A fake client whose Nth add_message sleeps ``delays[N]`` (0 after)."""
+    client = FakeMemoryClient()
+    original = client.short_term.add_message
+    remaining = list(delays)
+
+    async def add(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(remaining.pop(0) if remaining else 0)
+        return await original(*args, **kwargs)
+
+    client.short_term.add_message = add  # type: ignore[method-assign]
+    return client
+
+
+def _buffered(manager: Neo4jSessionManager, *texts: str) -> SimpleNamespace:
+    """Initialize ``manager`` on a bare agent and buffer user ``texts``."""
+    agent = SimpleNamespace(messages=[], agent_id="a1")
+    manager.initialize(agent)
+    for text in texts:
+        manager.append_message({"role": "user", "content": [{"text": text}]}, agent)
+    return agent
+
+
+class TestWritesRunToCompletion:
+    async def test_cancelling_the_caller_mid_write_keeps_the_turn(self) -> None:
+        client = _slow_client(0.3)
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = _agent(manager, [{"text": "A1"}])
+        task = asyncio.create_task(agent.invoke_async("hi"))
+        await asyncio.sleep(0.15)  # the model is done; the user write is in flight
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        await manager.aclose()
+
+        assert _stored(client) == [("user", "hi"), ("assistant", "A1")]
+
+    async def test_a_timeout_does_not_cut_off_extraction(self) -> None:
+        client = FakeMemoryClient()
+        original = client.short_term.add_message
+        steps: list[str] = []
+
+        async def store_then_extract(*args: Any, **kwargs: Any) -> Any:
+            stored = await original(*args, **kwargs)
+            steps.append("stored")
+            await asyncio.sleep(0.5)  # inline entity extraction
+            steps.append("extracted")
+            return stored
+
+        client.short_term.add_message = store_then_extract  # type: ignore[method-assign]
+        manager = Neo4jSessionManager("sess-1", memory_client=client, request_timeout=0.2)
+        agent = _agent(manager, [{"text": "A1"}])
+        try:
+            with pytest.raises(Exception, match="(?s).*"):
+                await agent.invoke_async("hi")
+            deadline = time.monotonic() + 3
+            while len(steps) < 4 and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            assert steps == ["stored", "extracted", "stored", "extracted"]
+            assert _stored(client) == [("user", "hi"), ("assistant", "A1")]
+        finally:
+            with contextlib.suppress(SessionException):
+                await manager.aclose()
+
+    async def test_concurrent_drains_write_in_order(self) -> None:
+        client = _slowing_client(0.3)  # the first write is the slowest
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        _buffered(manager, "one", "two", "three")
+
+        await asyncio.gather(manager._aflush_buffer(), manager._aflush_buffer())
+
+        assert _stored(client) == [("user", "one"), ("user", "two"), ("user", "three")]
+        await manager.aclose()
+
+    async def test_sync_close_racing_a_hook_writes_in_order(self) -> None:
+        client = _slowing_client(0.3)
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        _buffered(manager, "one", "two", "three")
+
+        hook = asyncio.create_task(manager._aflush_ready())  # writes one, two
+        await asyncio.sleep(0.05)
+        await asyncio.to_thread(manager.close)  # writes the rest
+        await hook
+
+        assert _stored(client) == [("user", "one"), ("user", "two"), ("user", "three")]
+
+    async def test_aclose_during_a_turn_keeps_order(self) -> None:
+        client = _slow_client(0.3)
+        manager = Neo4jSessionManager("sess-1", memory_client=client)
+        agent = _agent(manager, [{"text": "A1"}])
+        task = asyncio.create_task(agent.invoke_async("hi"))
+        await asyncio.sleep(0.1)
+
+        await manager.aclose()
+        with contextlib.suppress(Exception):
+            await task
+
+        stored = _stored(client)
+        assert stored[:1] == [("user", "hi")]
+        assert stored in ([("user", "hi")], [("user", "hi"), ("assistant", "A1")])
 
 
 # ---------------------------------------------------------------------------

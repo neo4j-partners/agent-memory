@@ -70,6 +70,19 @@ class AsyncBridge:
                 self._thread.start()
             return self._loop
 
+    def submit(self, coro: Coroutine[Any, Any, T]) -> concurrent.futures.Future[T]:
+        """Schedule ``coro`` on the background loop and return its future.
+
+        Raises:
+            RuntimeError: The bridge is closed. ``coro`` is closed unscheduled.
+        """
+        try:
+            loop = self._ensure_loop()
+        except RuntimeError:
+            coro.close()  # never scheduled; avoid a "never awaited" warning
+            raise
+        return asyncio.run_coroutine_threadsafe(coro, loop)
+
     def run(self, coro: Coroutine[Any, Any, T], timeout: float | None = None) -> T:
         """Submit ``coro`` to the background loop and block for its result.
 
@@ -77,12 +90,7 @@ class AsyncBridge:
         awaited value's real type back (e.g. ``run(client.add_message(...))``
         returns ``Message``, not ``Any``).
         """
-        try:
-            loop = self._ensure_loop()
-        except RuntimeError:
-            coro.close()  # never scheduled; avoid a "never awaited" warning
-            raise
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        future = self.submit(coro)
         return future.result(timeout=timeout if timeout is not None else self._timeout)
 
     async def run_async(self, coro: Coroutine[Any, Any, T], timeout: float | None = None) -> T:
@@ -95,16 +103,25 @@ class AsyncBridge:
         On timeout this raises ``TimeoutError`` and cancels the bridge
         task. Cancelling the caller also cancels the bridge task.
         """
-        try:
-            loop = self._ensure_loop()
-        except RuntimeError:
-            coro.close()  # never scheduled; avoid a "never awaited" warning
-            raise
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return await asyncio.wait_for(
-            asyncio.wrap_future(future),
-            timeout if timeout is not None else self._timeout,
-        )
+        return await self.wait(self.submit(coro), timeout)
+
+    async def wait(
+        self,
+        future: concurrent.futures.Future[T],
+        timeout: float | None = None,
+        *,
+        shield: bool = False,
+    ) -> T:
+        """Await a future from ``submit()`` without blocking the caller's loop.
+
+        On timeout this raises ``TimeoutError``. Without ``shield``, the
+        timeout or cancelling the caller also cancels the bridge task. With
+        ``shield``, only the wait stops, and the task runs to completion.
+        """
+        waiter: asyncio.Future[T] = asyncio.wrap_future(future)
+        if shield:
+            waiter = asyncio.shield(waiter)
+        return await asyncio.wait_for(waiter, timeout if timeout is not None else self._timeout)
 
     def close(self) -> None:
         """Stop and discard the loop thread. Safe to call repeatedly.

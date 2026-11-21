@@ -13,8 +13,11 @@ formatting), and ``integrations.base`` (the sync↔async bridge).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
 import logging
+import threading
+from collections import deque
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -114,6 +117,7 @@ class Neo4jSessionManager(SessionManager):
         self._extract_entities = extract_entities
         self._record_tool_calls = record_tool_calls
         self._restore_limit = restore_limit
+        self._request_timeout = request_timeout
         self._bridge = _AsyncBridge(timeout=request_timeout)
         # True when this manager owns the client lifecycle (settings-constructed
         # client, or when we performed the connect on an externally-supplied client).
@@ -128,7 +132,12 @@ class Neo4jSessionManager(SessionManager):
             self._client = memory_client
         self._conversation_key: str | None = None
         self._pending: StrandsMessage | None = None  # latest message, still redactable
-        self._ready: list[StrandsMessage] = []  # older messages waiting for a hook to write
+        self._ready: deque[StrandsMessage] = deque()  # older messages waiting for a hook to write
+        # _pending and _ready are read and changed on the agent's thread and
+        # on the bridge thread, so every access holds this lock.
+        self._queue_lock = threading.Lock()
+        self._drain_lock: asyncio.Lock | None = None  # bridge loop only; one drain at a time
+        self._inflight: concurrent.futures.Future[None] | None = None  # latest drain
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
@@ -419,11 +428,17 @@ class Neo4jSessionManager(SessionManager):
         moves to the ready queue, which the next hook writes.
         """
         self._check_open()
-        self._release_pending()
-        self._pending = copy.deepcopy(message)
+        latest = copy.deepcopy(message)
+        with self._queue_lock:
+            self._release_pending_locked()
+            self._pending = latest
 
     def _release_pending(self) -> None:
         """Move the slot's message to the ready queue."""
+        with self._queue_lock:
+            self._release_pending_locked()
+
+    def _release_pending_locked(self) -> None:
         if self._pending is not None:
             self._ready.append(self._pending)
             self._pending = None
@@ -443,13 +458,15 @@ class Neo4jSessionManager(SessionManager):
         log a warning.
         """
         self._check_open()
-        if self._pending is not None:
-            self._pending = copy.deepcopy(redact_message)
-            return
-        if self._ready:
-            # Seeded by initialize() after aopen() and not written yet.
-            self._ready[-1] = copy.deepcopy(redact_message)
-            return
+        redacted = copy.deepcopy(redact_message)
+        with self._queue_lock:
+            if self._pending is not None:
+                self._pending = redacted
+                return
+            if self._ready:
+                # Seeded by initialize() after aopen() and not written yet.
+                self._ready[-1] = redacted
+                return
         if self._last_persisted is None:
             logger.warning(
                 "redact_latest_message called for session %s but no message "
@@ -488,20 +505,14 @@ class Neo4jSessionManager(SessionManager):
         ``_aflush_buffer`` instead. Raises SessionException on failure.
         """
         self._release_pending()
-        while self._ready:
-            message = self._ready.pop(0)
-            if blocks := self._tool_uses(message):
-                try:
-                    self._bridge.run(self._arecord_tool_uses(blocks))
-                except Exception as e:
-                    logger.warning("Failed to mirror tool calls to reasoning memory: %s", e)
-            if text := _message_text(message):
-                try:
-                    self._store_message(message["role"], text, extract=self._extract_entities)
-                except Exception as e:
-                    raise SessionException(
-                        f"Failed to persist message for session {self.session_id!r}"
-                    ) from e
+        try:
+            future = self._submit_drain()
+            if future is not None:
+                future.result(timeout=self._request_timeout)
+        except Exception as e:
+            raise SessionException(
+                f"Failed to persist message for session {self.session_id!r}"
+            ) from e
 
     async def _aflush_buffer(self) -> None:
         """Persist every buffered message without blocking the caller's loop."""
@@ -511,25 +522,91 @@ class Neo4jSessionManager(SessionManager):
     async def _aflush_ready(self) -> None:
         """Persist the ready queue in order, leaving the latest message buffered.
 
-        Raises SessionException on failure. Messages after the failed one
-        stay queued.
+        The write runs on the bridge and is shielded: cancelling the caller,
+        or a timeout, stops only the wait. The write itself runs to
+        completion, and ``close()`` waits for it.
+
+        Raises SessionException on failure. The failed message is lost, and
+        messages after it stay queued.
         """
-        while self._ready:
-            message = self._ready.pop(0)
-            if blocks := self._tool_uses(message):
-                try:
-                    await self._bridge.run_async(self._arecord_tool_uses(blocks))
-                except Exception as e:
-                    logger.warning("Failed to mirror tool calls to reasoning memory: %s", e)
-            if text := _message_text(message):
-                try:
-                    self._last_persisted = await self._bridge.run_async(
-                        self._aadd_message(message["role"], text, extract=self._extract_entities)
-                    )
-                except Exception as e:
-                    raise SessionException(
-                        f"Failed to persist message for session {self.session_id!r}"
-                    ) from e
+        try:
+            future = self._submit_drain()
+            if future is not None:
+                await self._bridge.wait(future, shield=True)
+        except Exception as e:
+            raise SessionException(
+                f"Failed to persist message for session {self.session_id!r}"
+            ) from e
+
+    def _submit_drain(self) -> concurrent.futures.Future[None] | None:
+        """Start a drain of the ready queue on the bridge, or None if it is empty."""
+        with self._queue_lock:
+            if not self._ready:
+                return None
+            future = self._bridge.submit(self._adrain())
+            self._inflight = future
+            return future
+
+    async def _adrain(self) -> None:
+        """Write the ready queue in order. Runs on the bridge loop.
+
+        One drain runs at a time, so concurrent flushes (a hook, ``aclose()``
+        and a sync ``close()`` on another thread) cannot reorder or
+        double-write messages. A message leaves the queue only once its
+        write has finished.
+        """
+        if self._drain_lock is None:
+            self._drain_lock = asyncio.Lock()
+        async with self._drain_lock:
+            while True:
+                with self._queue_lock:
+                    if not self._ready:
+                        return
+                    message = self._ready[0]
+                if text := _message_text(message):
+                    try:
+                        self._last_persisted = await self._aadd_message(
+                            message["role"], text, extract=self._extract_entities
+                        )
+                    except BaseException:
+                        with self._queue_lock:
+                            self._ready.popleft()
+                        raise
+                with self._queue_lock:
+                    self._ready.popleft()
+                if blocks := self._tool_uses(message):
+                    try:
+                        await self._arecord_tool_uses(blocks)
+                    except Exception as e:
+                        logger.warning("Failed to mirror tool calls to reasoning memory: %s", e)
+
+    def _wait_for_inflight(self) -> None:
+        """Let the latest drain finish before the client closes. Blocking."""
+        future = self._inflight
+        if future is None:
+            return
+        try:
+            future.result(timeout=self._request_timeout)
+        except TimeoutError:
+            logger.warning(
+                "A memory write for session %r was still running at close.", self.session_id
+            )
+        except Exception:  # noqa: S110 - the flush that started it already reported it
+            pass
+
+    async def _await_inflight(self) -> None:
+        """Like ``_wait_for_inflight``, without blocking the caller's loop."""
+        future = self._inflight
+        if future is None:
+            return
+        try:
+            await self._bridge.wait(future, shield=True)
+        except TimeoutError:
+            logger.warning(
+                "A memory write for session %r was still running at close.", self.session_id
+            )
+        except Exception:  # noqa: S110 - the flush that started it already reported it
+            pass
 
     def _tool_uses(self, message: StrandsMessage) -> list[ToolUse]:
         """The toolUse blocks to mirror into reasoning memory, if enabled.
@@ -584,6 +661,7 @@ class Neo4jSessionManager(SessionManager):
             await self._aflush_buffer()
         finally:
             try:
+                await self._await_inflight()
                 if self._should_close_client and self._client.is_connected:
                     await self._bridge.run_async(self._client.close())
             finally:
@@ -598,6 +676,7 @@ class Neo4jSessionManager(SessionManager):
             self._flush_buffer()
         finally:
             try:
+                self._wait_for_inflight()
                 if self._should_close_client and self._client.is_connected:
                     self._bridge.run(self._client.close())
             finally:
