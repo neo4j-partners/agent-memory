@@ -1395,22 +1395,24 @@ class ShortTermMemory(BaseMemory[Message], ShortTermProtocol):
 
         The previous message is linked to the next one, and the
         conversation's FIRST_MESSAGE moves to the next message when the
-        first message is deleted. Entities, reasoning traces, and tool calls
-        are never deleted.
+        first message is deleted. Only the message node is deleted, never
+        the entities, reasoning traces, tool calls, or other nodes it links
+        to.
 
         Args:
             message_id: The message UUID to delete
-            cascade: If True, also remove the message's MENTIONS,
-                EXTRACTED_FROM, INITIATED_BY, and TRIGGERED_BY
-                relationships. If False, a message with any of them is
-                left unchanged and ValueError is raised.
+            cascade: If True, also remove every relationship of the message
+                other than HAS_MESSAGE, NEXT_MESSAGE, and FIRST_MESSAGE,
+                such as MENTIONS or EXTRACTED_FROM. If False, a message with
+                any such relationship is left unchanged and ValueError is
+                raised.
 
         Returns:
             True if message was deleted, False if not found
 
         Raises:
-            ValueError: If ``cascade`` is False and the message still has
-                entity or reasoning relationships.
+            ValueError: If ``cascade`` is False and the message has a
+                relationship other than the conversation chain links.
         """
         if isinstance(message_id, str):
             try:

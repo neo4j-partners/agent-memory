@@ -124,7 +124,7 @@ There are no public `get_messages` or `get_message` methods. Read the conversati
 
 Delete one message and relink the conversation around it. The previous message is linked to the next one. When the first message is deleted, the conversation's `:FIRST_MESSAGE` moves to the next message. Returns `False` for an ID that is not a UUID or matches no message. Not supported on NAMS.
 
-`cascade=True` also removes the message's `:MENTIONS`, `:EXTRACTED_FROM`, `:INITIATED_BY`, and `:TRIGGERED_BY` relationships. With `cascade=False`, a message that has any of them is left unchanged and the call raises `ValueError`. Entities, reasoning traces, and tool calls are never deleted. To remove a whole conversation, use xref:reference/api/short-term-sessions.adoc#_clear_session[`clear_session`].
+`cascade=True` also removes every other relationship of the message, such as `:MENTIONS`, `:EXTRACTED_FROM`, `:INITIATED_BY`, `:TRIGGERED_BY`, or an application's own relationship types. With `cascade=False`, a message that has any relationship besides `:HAS_MESSAGE`, `:NEXT_MESSAGE`, and `:FIRST_MESSAGE` is left unchanged, and the call raises `ValueError` naming the relationship types. Only the message node is deleted. Entities, reasoning traces, tool calls, and other linked nodes stay. To remove a whole conversation, use xref:reference/api/short-term-sessions.adoc#_clear_session[`clear_session`].
 
 // contract: memory/short_term.py:ShortTermMemory.delete_message
 [source,python]
@@ -136,7 +136,7 @@ async def delete_message(message_id: UUID | str, *, cascade: bool=True) -> bool:
 |===
 | Parameter | Description
 | `message_id` | The message UUID to delete
-| `cascade` | If True, also remove the message's entity and reasoning relationships. If False, a message with any of them raises `ValueError` and is not deleted.
+| `cascade` | If True, also remove the message's relationships outside the conversation chain. If False, a message with any of them raises `ValueError` and is not deleted.
 |===
 
 anchor:_extraction_status_nams[]

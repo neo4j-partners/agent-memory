@@ -229,13 +229,14 @@ ORDER BY score DESC
 
 # Delete one message and close the gap it leaves in the conversation chain.
 # The predecessor is linked to the successor, and FIRST_MESSAGE moves to the
-# successor when the head is deleted. Entity and reasoning links are dropped
-# with the message when $cascade is true. When $cascade is false, a message
-# that still has such links is left unchanged, and `blocking` names the link
-# types. No row is returned when the id matches no message.
+# successor when the head is deleted. Every other relationship of the message
+# is dropped with it when $cascade is true. When $cascade is false, a message
+# that has any other relationship is left unchanged, and `blocking` names the
+# relationship types. No row is returned when the id matches no message.
 DELETE_MESSAGE = """
 MATCH (m:Message {id: $id})
-OPTIONAL MATCH (m)-[r:MENTIONS|EXTRACTED_FROM|INITIATED_BY|TRIGGERED_BY]-()
+OPTIONAL MATCH (m)-[r]-()
+WHERE NOT type(r) IN ['HAS_MESSAGE', 'NEXT_MESSAGE', 'FIRST_MESSAGE']
 WITH m, collect(DISTINCT type(r)) AS blocking
 WITH m, blocking, ($cascade OR size(blocking) = 0) AS deleted
 // Take the conversation write lock before reading the neighbours, as

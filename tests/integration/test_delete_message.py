@@ -96,6 +96,8 @@ _LINKS = {
     "EXTRACTED_FROM": ("Entity", "(x)-[:EXTRACTED_FROM]->(m)"),
     "INITIATED_BY": ("ReasoningTrace", "(x)-[:INITIATED_BY]->(m)"),
     "TRIGGERED_BY": ("ToolCall", "(x)-[:TRIGGERED_BY]->(m)"),
+    # An application's own relationship type, unknown to the library.
+    "FLAGGED_BY": ("Review", "(m)-[:FLAGGED_BY]->(x)"),
 }
 
 
