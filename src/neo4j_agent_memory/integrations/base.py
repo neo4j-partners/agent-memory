@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import threading
 from collections.abc import Callable, Coroutine
 from functools import wraps
@@ -21,6 +22,11 @@ T = TypeVar("T")
 _executor: concurrent.futures.ThreadPoolExecutor | None = None
 _EXECUTOR_MAX_WORKERS = 4
 _SYNC_TIMEOUT_SECONDS = 30
+
+#: How long AsyncBridge shutdown lets cancelled tasks unwind.
+_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+_CLOSED_IN_FLIGHT = "AsyncBridge closed with work in flight"
 
 
 class AsyncBridge:
@@ -42,6 +48,12 @@ class AsyncBridge:
     transports bound to the old loop. ``run_async()`` behaves the same way.
     A thread that died without ``close()`` is still restarted on the next
     ``run()`` or ``run_async()``.
+
+    When the loop stops, its thread shuts it down the way ``asyncio.run``
+    does. It cancels the tasks still pending, gives them
+    ``_SHUTDOWN_TIMEOUT_SECONDS`` to unwind, shuts down async generators and
+    the default executor, and closes the loop. A caller still waiting on
+    cancelled work gets ``RuntimeError`` rather than ``CancelledError``.
     """
 
     def __init__(self, timeout: float = 30.0) -> None:
@@ -50,6 +62,10 @@ class AsyncBridge:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._closed = False
+        # Futures from submit() that are not done yet. Shutdown cancels any
+        # whose task never started, so no caller waits on them forever.
+        self._futures: set[concurrent.futures.Future[Any]] = set()
+        self._futures_lock = threading.Lock()
 
     @property
     def closed(self) -> bool:
@@ -63,12 +79,38 @@ class AsyncBridge:
             if self._loop is None or self._thread is None or not self._thread.is_alive():
                 self._loop = asyncio.new_event_loop()
                 self._thread = threading.Thread(
-                    target=self._loop.run_forever,
+                    target=self._run_loop,
+                    args=(self._loop,),
                     name="neo4j-strands-session-manager",
                     daemon=True,
                 )
                 self._thread.start()
             return self._loop
+
+    def _run_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Loop thread body: run until stopped, then shut down like ``asyncio.run``."""
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_forever()
+        finally:
+            try:
+                tasks = asyncio.all_tasks(loop)
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    loop.run_until_complete(asyncio.wait(tasks, timeout=_SHUTDOWN_TIMEOUT_SECONDS))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.run_until_complete(loop.shutdown_default_executor())
+            finally:
+                loop.close()
+                with self._futures_lock:
+                    stranded = [f for f in self._futures if not f.done()]
+                for future in stranded:
+                    future.cancel()
+
+    def _forget(self, future: concurrent.futures.Future[Any]) -> None:
+        with self._futures_lock:
+            self._futures.discard(future)
 
     def submit(self, coro: Coroutine[Any, Any, T]) -> concurrent.futures.Future[T]:
         """Schedule ``coro`` on the background loop and return its future.
@@ -81,7 +123,15 @@ class AsyncBridge:
         except RuntimeError:
             coro.close()  # never scheduled; avoid a "never awaited" warning
             raise
-        return asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError as e:  # the loop closed after _ensure_loop returned
+            coro.close()
+            raise RuntimeError("AsyncBridge is closed") from e
+        with self._futures_lock:
+            self._futures.add(future)
+        future.add_done_callback(self._forget)
+        return future
 
     def run(self, coro: Coroutine[Any, Any, T], timeout: float | None = None) -> T:
         """Submit ``coro`` to the background loop and block for its result.
@@ -91,7 +141,10 @@ class AsyncBridge:
         returns ``Message``, not ``Any``).
         """
         future = self.submit(coro)
-        return future.result(timeout=timeout if timeout is not None else self._timeout)
+        try:
+            return future.result(timeout=timeout if timeout is not None else self._timeout)
+        except concurrent.futures.CancelledError as e:
+            raise RuntimeError(_CLOSED_IN_FLIGHT) from e
 
     async def run_async(self, coro: Coroutine[Any, Any, T], timeout: float | None = None) -> T:
         """Submit ``coro`` to the background loop and await its result.
@@ -117,39 +170,46 @@ class AsyncBridge:
         On timeout this raises ``TimeoutError``. Without ``shield``, the
         timeout or cancelling the caller also cancels the bridge task. With
         ``shield``, only the wait stops, and the task runs to completion.
+
+        Raises:
+            RuntimeError: The bridge shut down and cancelled the task.
         """
         waiter: asyncio.Future[T] = asyncio.wrap_future(future)
         if shield:
             waiter = asyncio.shield(waiter)
-        return await asyncio.wait_for(waiter, timeout if timeout is not None else self._timeout)
+        try:
+            return await asyncio.wait_for(waiter, timeout if timeout is not None else self._timeout)
+        except asyncio.CancelledError as e:
+            task = asyncio.current_task()
+            if future.cancelled() and (task is None or not task.cancelling()):
+                raise RuntimeError(_CLOSED_IN_FLIGHT) from e
+            raise
 
     def close(self) -> None:
-        """Stop and discard the loop thread. Safe to call repeatedly.
+        """Stop the loop and join its thread. Safe to call repeatedly.
 
-        Callers with a ``run()`` in flight will block until their own
-        timeout fires. Drain in-flight work before closing (the session
-        manager flushes its buffer first, which guarantees this).
+        The loop thread then cancels the work still in flight, lets it
+        unwind, and closes the loop. Callers waiting on that work get
+        ``RuntimeError``. Drain work you need before closing (the session
+        manager waits for its writes first).
 
-        If the loop thread does not stop within the join timeout we do NOT
-        call ``loop.close()`` — closing a still-running loop raises
-        ``RuntimeError``. The thread is a daemon, so we drop our references
-        and let it unwind on its own rather than leave the bridge in a
-        half-closed state. References are always reset, and the bridge is
-        marked closed so a later ``run()`` raises instead of restarting.
+        If the thread does not finish within the join timeout, we drop our
+        references and let the daemon thread finish its shutdown on its
+        own. The bridge is always marked closed, so a later ``run()``
+        raises instead of restarting.
         """
         with self._lock:
             self._closed = True
             loop = self._loop
             thread = self._thread
-            if loop is None:
-                return
-            loop.call_soon_threadsafe(loop.stop)
-            if thread is not None:
-                thread.join(timeout=5)
-            if thread is None or not thread.is_alive():
-                loop.close()
             self._loop = None
             self._thread = None
+            if loop is None or thread is None or not thread.is_alive():
+                return
+            with contextlib.suppress(RuntimeError):  # its thread closed it already
+                loop.call_soon_threadsafe(loop.stop)
+            if thread is not threading.current_thread():
+                thread.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS + 5)
 
 
 def _get_executor() -> concurrent.futures.ThreadPoolExecutor:

@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finishes. `close()` and `aclose()` wait for a write that is still
   running. Writes from hooks, `aclose()`, and a `close()` on another
   thread run one at a time and keep the message order.
+- `AsyncBridge.close()` now shuts its loop down the way `asyncio.run`
+  does. Pending tasks are cancelled and get 5 seconds to unwind, so their
+  cleanup code runs. The loop thread closes its own loop. A caller still
+  waiting on cancelled work gets `RuntimeError`, not a bare
+  `CancelledError`, and a `run()` in flight no longer waits for its
+  timeout.
 
 ### Changed
 

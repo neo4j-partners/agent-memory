@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import json
+import logging
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable
@@ -214,6 +216,83 @@ class TestBridgeRunAsync:
             bridge.close()
 
 
+def _destroyed_pending(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """asyncio's "Task was destroyed but it is pending!" reports, after a GC pass."""
+    gc.collect()
+    return [r.getMessage() for r in caplog.records if "Task was destroyed" in r.getMessage()]
+
+
+class TestBridgeShutdown:
+    def test_close_lets_pending_tasks_unwind(self, caplog: pytest.LogCaptureFixture) -> None:
+        bridge = AsyncBridge(timeout=0.05)
+        cleaned = threading.Event()
+
+        async def stuck() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)  # cleanup that itself awaits
+                cleaned.set()
+
+        with pytest.raises(TimeoutError):
+            bridge.run(stuck())  # a run() timeout leaves the task pending
+        loop = bridge._loop
+        assert loop is not None
+
+        with caplog.at_level(logging.ERROR, logger="asyncio"):
+            bridge.close()
+            assert cleaned.is_set()
+            assert loop.is_closed()
+            assert _destroyed_pending(caplog) == []
+
+    def test_run_in_flight_at_close_raises_runtime_error(self) -> None:
+        bridge = AsyncBridge(timeout=5)
+        outcome: list[BaseException] = []
+
+        def call() -> None:
+            try:
+                bridge.run(asyncio.sleep(5))
+            except BaseException as e:  # noqa: BLE001 - recorded for the assertion
+                outcome.append(e)
+
+        caller = threading.Thread(target=call)
+        caller.start()
+        time.sleep(0.1)
+        bridge.close()
+        caller.join(timeout=2)
+
+        assert not caller.is_alive()
+        assert len(outcome) == 1
+        assert isinstance(outcome[0], RuntimeError)
+        assert "work in flight" in str(outcome[0])
+
+    @pytest.mark.parametrize("shield", [False, True], ids=["plain", "shielded"])
+    async def test_bridge_side_cancel_reaches_the_caller_as_runtime_error(
+        self, shield: bool
+    ) -> None:
+        bridge = AsyncBridge(timeout=5)
+        future = bridge.submit(asyncio.sleep(5))
+        waiter = asyncio.create_task(bridge.wait(future, shield=shield))
+        await asyncio.sleep(0.1)
+        try:
+            await asyncio.to_thread(bridge.close)
+            with pytest.raises(RuntimeError, match="work in flight"):
+                await waiter
+        finally:
+            await asyncio.to_thread(bridge.close)
+
+    async def test_cancelling_the_caller_still_raises_cancelled_error(self) -> None:
+        bridge = AsyncBridge(timeout=5)
+        try:
+            waiter = asyncio.create_task(bridge.run_async(asyncio.sleep(5)))
+            await asyncio.sleep(0.1)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        finally:
+            await asyncio.to_thread(bridge.close)
+
+
 # ---------------------------------------------------------------------------
 # Hooks run off the agent's loop
 # ---------------------------------------------------------------------------
@@ -320,7 +399,9 @@ class TestPersistenceThroughTheAgent:
             manager.close()
         assert _stored(client) == [("user", "one"), ("assistant", "two")]
 
-    async def test_write_timeout_surfaces_session_exception_without_hanging(self) -> None:
+    async def test_write_timeout_surfaces_session_exception_without_hanging(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         client = _slow_client(5)
         manager = Neo4jSessionManager("sess-1", memory_client=client, request_timeout=0.1)
         agent = _agent(manager, [{"text": "Hello!"}])
@@ -334,7 +415,10 @@ class TestPersistenceThroughTheAgent:
             failure = next(e for e in chain if isinstance(e, SessionException))
             assert isinstance(failure.__cause__, TimeoutError)
         finally:
-            manager._bridge.close()
+            with caplog.at_level(logging.ERROR, logger="asyncio"):
+                with contextlib.suppress(SessionException):
+                    await manager.aclose()  # the write still runs; close cancels it
+                assert _destroyed_pending(caplog) == []
 
 
 # ---------------------------------------------------------------------------
