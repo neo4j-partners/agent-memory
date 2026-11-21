@@ -214,6 +214,7 @@ class Neo4jSessionManager(SessionManager):
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
         self._tool_record: asyncio.Task[None] | None = None  # latest mirroring; bridge loop only
+        self._tool_records_running = 0  # mirroring tasks not yet finished; bridge loop only
         self._closed = False
         self._closing: concurrent.futures.Future[None] | None = None  # done when close ends
         self._warned_double_injection = False
@@ -1033,6 +1034,7 @@ class Neo4jSessionManager(SessionManager):
         previous = self._tool_record
         task = asyncio.ensure_future(self._arecord_after(previous, blocks))
         self._tool_record = task
+        self._tool_records_running += 1
         await asyncio.shield(task)
 
     async def _arecord_after(
@@ -1041,13 +1043,23 @@ class Neo4jSessionManager(SessionManager):
         """Wait for the ``previous`` recording, then record ``blocks``.
 
         The error is logged here, since the waiter may have stopped waiting.
+        A cancellation, which only closing the bridge causes, is logged too.
         """
-        if previous is not None:
-            await asyncio.wait({previous})
         try:
+            if previous is not None:
+                await asyncio.wait({previous})
             await self._arecord_blocks(blocks)
+        except asyncio.CancelledError:
+            logger.warning(
+                "Mirroring of tool calls of session %r to reasoning memory was "
+                "cancelled, so some of them are not recorded.",
+                self.session_id,
+            )
+            raise
         except Exception as e:
             logger.warning("Failed to mirror tool calls to reasoning memory: %s", _describe(e))
+        finally:
+            self._tool_records_running -= 1
 
     async def _arecord_blocks(self, blocks: list[ToolUse]) -> None:
         """Record each block as a step and its tool call, starting the trace once."""
@@ -1062,6 +1074,37 @@ class Neo4jSessionManager(SessionManager):
                 trace_id, thought=f"Tool use: {name}", action=name
             )
             await self._client.reasoning.record_tool_call(step.id, name, block.get("input") or {})
+
+    def _tool_records_bound(self) -> float | None:
+        """How long close waits for tool-call mirroring, the drain timeout.
+
+        Returns None when no recording has started. ``_tool_record`` is read
+        off the loop here. It only ever changes from None to a task, so None
+        means there is nothing to wait for. The caller's wait on the bridge
+        adds one ``request_timeout`` to cover scheduling.
+        """
+        if self._tool_record is None:
+            return None
+        return self._drain_timeout()
+
+    async def _await_tool_records(self, timeout: float) -> None:
+        """Wait up to ``timeout`` for tool-call mirroring. Runs on the bridge loop.
+
+        Each recording waits for the one before it, so the latest finishing
+        means all have. Closing the bridge cancels any still running, so a
+        warning names how many.
+        """
+        task = self._tool_record
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=timeout)
+        if self._tool_records_running:
+            logger.warning(
+                "Closing session %r while %d tool-call recording(s) are still "
+                "running after %ss. They are cancelled.",
+                self.session_id,
+                self._tool_records_running,
+                timeout,
+            )
 
     def _begin_close(self) -> concurrent.futures.Future[None] | None:
         """Mark the manager closed and return the future this close completes.
@@ -1093,6 +1136,13 @@ class Neo4jSessionManager(SessionManager):
                 await self._aflush_buffer()
             except BaseException as e:
                 failure = e
+            try:
+                if (bound := self._tool_records_bound()) is not None:
+                    await self._bridge.run_async(
+                        self._await_tool_records(bound), bound + self._request_timeout
+                    )
+            except BaseException as e:
+                failure = self._first_failure(failure, e, "wait for tool-call mirroring")
             try:
                 if self._should_close_client and self._client.is_connected:
                     await self._bridge.run_async(self._client.close())
@@ -1132,6 +1182,11 @@ class Neo4jSessionManager(SessionManager):
                 self._flush_buffer()
             except BaseException as e:
                 failure = e
+            try:
+                if (bound := self._tool_records_bound()) is not None:
+                    self._bridge.run(self._await_tool_records(bound), bound + self._request_timeout)
+            except BaseException as e:
+                failure = self._first_failure(failure, e, "wait for tool-call mirroring")
             try:
                 if self._should_close_client and self._client.is_connected:
                     self._bridge.run(self._client.close())

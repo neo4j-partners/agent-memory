@@ -863,6 +863,56 @@ class TestToolMirroringOutlivesItsWait:
         assert [s["action"] for s in reasoning.steps] == ["lookup", "fetch", "search"]
         assert [c["step_id"] for c in reasoning.tool_calls] == [s["id"] for s in reasoning.steps]
 
+    @staticmethod
+    async def _close(manager: Neo4jSessionManager, how: str) -> None:
+        if how == "aclose":
+            await manager.aclose()
+        else:
+            await asyncio.to_thread(manager.close)
+
+    @pytest.mark.parametrize("how", ["aclose", "close"])
+    async def test_close_waits_for_mirroring_that_outlived_the_drain(self, how: str) -> None:
+        client = FakeMemoryClient()
+        _commits_then_waits(client.reasoning, "add_step", 0.3)
+        manager = Neo4jSessionManager(
+            "sess-1",
+            memory_client=client,
+            request_timeout=0.2,
+            extract_entities=False,
+            record_tool_calls=True,
+        )
+        agent = _buffered(manager)
+        _uses_tools(manager, agent, "lookup")
+        await manager._aflush_ready()  # the wait runs out while the step replies
+        await self._close(manager, how)  # waits up to 0.4 s; the step replies at 0.3 s
+
+        assert len(client.reasoning.tool_calls) == 1
+
+    @pytest.mark.parametrize("how", ["aclose", "close"])
+    async def test_close_warns_about_the_mirroring_it_cancels(
+        self, how: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        _commits_then_waits(client.reasoning, "add_step", 5)
+        manager = Neo4jSessionManager(
+            "sess-1",
+            memory_client=client,
+            request_timeout=0.2,
+            extract_entities=False,
+            record_tool_calls=True,
+        )
+        agent = _buffered(manager)
+        _uses_tools(manager, agent, "lookup")
+        _uses_tools(manager, agent, "search")
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            await manager._aflush_ready()
+            await self._close(manager, how)
+
+        assert client.reasoning.tool_calls == []
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("2 tool-call recording(s)" in m for m in messages)
+        assert sum("was cancelled" in m for m in messages) == 2
+
 
 class TestDrainCoalescing:
     """A flush joins the running drain instead of queuing another."""

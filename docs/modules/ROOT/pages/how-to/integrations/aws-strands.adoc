@@ -123,7 +123,7 @@ The manager's hooks run on the agent's event loop and await memory I/O on the ma
 
 Strands calls `initialize` synchronously while it builds the `Agent`, so by default the history load blocks. In async code, await `aopen()` before you build the agent. The manager then restores the preloaded history with no I/O. Close with `await manager.aclose()` instead of `close()`, so the final write and the client close are awaited too.
 
-A close runs every step even after one fails. It writes the queue, closes an owned client, then stops the background loop. It raises the first error. An error from a later step is logged as an ERROR instead.
+A close runs every step even after one fails. It writes the queue, waits for tool-call mirroring still running, closes an owned client, then stops the background loop. The wait for mirroring is bounded like the wait for the queue. Recordings still running after it are cancelled, and a warning says how many. It raises the first error. An error from a later step is logged as an ERROR instead.
 
 [source,python]
 ----
