@@ -660,6 +660,18 @@ class TestInitialize:
         finally:
             manager.close()
 
+    def test_an_agent_that_cannot_be_weakly_referenced_fails_before_any_change(self) -> None:
+        from types import SimpleNamespace
+
+        manager, client = _make_manager(nams_mode=False)
+        try:
+            agent = SimpleNamespace(messages=[{"role": "user", "content": [{"text": "seeded"}]}])
+            with pytest.raises(TypeError):
+                manager.initialize(agent)
+            assert "sess-1" not in client.short_term.conversations
+        finally:
+            manager.close()
+
     def test_initialize_wraps_backend_errors_in_session_exception(self) -> None:
         from strands.types.exceptions import SessionException
 

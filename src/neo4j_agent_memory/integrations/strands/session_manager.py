@@ -525,8 +525,11 @@ class Neo4jSessionManager(SessionManager):
             SessionException: The manager is closed, loading failed, or the
                 manager already serves another Agent. One manager tracks
                 one Agent's turns, so a second Agent would discard them.
+            TypeError: ``agent`` cannot be weakly referenced. Nothing has
+                changed then.
         """
         self._check_open()
+        agent_ref = weakref.ref(agent)  # first, so a TypeError comes before any change
         attached = self._agent_ref() if self._agent_ref is not None else None
         if attached is not None and attached is not agent:
             raise SessionException(
@@ -566,7 +569,7 @@ class Neo4jSessionManager(SessionManager):
                 self._release_turn()
             else:
                 self._flush_buffer()
-        self._agent_ref = weakref.ref(agent)
+        self._agent_ref = agent_ref
 
     def _drop_freed_agents_turn(self) -> None:
         """Drop the turn that a freed Agent left open.
