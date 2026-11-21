@@ -53,6 +53,13 @@ _APPROVAL_TURN = [
 ]
 
 
+@tool(context=True)
+def abort(tool_context: ToolContext) -> str:
+    """Stop the agent now."""
+    tool_context.agent.cancel()
+    return "aborting"
+
+
 class TestASuccessfulTurn:
     async def test_nothing_is_written_until_the_turn_ends(self) -> None:
         client = FakeMemoryClient()
@@ -170,6 +177,68 @@ class TestATurnWithoutAResult:
         finally:
             await manager.aclose()
         assert _stored(client) == []
+
+    async def test_agent_cancel_stores_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        turn = [
+            {"text": "Stopping."},
+            {"toolUse": {"toolUseId": "t1", "name": "abort", "input": {}}},
+        ]
+        agent = Agent(
+            model=ScriptedModel(turn),
+            tools=[abort],
+            session_manager=manager,
+            callback_handler=None,
+        )
+        try:
+            with caplog.at_level(logging.INFO, logger=_LOGGER):
+                result = await agent.invoke_async("hi")
+        finally:
+            await manager.aclose()
+
+        assert result.stop_reason == "cancelled"
+        assert _stored(client) == []
+        (info,) = _records(caplog, "INFO")
+        assert "cancelled" in info
+        assert "3 message" in info  # the prompt, the tool call, and its result
+
+
+class TestAStopThatAnswers:
+    async def test_the_stop_tool_writes_the_turn(self) -> None:
+        stop_module = pytest.importorskip("strands.vended_tools.stop")
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        turn = [{"toolUse": {"toolUseId": "t1", "name": "stop", "input": {"message": "Bye."}}}]
+        agent = Agent(
+            model=ScriptedModel(turn),
+            tools=[stop_module.stop],
+            session_manager=manager,
+            callback_handler=None,
+        )
+        try:
+            result = await agent.invoke_async("hi")
+        finally:
+            await manager.aclose()
+
+        assert result.stop_reason == "cancelled"
+        assert _stored(client) == [("user", "hi"), ("assistant", "Bye.")]
+
+    @pytest.mark.parametrize(
+        "stop_reason",
+        ["limit_turns", "limit_total_tokens", "limit_output_tokens", "max_tokens", "cancelled"],
+    )
+    async def test_a_result_without_a_cancel_signal_writes_the_turn(self, stop_reason: str) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        agent = _buffered(manager)
+        try:
+            await manager._on_before_invocation(turn_ended(agent))
+            manager.append_message({"role": "user", "content": [{"text": "Q1"}]}, agent)
+            await manager._on_after_invocation(turn_ended(agent, stop_reason))
+        finally:
+            await manager.aclose()
+        assert _stored(client) == [("user", "Q1")]
 
 
 class TestAnInterruptedTurn:

@@ -98,6 +98,18 @@ class _Queued:
     written: StrandsMessage | None = None
 
 
+def _cancel_requested(agent: Agent | None) -> bool:
+    """True when ``agent.cancel()`` or its ``cancel_signal`` stopped the call.
+
+    The ``stop`` tool also ends a call with stop reason ``"cancelled"``,
+    but it leaves the signal clear. Strands clears the signal after the
+    AfterInvocationEvent hooks run. Strands 1.52 keeps the signal private,
+    and every cancel there sets it.
+    """
+    signal = getattr(agent, "cancel_signal", None) or getattr(agent, "_cancel_signal", None)
+    return isinstance(signal, threading.Event) and signal.is_set()
+
+
 def _describe(error: BaseException) -> str:
     """The error's message, or its type name when it has none (TimeoutError)."""
     return str(error) or type(error).__name__
@@ -506,11 +518,17 @@ class Neo4jSessionManager(SessionManager):
         """End the turn, and write it if it succeeded.
 
         A result with stop reason ``"interrupt"`` pauses the turn. Its
-        messages stay buffered for the call that resumes it. Any other
-        result means the turn succeeded, so its messages are written in
-        order. No result means the agent call raised or a hook cancelled
+        messages stay buffered for the call that resumes it. No result
+        means the agent call raised or a BeforeInvocationEvent hook
+        cancelled it. Stop reason ``"cancelled"`` with the agent's cancel
+        signal set means ``agent.cancel()`` or a ``cancel_signal`` stopped
         it. The turn's messages are then discarded with an INFO log, so a
-        failed turn never stores a prompt without its reply. Strands owns
+        failed turn never stores a prompt without its reply.
+
+        Any other result means the turn succeeded, so its messages are
+        written in order. That covers the ``limit_*`` stop reasons, since
+        the caller got an answer. It also covers the ``stop`` tool, which
+        cancels without setting the signal. Strands owns
         ``agent.messages``, so this leaves it alone.
 
         Strands fires this from its ``finally``, so it also runs when a
@@ -520,10 +538,10 @@ class Neo4jSessionManager(SessionManager):
         ``"raise"`` raises SessionException. ``"warn"`` logs one ERROR with
         their number, as for any other write that fails at close.
         """
-        discarded, turn = self._end_turn(event.result)
+        discarded, turn = self._end_turn(event.agent, event.result)
         if discarded:
             logger.info(
-                "Session %r: the agent call ended without a result, so its "
+                "Session %r: the agent call raised or was cancelled, so its "
                 "turn's %d message(s) were not written.",
                 self.session_id,
                 discarded,
@@ -543,12 +561,13 @@ class Neo4jSessionManager(SessionManager):
             return
         await self._aflush_ready(ends_turn=turn)
 
-    def _end_turn(self, result: AgentResult | None) -> tuple[int, int]:
+    def _end_turn(self, agent: Agent | None, result: AgentResult | None) -> tuple[int, int]:
         """Queue, keep, or discard the turn by its result.
 
         Returns how many messages were discarded, and the number of the
         turn that ended. See ``_on_after_invocation``.
         """
+        failed = result is None or (result.stop_reason == "cancelled" and _cancel_requested(agent))
         with self._queue_lock:
             turn = self._turns_ended
             discarded = 0
@@ -556,7 +575,7 @@ class Neo4jSessionManager(SessionManager):
                 self._turn_state = "paused"
             else:
                 self._turn_state = "idle"
-                if result is None:
+                if failed:
                     discarded = len(self._turn)
                     self._turn.clear()
                 else:

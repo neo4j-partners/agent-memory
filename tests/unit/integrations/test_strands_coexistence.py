@@ -170,3 +170,17 @@ class TestPrivateAttributeCoupling:
             "session_manager.py need a new way to enumerate stores."
         )
         assert [s.name for s in manager._stores] == ["t"]
+
+    def test_agent_cancel_still_sets_cancel_signal(self) -> None:
+        """Fails loudly if agent.cancel() stops setting the signal the manager reads."""
+        from strands import Agent
+
+        from neo4j_agent_memory.integrations.strands.session_manager import _cancel_requested
+
+        agent = Agent(callback_handler=None)
+        agent.cancel()
+
+        assert _cancel_requested(agent), (
+            "agent.cancel() no longer sets cancel_signal; _cancel_requested "
+            "in session_manager.py would write a cancelled turn."
+        )

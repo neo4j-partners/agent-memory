@@ -159,10 +159,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each message once the next one arrived. An agent call that raises or
   is cancelled now stores none of its messages, so the backend never
   holds a prompt without its reply. An INFO log gives the number of
-  messages discarded. A turn paused by an interrupt stays buffered, and
-  the call that resumes it writes the whole turn. Messages appended
-  outside an agent call are written when the next call starts, or at
-  close. A process that stops mid-turn loses that turn.
+  messages discarded. `agent.cancel()` and a set `cancel_signal` count
+  as a cancel. The `stop` tool and the `limit_*` stop reasons write the
+  turn, because the caller got an answer. A turn paused by an interrupt
+  stays buffered, and the call that resumes it writes the whole turn.
+  Messages appended outside an agent call are written when the next
+  call starts, or at close. A process that stops mid-turn loses that
+  turn.
 - **Behavior change:** LLM extraction, summarization, and every provider
   adapter now send no temperature by default, so each model uses its own
   default. Earlier releases sent `temperature=0.0`. Pass `temperature=0.0`
