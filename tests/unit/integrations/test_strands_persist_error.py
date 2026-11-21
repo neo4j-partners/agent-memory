@@ -93,6 +93,23 @@ class TestWaitThatRunsOut:
         manager._wait_failed(drain, TimeoutError())  # no raise
         await manager.aclose()
 
+    async def test_a_drain_that_fails_just_after_the_wait_reports_its_own_error(
+        self,
+    ) -> None:
+        from neo4j_agent_memory.integrations.strands.session_manager import _MessageDropped
+
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=FakeMemoryClient(), on_persist_error="raise"
+        )
+        cause = RuntimeError("backend down")
+        drain: concurrent.futures.Future[None] = concurrent.futures.Future()
+        drain.set_exception(_MessageDropped(cause))  # it failed after the timeout
+
+        with pytest.raises(SessionException, match="dropped") as raised:
+            manager._wait_failed(drain, TimeoutError())
+        assert raised.value.__cause__ is cause
+        await manager.aclose()
+
 
 class TestCloseErrorPrecedence:
     @pytest.mark.parametrize("use_async", [False, True], ids=["close", "aclose"])
