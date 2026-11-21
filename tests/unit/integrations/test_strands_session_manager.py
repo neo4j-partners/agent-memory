@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 
 import pytest
@@ -221,6 +222,11 @@ class TestAsyncBridge:
         assert [str(e) for e in result] == ["AsyncBridge closed with work in flight"]
         # The future was cancelled while its loop was open, so no callback failed.
         assert [r for r in caplog.records if r.name == "concurrent.futures"] == []
+        # The task outlived its loop. Collect it here, so asyncio reports it in
+        # this test and not in a later one. The error's traceback reaches it.
+        result.clear()
+        gc.collect()
+        assert any("Task was destroyed" in r.getMessage() for r in caplog.records)
 
     def test_a_task_that_starts_during_shutdown_is_cancelled_before_the_loop_closes(
         self,
@@ -278,6 +284,10 @@ class TestAsyncBridge:
             bridge.submit(noop())
         closer.join(timeout=5.0)
         assert stubborn.cancelled()
+        # The task outlived its loop. Collect it here, so asyncio reports it in
+        # this test and not in a later one. Its future reaches it.
+        del stubborn
+        gc.collect()
 
 
 class TestMappingHelpers:
