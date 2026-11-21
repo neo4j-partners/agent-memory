@@ -29,6 +29,7 @@ from tests.unit.integrations.test_strands_deferred_extraction import _Gate, _Hoo
 from tests.unit.integrations.test_strands_nonblocking import ScriptedModel  # noqa: E402
 
 _SETTINGS: Any = object()  # open() hands it to the patched MemoryClient only
+_SHARED_LOGGER = "neo4j_agent_memory.integrations.strands.shared"
 
 
 @pytest.fixture
@@ -168,6 +169,49 @@ class TestClosingSharedMemory:
 
         with pytest.raises(ConnectionError, match="no route"):
             SharedMemory.open(_SETTINGS)
+        assert _bridge_threads() == threads_before
+
+    def test_a_connect_that_fails_after_opening_the_driver_closes_the_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = FakeMemoryClient()
+
+        async def open_then_fail() -> None:
+            fake._connected = True  # the driver is open
+            raise ConnectionError("schema setup failed")
+
+        monkeypatch.setattr(fake, "connect", open_then_fail)
+        monkeypatch.setattr("neo4j_agent_memory.MemoryClient", lambda _settings: fake)
+        threads_before = _bridge_threads()
+
+        with pytest.raises(ConnectionError, match="schema setup"):
+            SharedMemory.open(_SETTINGS)
+        assert fake.close_calls == 1
+        assert not fake.is_connected
+        assert _bridge_threads() == threads_before
+
+    def test_a_close_that_fails_after_a_failed_connect_is_logged(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake = FakeMemoryClient()
+
+        async def refuse() -> None:
+            raise ConnectionError("no route to host")
+
+        async def broken_close() -> None:
+            raise RuntimeError("driver gone")
+
+        monkeypatch.setattr(fake, "connect", refuse)
+        monkeypatch.setattr(fake, "close", broken_close)
+        monkeypatch.setattr("neo4j_agent_memory.MemoryClient", lambda _settings: fake)
+        threads_before = _bridge_threads()
+
+        with (
+            caplog.at_level(logging.WARNING, logger=_SHARED_LOGGER),
+            pytest.raises(ConnectionError, match="no route"),
+        ):
+            SharedMemory.open(_SETTINGS)
+        assert "driver gone" in caplog.text
         assert _bridge_threads() == threads_before
 
 

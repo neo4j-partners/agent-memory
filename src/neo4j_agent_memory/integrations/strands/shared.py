@@ -89,8 +89,8 @@ class SharedMemory:
         thread-safe and fast. See ``Neo4jSessionManager``.
 
         Raises:
-            Exception: Connecting failed. The loop is stopped before the
-                error propagates.
+            Exception: Connecting failed. The client is closed and the loop
+                is stopped before the error propagates.
         """
         from neo4j_agent_memory import MemoryClient
 
@@ -99,7 +99,7 @@ class SharedMemory:
         try:
             bridge.run(client.connect(), request_timeout)
         except BaseException:
-            bridge.close()
+            _close_failed_client(client, bridge, request_timeout)
             raise
         return cls(client, bridge, request_timeout, background_hook)
 
@@ -208,6 +208,21 @@ class SharedMemory:
                 )
                 return
             await asyncio.wait(pending, timeout=remaining)
+
+
+def _close_failed_client(client: MemoryClient, bridge: AsyncBridge, timeout: float) -> None:
+    """Close a client whose connect failed, then stop the loop.
+
+    A connect can fail after it opened the driver, so the client is closed
+    anyway. An error from that close is logged as a WARNING, so the
+    connect error is the one that propagates.
+    """
+    try:
+        bridge.run(client.close(), timeout)
+    except Exception as e:
+        logger.warning("Closing the memory client after a failed connect failed: %s", e)
+    finally:
+        bridge.close()
 
 
 def _check_timeout(timeout: float) -> None:
