@@ -154,6 +154,7 @@ def LiteLLMProvider(
     timeout: float=60.0,
     max_retries: int=3,
     return_raw: bool=False,
+    send_temperature: bool=True,
     **default_kwargs: Any,
 ) -> None: ...
 ----
@@ -162,6 +163,8 @@ def LiteLLMProvider(
 * Fallback through the providers supported by your installed LiteLLM version; model availability and credentials are provider-specific.
 * `complete_structured` delegates to `schema_aligned_extract` (LiteLLM has no single structured-output mode that works across all providers).
 * Provider-specific kwargs passed via `**default_kwargs` are merged into every `acompletion` call — e.g. `aws_region_name="us-east-1"` for Bedrock-via-LiteLLM, `vertex_project="proj-id"` for Vertex AI, `api_version="2024-02-15"` for Azure.
+* `send_temperature=False` never sends a temperature, even when a caller passes one. Use it for models that reject the field, such as Claude Sonnet 5.5 on Bedrock.
+* `from_provider` drops `tool_choice` when it falls back to LiteLLM. Only `BedrockProvider` uses it.
 
 == `LiteLLMEmbeddingProvider`
 

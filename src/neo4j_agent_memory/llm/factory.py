@@ -216,6 +216,10 @@ def _resolve_llm(
         from neo4j_agent_memory.llm.adapters.litellm import LiteLLMProvider
 
         logger.debug("from_provider: routing %r to LiteLLMProvider", model)
+        # tool_choice only applies to BedrockProvider's native tool call.
+        # LiteLLM would forward it to acompletion, so it is dropped here.
+        if kwargs.pop("tool_choice", None) is not None:
+            logger.debug("from_provider: ignoring tool_choice for LiteLLMProvider")
         return LiteLLMProvider(model, **kwargs)
 
     raise ImportError(_install_hint(provider_prefix, "llm"))

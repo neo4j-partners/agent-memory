@@ -204,6 +204,64 @@ async def test_litellm_omits_temperature_by_default(monkeypatch: pytest.MonkeyPa
     assert calls[-1]["temperature"] == 0.3
 
 
+def _record_litellm(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Stub LiteLLM's ``acompletion`` and return the list of its kwargs."""
+    from types import SimpleNamespace
+
+    from neo4j_agent_memory.llm.adapters import litellm as adapter
+
+    calls: list[dict[str, Any]] = []
+
+    async def acompletion(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        message = SimpleNamespace(content='{"value": "ok"}')
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="stop")],
+            model="m",
+            usage=None,
+        )
+
+    monkeypatch.setattr(
+        adapter, "_ensure_litellm", lambda: SimpleNamespace(acompletion=acompletion)
+    )
+    return calls
+
+
+async def test_litellm_honors_send_temperature_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    from neo4j_agent_memory.llm.adapters.litellm import LiteLLMProvider
+
+    calls = _record_litellm(monkeypatch)
+    provider = LiteLLMProvider(
+        "bedrock/us.anthropic.claude-sonnet-5-5-v1:0", send_temperature=False
+    )
+
+    await provider.complete(_MESSAGES, temperature=0.3)
+    await provider.complete_structured(_MESSAGES, _Extraction, temperature=0.3)
+
+    assert all("temperature" not in call for call in calls)
+    assert all("send_temperature" not in call for call in calls)
+
+
+async def test_litellm_fallback_drops_bedrock_only_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from neo4j_agent_memory.llm import factory
+
+    calls = _record_litellm(monkeypatch)
+    monkeypatch.setattr(factory, "_has", lambda extra: extra == "litellm")
+    provider = factory.from_provider(
+        "bedrock/us.anthropic.claude-sonnet-5-5-v1:0",
+        send_temperature=False,
+        tool_choice="auto",
+    )
+
+    await provider.complete(_MESSAGES, temperature=0.3)
+
+    assert "tool_choice" not in calls[-1]
+    assert "send_temperature" not in calls[-1]
+    assert "temperature" not in calls[-1]
+
+
 async def test_instructor_omits_temperature_by_default() -> None:
     from neo4j_agent_memory.llm.adapters.instructor import InstructorProvider
 

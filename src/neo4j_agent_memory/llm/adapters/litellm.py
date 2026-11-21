@@ -141,6 +141,8 @@ class LiteLLMProvider:
         * Pass any provider-specific keyword arguments to the constructor
           and they will be forwarded to every ``acompletion`` call. See
           the LiteLLM docs for provider-specific kwargs.
+        * ``send_temperature=False`` never sends a temperature, even when
+          a caller passes one. Use it for models that reject the field.
     """
 
     def __init__(
@@ -153,10 +155,12 @@ class LiteLLMProvider:
         timeout: float = 60.0,
         max_retries: int = 3,
         return_raw: bool = False,
+        send_temperature: bool = True,
         **default_kwargs: Any,
     ) -> None:
         self.model = model
         self._return_raw = return_raw
+        self._send_temperature = send_temperature
 
         # Build the kwargs we pass to every acompletion() call. LiteLLM
         # uses ``aws_region_name`` not ``aws_region``, so we translate.
@@ -192,7 +196,7 @@ class LiteLLMProvider:
             "messages": [m.model_dump(exclude_none=True) for m in messages],
             **self._call_kwargs,
         }
-        if temperature is not None:
+        if temperature is not None and self._send_temperature:
             kwargs.setdefault("temperature", temperature)
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
