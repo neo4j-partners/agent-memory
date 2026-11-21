@@ -161,3 +161,30 @@ async def test_global_profile_honors_tool_choice() -> None:
     await provider.complete_structured(_MESSAGES, _Extraction)
 
     assert client.calls[0]["toolConfig"]["toolChoice"] == {"auto": {}}
+
+
+def _tool_reply(tool_input: Any) -> dict[str, Any]:
+    use = {"toolUseId": "t1", "name": "submit_extraction", "input": tool_input}
+    return converse_response({"toolUse": use}, stop="tool_use")
+
+
+async def test_non_json_tool_input_is_serialized_for_sap() -> None:
+    """A Decimal in the tool input must not crash the hand-off to SAP."""
+    from decimal import Decimal
+
+    provider, client = _sonnet(_tool_reply({"value": Decimal("1.5")}))
+
+    result = await provider.complete_structured(_MESSAGES, _Extraction)
+
+    assert result.value == "1.5"
+    assert len(client.calls) == 1
+
+
+async def test_string_tool_input_costs_no_extra_retry() -> None:
+    """A tool input that arrives as a JSON string is validated as is."""
+    provider, client = _sonnet(_tool_reply('{"value": "ok"}'))
+
+    result = await provider.complete_structured(_MESSAGES, _Extraction)
+
+    assert result.value == "ok"
+    assert len(client.calls) == 1
