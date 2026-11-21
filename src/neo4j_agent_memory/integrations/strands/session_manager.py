@@ -552,8 +552,8 @@ class Neo4jSessionManager(SessionManager):
             stored = self._last_persisted
         if stored is None:
             logger.warning(
-                "redact_latest_message called for session %s but no message "
-                "has been stored yet; nothing to redact.",
+                "redact_latest_message called for session %s, but its latest "
+                "message was not stored, so there is nothing to redact.",
                 self.session_id,
             )
             return
@@ -827,12 +827,13 @@ class Neo4jSessionManager(SessionManager):
         The content is read under the lock, so it includes a redaction that
         landed while the write ran. ``stored`` becomes the target of a late
         redaction in the same step. So a redaction finds the message either
-        in the queue or in ``_last_persisted``.
+        in the queue or in ``_last_persisted``. A message that was dropped
+        or has no text leaves None there, so a late redaction never
+        rewrites the message before it.
         """
         with self._queue_lock:
             entry = self._ready.popleft()
-            if stored is not None:
-                self._last_persisted = stored
+            self._last_persisted = stored
         self._dequeued += 1
         return entry.message
 

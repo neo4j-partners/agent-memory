@@ -772,6 +772,43 @@ class TestRedactionDuringAWrite:
         assert len(client.short_term.deleted_message_ids) == 1
         await manager.aclose()
 
+    @pytest.mark.parametrize("latest", ["no text", "dropped"])
+    async def test_a_late_redaction_never_rewrites_an_earlier_message(
+        self, latest: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, on_persist_error="warn")
+        agent = _buffered(manager, "kept")
+        if latest == "no text":
+            tool_use = {"toolUseId": "t1", "name": "lookup", "input": {}}
+            manager.append_message({"role": "assistant", "content": [{"toolUse": tool_use}]}, agent)
+        else:
+            original = client.short_term.add_message
+
+            async def lost_fails(session_id: str, role: Any, content: str, **kw: Any) -> Any:
+                if content == "lost":
+                    raise RuntimeError("backend down")
+                return await original(session_id, role, content, **kw)
+
+            client.short_term.add_message = lost_fails  # type: ignore[method-assign]
+            manager.append_message({"role": "user", "content": [{"text": "lost"}]}, agent)
+        manager._release_pending()
+        await manager._aflush_ready()  # writes "kept"; a write of "lost" fails
+        if latest == "dropped":
+            manager._turns_ended += 1  # "lost" is now from an earlier turn
+            await manager._aflush_ready()  # fails again, and drops "lost"
+            client.short_term.add_message = original  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            manager.redact_latest_message(
+                {"role": "user", "content": [{"text": "[REDACTED]"}]}, agent
+            )
+
+        assert _contents(client) == ["kept"]
+        assert client.short_term.deleted_message_ids == []
+        assert any("nothing to redact" in r.getMessage() for r in caplog.records)
+        await manager.aclose()
+
     async def test_a_failed_redaction_is_logged_as_an_error(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:

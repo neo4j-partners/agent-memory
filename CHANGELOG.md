@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A late Strands redaction no longer rewrites an earlier message. When
+  the latest message had no text, or its write failed and it was
+  dropped, the redaction replaced the message stored before it.
+  Now nothing is redacted, and a warning is logged.
 - A Strands flush whose wait runs out just before its writes finish no
   longer reports a failure. Before, raise mode raised `SessionException`
   saying the messages stayed queued, though all of them were written.
