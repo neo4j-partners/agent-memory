@@ -942,6 +942,24 @@ class TestToolMirroringOutlivesItsWait:
         assert any("2 tool-call recording(s)" in m for m in messages)
         assert sum("was cancelled" in m for m in messages) == 2
 
+    async def test_a_recording_cancelled_before_it_starts_is_no_longer_counted(
+        self,
+    ) -> None:
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=FakeMemoryClient(), record_tool_calls=True
+        )
+        block: Any = {"toolUseId": "t1", "name": "lookup", "input": {}}
+        waiter = asyncio.ensure_future(manager._arecord_tool_uses([block]))
+        await asyncio.sleep(0)  # the waiter starts the recording and waits on it
+        assert manager._tool_record is not None
+        manager._tool_record.cancel()  # before the recording takes its first step
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiter
+        await asyncio.sleep(0)
+
+        assert manager._tool_records_running == 0
+        await manager.aclose()
+
 
 class TestDrainCoalescing:
     """A flush joins the running drain instead of queuing another."""

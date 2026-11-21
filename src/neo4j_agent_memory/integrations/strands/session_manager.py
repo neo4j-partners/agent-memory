@@ -1058,7 +1058,12 @@ class Neo4jSessionManager(SessionManager):
         task = asyncio.ensure_future(self._arecord_after(previous, blocks))
         self._tool_record = task
         self._tool_records_running += 1
+        task.add_done_callback(self._tool_record_done)  # also runs for one never started
         await asyncio.shield(task)
+
+    def _tool_record_done(self, task: asyncio.Task[None]) -> None:
+        """Count a recording as finished. Runs on the bridge loop."""
+        self._tool_records_running -= 1
 
     async def _arecord_after(
         self, previous: asyncio.Task[None] | None, blocks: list[ToolUse]
@@ -1081,8 +1086,6 @@ class Neo4jSessionManager(SessionManager):
             raise
         except Exception as e:
             logger.warning("Failed to mirror tool calls to reasoning memory: %s", _describe(e))
-        finally:
-            self._tool_records_running -= 1
 
     async def _arecord_blocks(self, blocks: list[ToolUse]) -> None:
         """Record each block as a step and its tool call, starting the trace once."""
