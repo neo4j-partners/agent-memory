@@ -165,7 +165,7 @@ def LiteLLMProvider(
 * `complete_structured` delegates to `schema_aligned_extract` (LiteLLM has no single structured-output mode that works across all providers).
 * Provider-specific kwargs passed via `**default_kwargs` are merged into every `acompletion` call — e.g. `aws_region_name="us-east-1"` for Bedrock-via-LiteLLM, `vertex_project="proj-id"` for Vertex AI, `api_version="2024-02-15"` for Azure.
 * `send_temperature=False` never sends a temperature, even when a caller passes one. Use it for models that reject the field, such as Claude Sonnet 5.5 on Bedrock.
-* `from_provider` checks `tool_choice` when it falls back to LiteLLM. A value other than `None`, `"tool"`, or `"auto"` raises `ValueError`. A valid value has no effect on LiteLLM, so it is dropped, and a WARNING is logged once per process. Only `BedrockProvider` uses `tool_choice`.
+* `from_provider` checks `tool_choice` when it routes to a provider other than `BedrockProvider`. These are the native OpenAI and Anthropic providers and the LiteLLM fallback. A value other than `None`, `"tool"`, or `"auto"` raises `ValueError`. A `"tool"` or `"auto"` value has no effect there, so it is dropped, and a WARNING is logged once per process. Only `BedrockProvider` uses `tool_choice`.
 
 == `LiteLLMEmbeddingProvider`
 

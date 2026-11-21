@@ -39,7 +39,8 @@ _NATIVE_EMBEDDING_PROVIDERS: frozenset[str] = frozenset(
     {"openai", "vertex_ai", "bedrock", "sentence-transformers"}
 )
 
-# The LiteLLM route drops tool_choice. The warning is logged once per process.
+# Every route but BedrockProvider drops tool_choice. The warning is logged
+# once per process.
 _tool_choice_drop_warned = False
 
 
@@ -202,11 +203,13 @@ def _resolve_llm(
             from neo4j_agent_memory.llm.adapters.openai import OpenAIProvider
 
             logger.debug("from_provider: routing %r to native OpenAIProvider", model)
+            _drop_tool_choice(kwargs, "OpenAIProvider")
             return OpenAIProvider(model, **kwargs)
         if provider_prefix == "anthropic" and _has("anthropic"):
             from neo4j_agent_memory.llm.adapters.anthropic import AnthropicProvider
 
             logger.debug("from_provider: routing %r to native AnthropicProvider", model)
+            _drop_tool_choice(kwargs, "AnthropicProvider")
             return AnthropicProvider(model, **kwargs)
         if provider_prefix == "bedrock" and _has("bedrock"):
             from neo4j_agent_memory.llm.adapters.bedrock import BedrockProvider
@@ -221,14 +224,17 @@ def _resolve_llm(
         logger.debug("from_provider: routing %r to LiteLLMProvider", model)
         # tool_choice only applies to BedrockProvider's native tool call.
         # LiteLLM would forward it to acompletion, so it is dropped here.
-        _drop_tool_choice(kwargs)
+        _drop_tool_choice(kwargs, "LiteLLMProvider")
         return LiteLLMProvider(model, **kwargs)
 
     raise ImportError(_install_hint(provider_prefix, "llm"))
 
 
-def _drop_tool_choice(kwargs: dict[str, Any]) -> None:
-    """Validate and remove ``tool_choice`` before routing to LiteLLM.
+def _drop_tool_choice(kwargs: dict[str, Any], provider: str) -> None:
+    """Validate and remove ``tool_choice`` before routing to ``provider``.
+
+    Only BedrockProvider takes ``tool_choice``. The other providers do not
+    accept it, so it is dropped before they are built.
 
     Raises:
         ValueError: ``tool_choice`` is not None, "tool", or "auto".
@@ -245,8 +251,9 @@ def _drop_tool_choice(kwargs: dict[str, Any]) -> None:
     if not _tool_choice_drop_warned:
         _tool_choice_drop_warned = True
         logger.warning(
-            "from_provider: tool_choice=%r has no effect on LiteLLMProvider and was ignored",
+            "from_provider: tool_choice=%r has no effect on %s and was ignored",
             tool_choice,
+            provider,
         )
 
 

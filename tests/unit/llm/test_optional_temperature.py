@@ -454,6 +454,69 @@ def test_litellm_fallback_warns_once_about_dropped_tool_choice(
     assert "tool_choice" in warnings[0].getMessage()
 
 
+_NATIVE_ROUTES = [
+    ("openai", "openai/gpt-5", "OpenAIProvider"),
+    ("anthropic", "anthropic/claude-sonnet-5-5", "AnthropicProvider"),
+]
+
+
+def _native_route(monkeypatch: pytest.MonkeyPatch, extra: str, class_name: str) -> list[str]:
+    """Route ``from_provider`` to a stub of the native ``class_name``.
+
+    Like the real class, the stub takes no ``tool_choice``. Returns the
+    models it was built with.
+    """
+    import importlib
+
+    from neo4j_agent_memory.llm import factory
+
+    built: list[str] = []
+
+    class _Native:
+        def __init__(self, model: str, *, api_key: str | None = None) -> None:
+            built.append(model)
+
+    adapter = importlib.import_module(f"neo4j_agent_memory.llm.adapters.{extra}")
+    monkeypatch.setattr(adapter, class_name, _Native)
+    monkeypatch.setattr(factory, "_has", lambda name: name == extra)
+    monkeypatch.setattr(factory, "_tool_choice_drop_warned", False, raising=False)
+    return built
+
+
+@pytest.mark.parametrize(("extra", "model", "class_name"), _NATIVE_ROUTES)
+def test_native_routes_warn_once_about_dropped_tool_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    extra: str,
+    model: str,
+    class_name: str,
+) -> None:
+    from neo4j_agent_memory.llm import factory
+
+    built = _native_route(monkeypatch, extra, class_name)
+
+    with caplog.at_level("WARNING", logger=factory.__name__):
+        for _ in range(2):
+            factory.from_provider(model, tool_choice="auto")
+
+    assert built == [model, model]
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert class_name in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize(("extra", "model", "class_name"), _NATIVE_ROUTES)
+def test_native_routes_reject_unknown_tool_choice(
+    monkeypatch: pytest.MonkeyPatch, extra: str, model: str, class_name: str
+) -> None:
+    from neo4j_agent_memory.llm import factory
+
+    _native_route(monkeypatch, extra, class_name)
+
+    with pytest.raises(ValueError, match="tool_choice"):
+        factory.from_provider(model, tool_choice="any")
+
+
 async def test_instructor_omits_temperature_by_default() -> None:
     from neo4j_agent_memory.llm.adapters.instructor import InstructorProvider
 

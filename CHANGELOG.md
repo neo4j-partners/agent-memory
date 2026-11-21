@@ -18,9 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer `complete_structured` without the forced tool call. If it
   answers in text, the provider parses that text as JSON. Both settings
   are recommended for Claude Sonnet 5.5. `from_provider` passes
-  `tool_choice` only to `BedrockProvider`. When it routes to LiteLLM, a
-  value other than `None`, `"tool"`, or `"auto"` raises `ValueError`. A
-  valid value is dropped, and a WARNING is logged once per process.
+  `tool_choice` only to `BedrockProvider`. On any other route, a value
+  other than `None`, `"tool"`, or `"auto"` raises `ValueError`. A `"tool"`
+  or `"auto"` value is dropped, and a WARNING is logged once per process.
 - `ShortTermMemory.add_message(message_id=...)` on bolt. The message is
   stored under that id. A retry with the same id stores nothing when the
   conversation already holds the message, so a write whose reply was
