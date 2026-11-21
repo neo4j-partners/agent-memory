@@ -199,7 +199,12 @@ class LLMConfig(BaseModel):
     provider: LLMProvider = Field(default=LLMProvider.OPENAI, description="LLM provider to use")
     model: str = Field(default="gpt-4o-mini", description="LLM model name")
     api_key: SecretStr | None = Field(default=None, description="API key for LLM provider")
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="LLM temperature")
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="LLM temperature. None uses the provider's default.",
+    )
     max_tokens: int = Field(default=4096, ge=1, description="Maximum tokens for LLM")
 
 

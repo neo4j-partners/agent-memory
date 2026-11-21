@@ -142,7 +142,7 @@ See xref:reference/configuration-providers.adoc#embedding[Embedding configuratio
 | `NAM_LLM__PROVIDER` | `openai` | LLM provider to use
 | `NAM_LLM__MODEL` | `gpt-4o-mini` | LLM model name
 | `NAM_LLM__API_KEY` | unset | API key for LLM provider
-| `NAM_LLM__TEMPERATURE` | `0.0` | LLM temperature — not automatically applied by MemoryClient
+| `NAM_LLM__TEMPERATURE` | unset | LLM temperature. Unset uses the provider's default. Not automatically applied by MemoryClient
 | `NAM_LLM__MAX_TOKENS` | `4096` | Maximum tokens for LLM — not automatically applied by MemoryClient
 |===
 

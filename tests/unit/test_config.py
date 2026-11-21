@@ -71,6 +71,27 @@ class TestEmbeddingConfig:
         assert config.device == "cuda"
 
 
+class TestLLMConfig:
+    """Tests for LLM configuration."""
+
+    def test_temperature_defaults_to_none(self):
+        """No temperature means the provider's default."""
+        assert LLMConfig().temperature is None
+
+    @pytest.mark.parametrize("temperature", [0.0, 1.5, 2.0])
+    def test_temperature_accepts_values_in_range(self, temperature):
+        assert LLMConfig(temperature=temperature).temperature == temperature
+
+    @pytest.mark.parametrize("temperature", [-0.1, 2.1])
+    def test_temperature_rejects_values_out_of_range(self, temperature):
+        with pytest.raises(ValidationError):
+            LLMConfig(temperature=temperature)
+
+    def test_temperature_unset_in_environment_is_none(self, monkeypatch):
+        monkeypatch.delenv("NAM_LLM__TEMPERATURE", raising=False)
+        assert MemorySettings(_env_file=None).llm.temperature is None
+
+
 class TestExtractionConfig:
     """Tests for extraction configuration."""
 

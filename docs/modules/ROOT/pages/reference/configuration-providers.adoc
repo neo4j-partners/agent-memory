@@ -44,7 +44,7 @@ anchor:_environment_variables_6[]
 
 == LLM configuration
 
-Legacy LLM field inventory. The extraction factory forwards the selected provider/model/API key; it does not forward these legacy temperature/max_tokens fields. Use the extractor/provider APIs for their supported generation controls. `extraction.llm_model` is the fallback only when the factory receives no LLM config/provider.
+Legacy LLM field inventory. The extraction factory forwards the selected provider/model/API key; it does not forward these legacy temperature/max_tokens fields. Use the extractor/provider APIs for their supported generation controls. `temperature` defaults to `None`, which matches the provider APIs: no temperature is sent, so the model uses its own default. `extraction.llm_model` is the fallback only when the factory receives no LLM config/provider.
 
 // settings-fields: LLMConfig:llm:python
 [cols="4,2,2,2,3,5",options="header"]
@@ -53,7 +53,7 @@ Legacy LLM field inventory. The extraction factory forwards the selected provide
 | `provider` | `openai / anthropic / custom` | `'openai'` | — | `NAM_LLM__PROVIDER` | LLM provider to use
 | `model` | `str` | `'gpt-4o-mini'` | — | `NAM_LLM__MODEL` | LLM model name
 | `api_key` | `SecretStr \| None` | `None` | — | `NAM_LLM__API_KEY` | API key for LLM provider
-| `temperature` | `float` | `0.0` | ge 0.0, le 2.0 | `NAM_LLM__TEMPERATURE` | LLM temperature †
+| `temperature` | `float \| None` | `None` | ge 0.0, le 2.0 | `NAM_LLM__TEMPERATURE` | LLM temperature. `None` uses the provider's default †
 | `max_tokens` | `int` | `4096` | ge 1 | `NAM_LLM__MAX_TOKENS` | Maximum tokens for LLM †
 |===
 
