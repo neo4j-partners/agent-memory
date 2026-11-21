@@ -932,6 +932,36 @@ class TestDrainCoalescing:
         assert _stored(client) == [("user", "one"), ("user", "two")]
         await manager.aclose()
 
+    @pytest.mark.parametrize("how", ["aclose", "close"])
+    @pytest.mark.parametrize("first_write", ["fails", "is slow"])
+    async def test_close_retries_what_the_drain_it_found_failed_on(
+        self, first_write: str, how: str
+    ) -> None:
+        client = FakeMemoryClient()
+        original = client.short_term.add_message
+        calls = 0
+
+        async def add(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1 and first_write == "fails":
+                await asyncio.sleep(0.1)
+                raise ConnectionError("transient")
+            await asyncio.sleep(0.4 if calls == 1 else 0)  # 0.4 s outlasts the 0.3 s timeout
+            return await original(*args, **kwargs)
+
+        client.short_term.add_message = add  # type: ignore[method-assign]
+        manager = Neo4jSessionManager(
+            "sess-1", memory_client=client, request_timeout=0.3, extract_entities=False
+        )
+        _buffered(manager, "one", "two")
+        manager._submit_drain()  # a hook's drain, writing "one"
+        await asyncio.sleep(0.05)
+        await (manager.aclose() if how == "aclose" else asyncio.to_thread(manager.close))
+
+        (conversation,) = client.short_term.conversations.values()
+        assert [m.content for m in conversation.messages] == ["one", "two"]
+
     async def test_a_flush_after_the_drain_found_the_queue_empty_starts_another(self) -> None:
         client = FakeMemoryClient()
         manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)

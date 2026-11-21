@@ -778,6 +778,8 @@ class Neo4jSessionManager(SessionManager):
 
         A drain that has not yet found the queue empty writes every message
         queued before then, so a flush joins it instead of starting another.
+        A close never joins. It starts its own drain, which runs once the
+        running one ends and retries a message that drain failed on.
         Returns None when the queue is empty, unless the manager is closing
         while a drain still runs. The bridge is called outside the queue
         lock.
@@ -787,7 +789,7 @@ class Neo4jSessionManager(SessionManager):
             running = run is not None and not run.done()
             if not self._ready and not (self._closed and running):
                 return None
-            if run is not None and running:
+            if run is not None and running and not self._closed:
                 return run
             run = self._drain_run = concurrent.futures.Future()
         try:
