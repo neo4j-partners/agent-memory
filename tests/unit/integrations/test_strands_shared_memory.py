@@ -298,7 +298,8 @@ class TestClosingWithBackgroundWork:
             await asyncio.wait_for(asyncio.to_thread(shared.close, 0.1), timeout=5)
 
         assert gate.done == []
-        assert "Closing SharedMemory while 2 background task(s) are still running" in caplog.text
+        # The count includes the fake's own tasks, which differ by Python version.
+        assert "background task(s) are still running after 0.1s" in caplog.text
         assert running_at_close == [0]  # cancelled before the client closed
         assert client.close_calls == 1
         assert _bridge_threads() == threads_before
