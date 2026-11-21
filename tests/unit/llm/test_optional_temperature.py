@@ -216,6 +216,35 @@ async def test_bedrock_rejected_forced_tool_choice_falls_back_to_auto(
     assert "toolChoice" in warnings[0].getMessage()
 
 
+# The message Bedrock returns for a forced choice on Claude Sonnet 5.5.
+_BEDROCK_TOOL_CHOICE_MESSAGE = 'tool_choice: type "tool" and "any" are not supported for this model'
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (_BEDROCK_TOOL_CHOICE_MESSAGE, True),
+        (_TOOL_CHOICE_REJECTION, True),
+        ("The tool choice is not supported for this model.", True),
+        ("Input is too long for requested model.", False),
+    ],
+)
+def test_bedrock_recognizes_a_tool_choice_rejection(message: str, expected: bool) -> None:
+    from neo4j_agent_memory.llm.adapters.bedrock import _rejects_tool_choice
+
+    assert _rejects_tool_choice(_validation_error(message)) is expected
+
+
+async def test_bedrock_real_tool_choice_message_falls_back_to_auto() -> None:
+    provider, client = _rejecting_provider(_BEDROCK_TOOL_CHOICE_MESSAGE)
+
+    result = await provider.complete_structured(_MESSAGES, _Extraction)
+
+    assert result.value == "ok"
+    choices = [call["toolConfig"]["toolChoice"] for call in client.calls]
+    assert choices == [_FORCED, _AUTO]
+
+
 async def test_bedrock_failed_auto_retry_keeps_the_forced_choice(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -255,8 +284,12 @@ async def test_bedrock_other_validation_errors_do_not_fall_back() -> None:
 
     with pytest.raises(ProviderInvalidRequestError, match="too long"):
         await provider.complete_structured(_MESSAGES, _Extraction)
-
     assert len(client.calls) == 1
+
+    with pytest.raises(ProviderInvalidRequestError, match="too long"):
+        await provider.complete_structured(_MESSAGES, _Extraction)
+    choices = [call["toolConfig"]["toolChoice"] for call in client.calls]
+    assert choices == [_FORCED, _FORCED]  # the next call is still forced
 
 
 async def test_bedrock_explicit_forced_tool_choice_does_not_fall_back() -> None:

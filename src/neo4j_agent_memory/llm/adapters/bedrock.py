@@ -62,9 +62,10 @@ _TOOL_CHOICES = ("tool", "auto")
 # ``anthropic.``.
 _ANTHROPIC_MODEL_RE = re.compile(r"^(?:[a-z]+(?:-[a-z]+)*\.)?anthropic\.")
 
-# Bedrock names the rejected field in the message, for example "This model
-# doesn't support the toolConfig.toolChoice.tool field".
-_TOOL_CHOICE_ERROR_RE = re.compile(r"tool_?choice", re.IGNORECASE)
+# Bedrock names the rejected field in the message. For a forced choice,
+# Anthropic models on Bedrock return 'tool_choice: type "tool" and "any" are
+# not supported for this model'. Other models write "toolConfig.toolChoice".
+_TOOL_CHOICE_ERROR_RE = re.compile(r"tool[_ ]?choice", re.IGNORECASE)
 
 
 def _strip_provider_prefix(model: str) -> str:
