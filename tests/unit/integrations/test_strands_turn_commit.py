@@ -15,11 +15,13 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 pytest.importorskip("strands", reason="strands-agents not installed")
 
 from strands import Agent, ToolContext, tool  # noqa: E402
 from strands.hooks import BeforeInvocationEvent  # noqa: E402
+from strands.types.agent import ConcurrentInvocationMode  # noqa: E402
 
 from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E402
     Neo4jSessionManager,
@@ -498,6 +500,124 @@ class TestACallThatStartsWhileATurnRuns:
 
         assert _stored(client) == []
         assert len(_records(caplog, "ERROR")) == 1
+
+
+class _Summary(BaseModel):
+    text: str
+
+
+class _HeldModel(ScriptedModel):
+    """A model that holds its first answer until ``release`` is set.
+
+    A second call raises while the first is held. Structured output
+    answers at once.
+    """
+
+    def __init__(self, *turns: list[dict[str, Any]]) -> None:
+        super().__init__(*turns)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        if self.started.is_set() and not self.release.is_set():
+            raise RuntimeError("model down")
+        self.started.set()
+        await self.release.wait()
+        async for event in super().stream(*args, **kwargs):
+            yield event
+
+    async def structured_output(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        yield {"output": _Summary(text="a summary")}
+
+
+def _held_agent(manager: Neo4jSessionManager, model: _HeldModel) -> Agent:
+    return Agent(
+        model=model,
+        session_manager=manager,
+        callback_handler=None,
+        concurrent_invocation_mode=ConcurrentInvocationMode.UNSAFE_REENTRANT,
+    )
+
+
+class TestCallsThatOverlap:
+    async def test_structured_output_during_a_call_leaves_its_turn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        model = _HeldModel([{"text": "A1"}])
+        agent = _held_agent(manager, model)
+        try:
+            call = asyncio.create_task(agent.invoke_async("Q1"))
+            await model.started.wait()
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                summary = await agent.structured_output_async(_Summary, "Summarize.")
+            model.release.set()
+            await call
+        finally:
+            await manager.aclose()
+
+        assert summary.text == "a summary"
+        assert _stored(client) == [("user", "Q1"), ("assistant", "A1")]
+        (warning,) = _records(caplog, "WARNING")
+        assert "first call's result decides" in warning
+
+    async def test_a_failed_call_leaves_the_turn_it_overlapped(self) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        model = _HeldModel([{"text": "A1"}])
+        agent = _held_agent(manager, model)
+        try:
+            call = asyncio.create_task(agent.invoke_async("Q1"))
+            await model.started.wait()
+            with pytest.raises(RuntimeError, match="model down"):
+                await agent.invoke_async("Q2")
+            model.release.set()
+            await call
+        finally:
+            await manager.aclose()
+
+        assert _stored(client) == [("user", "Q1"), ("user", "Q2"), ("assistant", "A1")]
+
+    async def test_structured_output_alone_ends_its_turn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        model = _HeldModel([{"text": "A1"}])
+        model.release.set()
+        agent = _held_agent(manager, model)
+        try:
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await agent.structured_output_async(_Summary, "Summarize.")
+                await agent.invoke_async("Q1")
+        finally:
+            await manager.aclose()
+
+        assert _stored(client) == [("user", "Q1"), ("assistant", "A1")]
+        assert _records(caplog, "WARNING") == []
+
+    async def test_a_call_after_a_failed_before_hook_in_another_task_writes_its_turn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = FakeMemoryClient()
+        manager = Neo4jSessionManager("sess-1", memory_client=client, extract_entities=False)
+        model = _HeldModel([{"text": "A1"}])
+        model.release.set()
+        agent = _held_agent(manager, model)
+        agent.hooks.add_callback(BeforeInvocationEvent, _once(_crash))
+        try:
+            with pytest.raises(RuntimeError, match="hook failed"):
+                await asyncio.create_task(agent.invoke_async("Q0"))
+
+            with caplog.at_level(logging.WARNING, logger=_LOGGER):
+                await agent.invoke_async("Q1")
+        finally:
+            await manager.aclose()
+
+        assert _stored(client) == [("user", "Q1"), ("assistant", "A1")]
+        (warning,) = _records(caplog, "WARNING")
+        assert "before the previous call's turn ended" in warning
 
 
 class TestTheNextCallWritesWhatIsQueued:

@@ -303,6 +303,15 @@ class Neo4jSessionManager(SessionManager):
         # The paused turn's length when the running call resumed it, else
         # None. A resume that fails drops what it added. Under _queue_lock.
         self._resume_from: int | None = None
+        # The call that owns the open turn: its invocation_state, the task
+        # its BeforeInvocationEvent ran in, and whether a message joined the
+        # turn since. Calls that overlap it fold into its turn. _open_calls
+        # counts calls whose BeforeInvocationEvent ran and whose
+        # AfterInvocationEvent has not. All under _queue_lock.
+        self._owner: dict[str, Any] | None = None
+        self._owner_task: asyncio.Task[Any] | None = None
+        self._owner_appended = False
+        self._open_calls = 0
         self._restored: list[StrandsMessage] | None = None  # history preloaded by aopen()
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
         self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
@@ -557,10 +566,18 @@ class Neo4jSessionManager(SessionManager):
         A message whose write failed in an earlier turn is retried here,
         before the turn adds its own.
 
-        A turn still running means another call has not ended. That is a
-        concurrent call, or a call whose BeforeInvocationEvent hook raised,
-        so no AfterInvocationEvent fired. Its messages stay buffered with
-        a warning, and they are written when this call's turn is.
+        The call that opens a turn owns it. A call that starts while the
+        owner runs overlaps it, such as ``structured_output_async`` during
+        ``invoke_async``, or a second call on an agent in
+        ``UNSAFE_REENTRANT`` mode. Its messages join the owner's turn with
+        a warning, and the owner's result decides that turn.
+
+        A running turn whose owner cannot still be running is left over
+        from a call whose BeforeInvocationEvent hook raised, so no
+        AfterInvocationEvent fired. The owner's task has finished, or this
+        call runs in that task with no message added since. This call
+        takes over the turn with a warning. Its messages stay buffered and
+        are written when this call's turn is.
         """
         self._check_open()
         with self._queue_lock:
@@ -570,8 +587,29 @@ class Neo4jSessionManager(SessionManager):
                 self._resume_from = None
             elif state == "paused":
                 self._resume_from = len(self._turn)
+        await self._aflush_ready()
+        task = asyncio.current_task()
+        with self._queue_lock:
+            overlaps = self._turn_state == "running" and self._owner_running(task)
+            left_over = self._turn_state == "running" and not overlaps
+            if overlaps:
+                self._open_calls += 1
+            else:
+                self._owner = event.invocation_state
+                self._owner_task = task
+                self._owner_appended = False
+                self._open_calls = 1 if left_over else self._open_calls + 1
+            self._turn_state = "running"
             open_turn = len(self._turn)
-        if state == "running":
+        if overlaps:
+            logger.warning(
+                "Session %r: an agent call started while another call's turn "
+                "is open with %d message(s). Its messages join that turn, and "
+                "the first call's result decides whether the turn is written.",
+                self.session_id,
+                open_turn,
+            )
+        elif left_over:
             logger.warning(
                 "Session %r: an agent call started before the previous call's "
                 "turn ended. The open turn's %d message(s) stay buffered and "
@@ -579,9 +617,17 @@ class Neo4jSessionManager(SessionManager):
                 self.session_id,
                 open_turn,
             )
-        await self._aflush_ready()
-        with self._queue_lock:
-            self._turn_state = "running"
+
+    def _owner_running(self, task: asyncio.Task[Any] | None) -> bool:
+        """Whether the turn's owner may still be running. Holds _queue_lock.
+
+        A call in the owner's own task overlaps it only from inside it,
+        such as from a tool, after the owner added its prompt.
+        """
+        owner_task = self._owner_task
+        if owner_task is None or owner_task.done():
+            return False
+        return owner_task is not task or self._owner_appended
 
     async def _on_after_invocation(self, event: AfterInvocationEvent) -> None:
         """End the turn, and write it if it succeeded.
@@ -609,8 +655,22 @@ class Neo4jSessionManager(SessionManager):
         so a closed manager returns quietly. When messages would be lost,
         ``"raise"`` raises SessionException. ``"warn"`` logs one ERROR with
         their number, as for any other write that fails at close.
+
+        Only the owner's call ends the turn. A call that overlapped it
+        leaves the turn alone, so its failure discards nothing. When the
+        last open call ends, it ends the turn whatever its
+        ``invocation_state``. ``structured_output_async`` sends a new
+        ``invocation_state`` with each event, so this is how its turn ends.
         """
-        discarded, turn = self._end_turn(event.agent, event.result)
+        ended = self._end_turn(event.agent, event.result, event.invocation_state)
+        if ended is None:
+            logger.debug(
+                "Session %r: an agent call that overlapped the open turn "
+                "ended. The turn stays open for its first call.",
+                self.session_id,
+            )
+            return
+        discarded, turn = ended
         if discarded:
             logger.info(
                 "Session %r: the agent call raised or was cancelled, so its "
@@ -633,14 +693,26 @@ class Neo4jSessionManager(SessionManager):
             return
         await self._aflush_ready(ends_turn=turn)
 
-    def _end_turn(self, agent: Agent | None, result: AgentResult | None) -> tuple[int, int]:
+    def _end_turn(
+        self,
+        agent: Agent | None,
+        result: AgentResult | None,
+        invocation_state: dict[str, Any] | None,
+    ) -> tuple[int, int] | None:
         """Queue, keep, or discard the turn by its result.
 
         Returns how many messages were discarded, and the number of the
-        turn that ended. See ``_on_after_invocation``.
+        turn that ended. Returns None when a call that overlapped the
+        turn's owner ended, which leaves the turn alone. See
+        ``_on_after_invocation``.
         """
         failed = result is None or (result.stop_reason == "cancelled" and _cancel_requested(agent))
         with self._queue_lock:
+            self._open_calls = max(self._open_calls - 1, 0)
+            if invocation_state is not self._owner and self._open_calls:
+                return None
+            self._owner = None
+            self._owner_task = None
             turn = self._turns_ended
             discarded = 0
             if result is not None and result.stop_reason == "interrupt":
@@ -720,6 +792,7 @@ class Neo4jSessionManager(SessionManager):
         latest = copy.deepcopy(message)
         with self._queue_lock:
             self._turn.append(latest)
+            self._owner_appended = True
 
     def _release_turn(self) -> None:
         """Move the buffered messages to the ready queue."""

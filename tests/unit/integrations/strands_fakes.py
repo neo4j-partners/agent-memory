@@ -542,13 +542,23 @@ class FakeAgent:
         self.state: dict[str, Any] = {}
 
 
-def turn_ended(agent: Any = None, stop_reason: str | None = "end_turn") -> Any:
+ONE_CALL: dict[str, Any] = {}  # the invocation_state of every turn_ended event by default
+
+
+def turn_ended(
+    agent: Any = None,
+    stop_reason: str | None = "end_turn",
+    invocation_state: dict[str, Any] | None = None,
+) -> Any:
     """An AfterInvocationEvent stand-in for a turn that ended this way.
 
     ``stop_reason=None`` is a call that raised or was cancelled, which
-    Strands reports with no result.
+    Strands reports with no result. The events share ``ONE_CALL`` as
+    their ``invocation_state`` unless given another, so they stand for one
+    call's events.
     """
     from types import SimpleNamespace
 
     result = None if stop_reason is None else SimpleNamespace(stop_reason=stop_reason)
-    return SimpleNamespace(agent=agent, result=result)
+    state = ONE_CALL if invocation_state is None else invocation_state
+    return SimpleNamespace(agent=agent, result=result, invocation_state=state)

@@ -90,6 +90,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returns the timestamp of the message stored before.
 - `add_messages_batch` now stores a timestamp in a named UTC zone at
   offset UTC, so batch messages read back in the right order.
+- Strands calls that overlap on one agent no longer end each other's
+  turn. Before, any call's AfterInvocationEvent ended the open turn. A
+  `structured_output_async` call during `invoke_async` reports no result,
+  so it discarded the prompt of the call it overlapped. The manager now
+  records the call that opened the turn by its `invocation_state`. Only
+  that call's end decides the turn. An overlapping call's messages fold
+  into it with a warning.
 - Strands redactions of a stored message now run one at a time. Before,
   two redactions could rewrite the same message at once, and each stored
   its own redacted copy. Each redaction now waits for the one before it
