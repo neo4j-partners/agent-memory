@@ -53,7 +53,7 @@ class _RecordingProvider:
         self,
         messages: Sequence[ChatMessage],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         timeout: float | None = None,
@@ -144,13 +144,13 @@ async def test_observer_falls_back_to_keywords_on_provider_error():
     assert "Session summary" in obs["reflections"][0]
 
 
-async def test_observer_summarization_sends_no_temperature():
+async def test_observer_summarization_sends_no_temperature() -> None:
     """The reflection call leaves temperature to the model's default."""
-    from tests.unit.llm.test_optional_temperature import _bedrock, _text_response
+    from tests.unit.llm._mocks import bedrock_provider, converse_text
 
     messages = [_FakeMessage(role="user", content=f"history line {i}") for i in range(40)]
-    provider, converse = _bedrock(
-        "bedrock/us.anthropic.claude-sonnet-5-5-v1:0", _text_response("Compressed.")
+    provider, converse = bedrock_provider(
+        "bedrock/us.anthropic.claude-sonnet-5-5-v1:0", converse_text("Compressed.")
     )
     observer = MemoryObserver(
         _FakeClient(messages),  # type: ignore[arg-type]

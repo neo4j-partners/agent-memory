@@ -26,7 +26,7 @@ class _RecordingProvider:
         self,
         messages: Sequence[ChatMessage],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         timeout: float | None = None,

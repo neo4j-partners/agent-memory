@@ -29,6 +29,7 @@ import pytest
 from pydantic import BaseModel
 
 from neo4j_agent_memory.llm.types import ChatMessage
+from tests.unit.llm._mocks import Block, FakeOpenAIClient, Recorder
 
 
 class _Extraction(BaseModel):
@@ -40,25 +41,6 @@ class _Extraction(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class _Recorder:
-    """Collects the kwargs each fake ``create()`` call received."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-
-    @property
-    def last(self) -> dict[str, Any]:
-        assert self.calls, "expected the adapter to issue a request"
-        return self.calls[-1]
-
-
-class _Block:
-    def __init__(self, type_: str, **fields: Any) -> None:
-        self.type = type_
-        for key, value in fields.items():
-            setattr(self, key, value)
-
-
 class _AnthropicUsage:
     input_tokens = 11
     output_tokens = 7
@@ -66,7 +48,7 @@ class _AnthropicUsage:
 
 
 class _AnthropicResponse:
-    def __init__(self, content: list[_Block]) -> None:
+    def __init__(self, content: list[Block]) -> None:
         self.content = content
         self.model = "claude-opus-5"
         self.usage = _AnthropicUsage()
@@ -77,7 +59,7 @@ class _AnthropicResponse:
 
 
 class _FakeAnthropicMessages:
-    def __init__(self, recorder: _Recorder, content: list[_Block]) -> None:
+    def __init__(self, recorder: Recorder, content: list[Block]) -> None:
         self._recorder = recorder
         self._content = content
 
@@ -87,62 +69,8 @@ class _FakeAnthropicMessages:
 
 
 class _FakeAnthropicClient:
-    def __init__(self, recorder: _Recorder, content: list[_Block]) -> None:
+    def __init__(self, recorder: Recorder, content: list[Block]) -> None:
         self.messages = _FakeAnthropicMessages(recorder, content)
-
-
-class _OpenAIUsage:
-    prompt_tokens = 5
-    completion_tokens = 3
-    total_tokens = 8
-    prompt_tokens_details = None
-
-
-class _OpenAIChoice:
-    def __init__(self, content: str) -> None:
-        self.message = _Block("message", content=content)
-        self.finish_reason = "stop"
-
-
-class _OpenAIResponse:
-    def __init__(self, content: str) -> None:
-        self.choices = [_OpenAIChoice(content)]
-        self.model = "gpt-5-mini"
-        self.usage = _OpenAIUsage()
-
-    def model_dump(self) -> dict[str, Any]:
-        return {}
-
-
-class _FakeOpenAICompletions:
-    def __init__(self, recorder: _Recorder, content: str) -> None:
-        self._recorder = recorder
-        self._content = content
-
-    async def create(self, **kwargs: Any) -> _OpenAIResponse:
-        self._recorder.calls.append(kwargs)
-        return _OpenAIResponse(self._content)
-
-
-class _FakeOpenAIEmbeddings:
-    def __init__(self, recorder: _Recorder, dimensions: int) -> None:
-        self._recorder = recorder
-        self._dimensions = dimensions
-
-    async def create(self, **kwargs: Any) -> Any:
-        self._recorder.calls.append(kwargs)
-        inputs = kwargs["input"]
-        data = [
-            _Block("embedding", index=i, embedding=[0.1] * self._dimensions)
-            for i in range(len(inputs))
-        ]
-        return _Block("response", data=data)
-
-
-class _FakeOpenAIClient:
-    def __init__(self, recorder: _Recorder, *, content: str = "hi", dimensions: int = 1536) -> None:
-        self.chat = _Block("chat", completions=_FakeOpenAICompletions(recorder, content))
-        self.embeddings = _FakeOpenAIEmbeddings(recorder, dimensions)
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +101,9 @@ def _assert_kwargs_accepted(sent: dict[str, Any], method: Any) -> None:
 async def test_anthropic_complete_omits_sampling_parameters() -> None:
     from neo4j_agent_memory.llm.adapters.anthropic import AnthropicProvider
 
-    recorder = _Recorder()
+    recorder = Recorder()
     provider = AnthropicProvider("anthropic/claude-opus-5", api_key="x")
-    provider._client = _FakeAnthropicClient(recorder, [_Block("text", text="hello")])  # type: ignore[assignment]
+    provider._client = _FakeAnthropicClient(recorder, [Block("text", text="hello")])  # type: ignore[assignment]
 
     completion = await provider.complete(
         [ChatMessage(role="system", content="be terse"), ChatMessage(role="user", content="hi")],
@@ -199,11 +127,11 @@ async def test_anthropic_complete_omits_sampling_parameters() -> None:
 async def test_anthropic_structured_omits_sampling_parameters() -> None:
     from neo4j_agent_memory.llm.adapters.anthropic import AnthropicProvider
 
-    recorder = _Recorder()
+    recorder = Recorder()
     provider = AnthropicProvider("anthropic/claude-opus-5", api_key="x")
     provider._client = _FakeAnthropicClient(  # type: ignore[assignment]
         recorder,
-        [_Block("tool_use", input={"value": "ok"}, name="submit_extraction")],
+        [Block("tool_use", input={"value": "ok"}, name="submit_extraction")],
     )
 
     result = await provider.complete_structured(
@@ -222,9 +150,9 @@ async def test_anthropic_request_keywords_exist_in_installed_sdk() -> None:
     anthropic = pytest.importorskip("anthropic")
     from neo4j_agent_memory.llm.adapters.anthropic import AnthropicProvider
 
-    recorder = _Recorder()
+    recorder = Recorder()
     provider = AnthropicProvider("anthropic/claude-opus-5", api_key="x", cache_system=True)
-    provider._client = _FakeAnthropicClient(recorder, [_Block("text", text="hello")])  # type: ignore[assignment]
+    provider._client = _FakeAnthropicClient(recorder, [Block("text", text="hello")])  # type: ignore[assignment]
 
     await provider.complete(
         [ChatMessage(role="system", content="s"), ChatMessage(role="user", content="u")],
@@ -260,9 +188,9 @@ async def test_openai_request_keywords_exist_in_installed_sdk() -> None:
     openai = pytest.importorskip("openai")
     from neo4j_agent_memory.llm.adapters.openai import OpenAIProvider
 
-    recorder = _Recorder()
+    recorder = Recorder()
     provider = OpenAIProvider("openai/gpt-5-mini", api_key="x")
-    provider._client = _FakeOpenAIClient(recorder)  # type: ignore[assignment]
+    provider._client = FakeOpenAIClient(recorder)  # type: ignore[assignment]
 
     client = openai.AsyncOpenAI(api_key="x")
 
@@ -275,9 +203,9 @@ async def test_openai_request_keywords_exist_in_installed_sdk() -> None:
     )
     _assert_kwargs_accepted(recorder.last, client.chat.completions.create)
 
-    structured_recorder = _Recorder()
+    structured_recorder = Recorder()
     structured = OpenAIProvider("openai/gpt-5-mini", api_key="x")
-    structured._client = _FakeOpenAIClient(  # type: ignore[assignment]
+    structured._client = FakeOpenAIClient(  # type: ignore[assignment]
         structured_recorder, content='{"value": "ok"}'
     )
     extraction = await structured.complete_structured(
@@ -296,9 +224,9 @@ async def test_openai_embedding_request_keywords_exist_in_installed_sdk() -> Non
     openai = pytest.importorskip("openai")
     from neo4j_agent_memory.llm.adapters.openai import OpenAIEmbeddingProvider
 
-    recorder = _Recorder()
+    recorder = Recorder()
     provider = OpenAIEmbeddingProvider("openai/text-embedding-3-small", dimensions=256)
-    provider._client = _FakeOpenAIClient(recorder, dimensions=256)  # type: ignore[assignment]
+    provider._client = FakeOpenAIClient(recorder, dimensions=256)  # type: ignore[assignment]
 
     vectors = await provider.embed(["a", "b"])
     assert [len(v) for v in vectors] == [256, 256]
