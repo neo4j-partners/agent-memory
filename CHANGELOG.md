@@ -98,6 +98,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bolt schema setup on `connect()` now reads the existing constraint and
+  index names with one `SHOW CONSTRAINTS` and one `SHOW INDEXES`, then
+  creates only the missing ones with `IF NOT EXISTS`. Before, it checked
+  each of 40 names in its own query, one after another. Against Aura that
+  took 13 to 15 seconds, so a cold `SharedMemory.open()` came close to
+  its 30-second default timeout. It now takes about 1.3 seconds. The
+  `setup_*` methods take an optional `existing=` set of names, and read
+  it once themselves when it is not given.
 - A Strands redaction whose delete commits and then fails or times out
   no longer lets a deferred extraction read the deleted text. The
   redaction now marks the message before the delete runs.

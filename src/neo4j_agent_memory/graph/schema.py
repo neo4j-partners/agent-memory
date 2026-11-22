@@ -92,16 +92,44 @@ class SchemaManager:
         self._backfill_relation_types = backfill_relation_types
 
     async def setup_all(self) -> None:
-        """Set up all indexes and constraints."""
-        await self.setup_constraints()
-        await self.setup_indexes()
+        """Set up all indexes and constraints.
+
+        Reads the existing constraint and index names once, in two queries,
+        and creates only the missing ones. Each create uses ``IF NOT
+        EXISTS``, so a database another process set up in the meantime is
+        left as it is.
+        """
+        constraints = await self._existing_names(queries.SHOW_CONSTRAINTS, "constraints")
+        indexes = await self._existing_names(queries.SHOW_INDEXES, "indexes")
+        await self.setup_constraints(existing=constraints)
+        await self.setup_indexes(existing=indexes)
         await self._backfill_relation_type()
         await self._backfill_entity_keys()
-        await self.setup_vector_indexes()
-        await self.setup_point_indexes()
+        await self.setup_vector_indexes(existing=indexes)
+        await self.setup_point_indexes(existing=indexes)
 
-    async def setup_constraints(self) -> None:
-        """Create unique constraints for all node types."""
+    async def _existing_names(self, query: str, kind: str) -> set[str]:
+        """Return the names that ``query`` (``SHOW CONSTRAINTS`` or
+        ``SHOW INDEXES``) lists.
+
+        Raises:
+            SchemaError: The names could not be read.
+        """
+        try:
+            rows = await self._client.execute_read(query)
+        except Exception as e:
+            raise SchemaError(f"Failed to read existing {kind}: {e}") from e
+        return {row["name"] for row in rows}
+
+    async def setup_constraints(self, *, existing: set[str] | None = None) -> None:
+        """Create unique constraints for all node types.
+
+        Args:
+            existing: Constraint names already in the database. Read with
+                one ``SHOW CONSTRAINTS`` when not given.
+        """
+        if existing is None:
+            existing = await self._existing_names(queries.SHOW_CONSTRAINTS, "constraints")
         constraints = [
             # Short-term memory
             ("conversation_id", "Conversation", "id"),
@@ -129,10 +157,18 @@ class SchemaManager:
         ]
 
         for constraint_name, label, property_name in constraints:
-            await self._create_constraint(constraint_name, label, property_name)
+            if constraint_name not in existing:
+                await self._create_constraint(constraint_name, label, property_name)
 
-    async def setup_indexes(self) -> None:
-        """Create regular indexes for common queries."""
+    async def setup_indexes(self, *, existing: set[str] | None = None) -> None:
+        """Create regular indexes for common queries.
+
+        Args:
+            existing: Index names already in the database. Read with one
+                ``SHOW INDEXES`` when not given.
+        """
+        if existing is None:
+            existing = await self._existing_names(queries.SHOW_INDEXES, "indexes")
         indexes = [
             # Short-term memory
             ("conversation_session_idx", "Conversation", "session_id"),
@@ -159,7 +195,8 @@ class SchemaManager:
         ]
 
         for index_name, label, property_name in indexes:
-            await self._create_index(index_name, label, property_name)
+            if index_name not in existing:
+                await self._create_index(index_name, label, property_name)
 
         # Text indexes back the resolution blocking queries' ``CONTAINS`` /
         # ``ENDS WITH`` lookups (exact surface-form bucket, name-suffix bucket).
@@ -168,7 +205,8 @@ class SchemaManager:
             ("entity_name_key_text_idx", "Entity", "name_key"),
         ]
         for index_name, label, property_name in text_indexes:
-            await self._create_index(index_name, label, property_name, text=True)
+            if index_name not in existing:
+                await self._create_index(index_name, label, property_name, text=True)
 
     # Vector indexes the library manages. Used by both
     # :meth:`setup_vector_indexes` and
@@ -182,10 +220,18 @@ class SchemaManager:
         ("step_embedding_idx", "ReasoningStep", "embedding"),
     )
 
-    async def setup_vector_indexes(self) -> None:
-        """Create vector indexes for semantic search."""
+    async def setup_vector_indexes(self, *, existing: set[str] | None = None) -> None:
+        """Create vector indexes for semantic search.
+
+        Args:
+            existing: Index names already in the database. Read with one
+                ``SHOW INDEXES`` when not given.
+        """
+        if existing is None:
+            existing = await self._existing_names(queries.SHOW_INDEXES, "indexes")
         for index_name, label, property_name in self._MANAGED_VECTOR_INDEXES:
-            await self._create_vector_index(index_name, label, property_name)
+            if index_name not in existing:
+                await self._create_vector_index(index_name, label, property_name)
 
     async def validate_vector_index_dimensions(self, expected: int) -> None:
         """Verify existing vector indexes match ``expected`` dimensions.
@@ -347,15 +393,23 @@ class SchemaManager:
         except Exception:
             logger.warning("Failed to backfill entity lookup keys.", exc_info=True)
 
-    async def setup_point_indexes(self) -> None:
-        """Create point indexes for geospatial queries."""
+    async def setup_point_indexes(self, *, existing: set[str] | None = None) -> None:
+        """Create point indexes for geospatial queries.
+
+        Args:
+            existing: Index names already in the database. Read with one
+                ``SHOW INDEXES`` when not given.
+        """
+        if existing is None:
+            existing = await self._existing_names(queries.SHOW_INDEXES, "indexes")
         point_indexes = [
             # Location entities have a 'location' Point property for coordinates
             ("entity_location_idx", "Entity", "location"),
         ]
 
         for index_name, label, property_name in point_indexes:
-            await self._create_point_index(index_name, label, property_name)
+            if index_name not in existing:
+                await self._create_point_index(index_name, label, property_name)
 
     async def _create_constraint(
         self,
@@ -363,12 +417,8 @@ class SchemaManager:
         label: str,
         property_name: str,
     ) -> None:
-        """Create a unique constraint if it doesn't exist."""
+        """Create a unique constraint. ``IF NOT EXISTS`` keeps it idempotent."""
         try:
-            exists = await self._client.check_constraint_exists(constraint_name)
-            if exists:
-                return
-
             query = queries.create_constraint_query(constraint_name, label, property_name)
             await self._client.execute_write(query)
         except Exception as e:
@@ -382,12 +432,9 @@ class SchemaManager:
         *,
         text: bool = False,
     ) -> None:
-        """Create a regular (range) or text index if it doesn't exist."""
+        """Create a regular (range) or text index. ``IF NOT EXISTS`` keeps it
+        idempotent."""
         try:
-            exists = await self._client.check_index_exists(index_name)
-            if exists:
-                return
-
             build = queries.create_text_index_query if text else queries.create_index_query
             query = build(index_name, label, property_name)
             await self._client.execute_write(query)
@@ -400,12 +447,8 @@ class SchemaManager:
         label: str,
         property_name: str,
     ) -> None:
-        """Create a vector index if it doesn't exist."""
+        """Create a vector index. ``IF NOT EXISTS`` keeps it idempotent."""
         try:
-            exists = await self._client.check_index_exists(index_name)
-            if exists:
-                return
-
             query = queries.create_vector_index_query(
                 index_name, label, property_name, self._vector_dimensions
             )
@@ -421,12 +464,9 @@ class SchemaManager:
         label: str,
         property_name: str,
     ) -> None:
-        """Create a point index for geospatial queries if it doesn't exist."""
+        """Create a point index for geospatial queries. ``IF NOT EXISTS`` keeps
+        it idempotent."""
         try:
-            exists = await self._client.check_index_exists(index_name)
-            if exists:
-                return
-
             query = queries.create_point_index_query(index_name, label, property_name)
             await self._client.execute_write(query)
         except Exception:
