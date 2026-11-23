@@ -802,6 +802,7 @@ class TestToolCallMirroring:
             )
             manager._flush_buffer()
             assert len(client.reasoning.traces) == 1
+            assert client.reasoning.traces[0]["completed"]
             assert client.reasoning.tool_calls[0]["tool_name"] == "search"
             assert client.reasoning.tool_calls[0]["arguments"] == {"q": "x"}
             # The text part is still persisted as a normal message.

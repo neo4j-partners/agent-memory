@@ -93,7 +93,7 @@ Should we approve credit for Acme Corp?
 Graph: Acme Corp —[BENEFICIAL_OWNER_OF]— Jane Doe (PERSON)
 Restored 2 messages for 'kyc-session'.
 Owner of 'kyc-session': analyst-1 (KYC analyst)
-Reasoning: Strands agent session -> tool call check_sanctions({'entity': 'Acme Corp'})
+Reasoning: Strands agent turn -> tool call check_sanctions({'entity': 'Acme Corp'})
 ```
 
 The demo clears its two sessions at startup so each run starts fresh; remove
@@ -152,9 +152,9 @@ search are bolt-only, so `Neo4jRetrievalConfig.include_preferences` /
   than the transcript.
 - **Retrieval is database-wide**, not session- or conversation-scoped. Scope
   preferences with `user_id=`; entity search has no scoping knob.
-- **Reasoning traces are left open.** `record_tool_calls=True` starts a trace
-  and records steps, but `close()` does not yet call `complete_trace()`, so
-  the trace has no outcome and no `success` flag.
+- **One reasoning trace per turn.** `record_tool_calls=True` records each
+  turn that used tools as one trace and completes it when the turn ends. A
+  turn still open when the manager closes gets no trace.
 
 ## Files
 

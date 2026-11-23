@@ -460,7 +460,14 @@ class FakeReasoning:
         self.tool_calls: list[dict[str, Any]] = []
 
     async def start_trace(self, session_id: str, task: str, **kwargs: Any) -> Any:
-        trace = {"id": uuid.uuid4(), "session_id": session_id, "task": task}
+        trace = {
+            "id": uuid.uuid4(),
+            "session_id": session_id,
+            "task": task,
+            "completed": False,
+            "outcome": None,
+            "success": None,
+        }
         self.traces.append(trace)
 
         class _T:
@@ -482,6 +489,10 @@ class FakeReasoning:
     ) -> Any:
         self.tool_calls.append({"step_id": step_id, "tool_name": tool_name, "arguments": arguments})
         return None
+
+    async def complete_trace(self, trace_id: Any, **kwargs: Any) -> None:
+        (trace,) = (t for t in self.traces if t["id"] == trace_id)
+        trace.update(completed=True, outcome=kwargs.get("outcome"), success=kwargs.get("success"))
 
 
 class FakeMemoryClient:

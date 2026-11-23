@@ -24,6 +24,7 @@ from neo4j_agent_memory.integrations.base import AsyncBridge  # noqa: E402
 from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E402
     Neo4jSessionManager,
     SessionException,
+    _Trace,
 )
 from neo4j_agent_memory.memory.short_term import Message, MessageRole  # noqa: E402
 from tests.unit.integrations.strands_fakes import FakeMemoryClient  # noqa: E402
@@ -385,7 +386,7 @@ class TestBackgroundHook:
         )
         blocks: Any = [{"toolUseId": "t1", "name": "lookup", "input": {}}]
 
-        manager._bridge.run(manager._arecord_tool_uses(blocks))
+        manager._bridge.run(manager._arecord_trace(_Trace("Q1", blocks, success=True)))
         await manager.aclose()
 
         assert hook.names("start") == ["tool-calls:sess-1"]

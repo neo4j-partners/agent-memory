@@ -83,6 +83,28 @@ _PERSIST_ERROR_POLICIES = ("raise", "warn")
 #: to AfterInvocationEvent. "paused" is a turn stopped by an interrupt.
 _TurnState = Literal["idle", "running", "paused"]
 
+#: The task of a turn's trace when the turn has no user text.
+_DEFAULT_TRACE_TASK = "Strands agent turn"
+
+#: The action of the step that holds a turn's outcome on NAMS, which has no
+#: trace outcome. It is not "direct response", so the NAMS AI provider does
+#: not put the step in prompts.
+_OUTCOME_ACTION = "turn outcome"
+
+_SUCCEEDED = "The turn succeeded."
+_FAILED = (
+    "The turn failed. The agent call raised or was cancelled, so its messages were not stored."
+)
+
+
+@dataclass(slots=True)
+class _Trace:
+    """A turn's tool uses, waiting to be recorded as one reasoning trace."""
+
+    task: str
+    blocks: list[ToolUse]
+    success: bool
+
 
 @dataclass(slots=True)
 class _Queued:
@@ -241,6 +263,17 @@ class Neo4jSessionManager(SessionManager):
     bridge does not wait. ``SharedMemory`` waits for them when it closes.
     NAMS extracts on the server, so the option does nothing there.
 
+    ``record_tool_calls`` records each turn that used tools as one
+    reasoning trace. Messages appended outside an agent call, such as a
+    direct tool call, count as one turn. The trace's task is the turn's
+    first user text. Each tool use is a step with its tool call. When the
+    turn ends, the trace is completed with ``success=True``, or with
+    ``success=False`` if the agent call raised or was cancelled. A failed
+    turn's messages are still not stored. NAMS keeps no trace outcome, so
+    there the outcome is one more step, with action ``"turn outcome"`` and
+    observation ``"success"`` or ``"failure"``. A turn that is still open
+    when the manager closes, or whose agent is freed, gets no trace.
+
     ``background_hook`` reports the work that outlives a write. It is
     called with a short name, such as ``"extract:<session_id>"``, when a
     deferred extraction or a tool-call recording starts. It returns a
@@ -344,7 +377,7 @@ class Neo4jSessionManager(SessionManager):
         # holds this manager through its hooks.
         self._agent_ref: weakref.ref[Agent] | None = None
         self._last_persisted: StoredMessage | None = None  # last stored (late redaction)
-        self._trace_id: UUID | None = None  # lazy reasoning trace (record_tool_calls)
+        self._traces: deque[_Trace] = deque()  # ended turns to record; under _queue_lock
         self._tool_record: asyncio.Task[None] | None = None  # latest mirroring; bridge loop only
         self._live_tool_records: set[asyncio.Task[None]] = set()  # unfinished; bridge loop only
         self._extraction: asyncio.Task[None] | None = None  # own latest deferred; bridge loop only
@@ -836,7 +869,8 @@ class Neo4jSessionManager(SessionManager):
         discards only what it added. A failed call that was not a resume
         keeps its whole turn, so the call that resumes it writes the whole
         turn. This returns None then. Any other failed turn is discarded
-        whole, and the turn goes idle.
+        whole, and the turn goes idle. Its tool uses are queued as a failed
+        trace.
         """
         if _interrupt_active(agent):
             self._turn_state = "paused"
@@ -845,6 +879,7 @@ class Neo4jSessionManager(SessionManager):
             discarded = len(self._turn) - self._resume_from
             del self._turn[self._resume_from :]
             return discarded
+        self._queue_trace_locked(success=False)
         discarded = len(self._turn)
         self._turn.clear()
         self._turn_state = "idle"
@@ -917,8 +952,25 @@ class Neo4jSessionManager(SessionManager):
             self._release_turn_locked()
 
     def _release_turn_locked(self) -> None:
+        self._queue_trace_locked(success=True)
         self._ready.extend(_Queued(message, self._turns_ended) for message in self._turn)
         self._turn.clear()
+
+    def _queue_trace_locked(self, *, success: bool) -> None:
+        """Queue the buffered turn's tool uses as one trace. Holds _queue_lock.
+
+        Only a turn with tool uses gets a trace, and only when
+        ``record_tool_calls`` is on. The task is the turn's first user
+        text. The drain records the trace before it writes its next
+        message, so a failed write never holds the trace back. See
+        ``_arecord_trace``.
+        """
+        blocks = [block for message in self._turn for block in self._tool_uses(message)]
+        if not blocks:
+            return
+        prompts = (_message_text(m) for m in self._turn if m.get("role") == "user")
+        task = next((text for text in prompts if text), _DEFAULT_TRACE_TASK)
+        self._traces.append(_Trace(task, blocks, success))
 
     def _release_idle_turn(self, *, closing: bool) -> None:
         """Move messages appended outside an agent call to the ready queue.
@@ -1121,9 +1173,10 @@ class Neo4jSessionManager(SessionManager):
         """How long a caller waits for a drain.
 
         Each step of a drain is bounded by ``request_timeout``, so a drain
-        can take that long per step for each queued message. One message
-        more covers a drain that is still finishing a popped message. A
-        deferred extraction runs after the drain, so it is not a step.
+        can take that long per step for each queued message or trace. One
+        message more covers a drain that is still finishing a popped
+        message. A deferred extraction runs after the drain, so it is not a
+        step.
 
         A redaction that lands while its message is being written adds one
         more step, and it is not counted. Strands redacts before the hook
@@ -1133,7 +1186,7 @@ class Neo4jSessionManager(SessionManager):
         extracts = self._extract_entities and not self._is_nams and not self._defer_extraction
         steps = 1 + int(extracts) + int(self._record_tool_calls)
         with self._queue_lock:
-            queued = len(self._ready)
+            queued = len(self._ready) + len(self._traces)
         return self._request_timeout * steps * (queued + 1)
 
     def _wait_failed(
@@ -1235,14 +1288,14 @@ class Neo4jSessionManager(SessionManager):
         queued before then, so a flush joins it instead of starting another.
         A close never joins. It starts its own drain, which runs once the
         running one ends and retries a message that drain failed on.
-        Returns None when the queue is empty, unless the manager is closing
-        while a drain still runs. The bridge is called outside the queue
-        lock.
+        Returns None when no message or trace is queued, unless the manager
+        is closing while a drain still runs. The bridge is called outside
+        the queue lock.
         """
         with self._queue_lock:
             run = self._drain_run
             running = run is not None and not run.done()
-            if not self._ready and not (self._closed and running):
+            if not self._ready and not self._traces and not (self._closed and running):
                 return None
             if run is not None and running and not self._closed:
                 return run
@@ -1287,6 +1340,9 @@ class Neo4jSessionManager(SessionManager):
         the later messages. If every later message is written, the drain
         raises ``_MessageDropped`` at the end. Any other failure marks the
         message as failed, stops the drain, and raises the error as is.
+
+        Each pass records the queued traces before it writes a message, so
+        a failed write never holds a trace back. See ``_arecord_trace``.
         """
         try:
             await self._adrain_locked(run)
@@ -1303,11 +1359,17 @@ class Neo4jSessionManager(SessionManager):
         async with self._drain_lock:
             while True:
                 with self._queue_lock:
-                    if not self._ready:
+                    traces = list(self._traces)
+                    self._traces.clear()
+                    if not traces and not self._ready:
                         if self._drain_run is run:
                             self._drain_run = None
                         break
-                    entry = self._ready[0]
+                    entry = self._ready[0] if self._ready else None
+                for trace in traces:
+                    await self._arecord_trace_bounded(trace)
+                if traces or entry is None:
+                    continue  # the queue may have changed while the traces were recorded
                 try:
                     written, stored = await self._awrite(entry)
                 except Exception as e:
@@ -1340,19 +1402,6 @@ class Neo4jSessionManager(SessionManager):
                         self._defer_extract(stored)
                     else:
                         await self._aextract(stored)
-                if blocks := self._tool_uses(latest):
-                    try:
-                        await asyncio.wait_for(
-                            self._arecord_tool_uses(blocks), self._request_timeout
-                        )
-                    except TimeoutError:
-                        logger.warning(
-                            "Tool calls of session %r are still being mirrored to "
-                            "reasoning memory after %ss. The recording goes on in "
-                            "the background.",
-                            self.session_id,
-                            self._request_timeout,
-                        )
         if dropped is not None:
             raise dropped
 
@@ -1464,10 +1513,10 @@ class Neo4jSessionManager(SessionManager):
         return result
 
     def _tool_uses(self, message: StrandsMessage) -> list[ToolUse]:
-        """The toolUse blocks to mirror into reasoning memory, if enabled.
+        """The toolUse blocks of ``message`` for its turn's trace, if enabled.
 
-        A message with no text (pure tool use or result) is not memory, so
-        only its tool uses are recorded.
+        A message with no text, such as a pure tool use, is not stored as a
+        message. Its tool uses still go in the trace.
         """
         if not self._record_tool_calls:
             return []
@@ -1592,26 +1641,36 @@ class Neo4jSessionManager(SessionManager):
         self._bridge.when_done(task, lambda: _report_done(name, done))
         return task
 
-    async def _arecord_tool_uses(self, blocks: list[ToolUse]) -> None:
-        """Mirror toolUse blocks into reasoning memory. Runs on the bridge loop.
+    async def _arecord_trace_bounded(self, trace: _Trace) -> None:
+        """Record ``trace``, waiting at most ``request_timeout``. Runs on the bridge loop."""
+        try:
+            await asyncio.wait_for(self._arecord_trace(trace), self._request_timeout)
+        except TimeoutError:
+            logger.warning(
+                "Tool calls of session %r are still being mirrored to "
+                "reasoning memory after %ss. The recording goes on in "
+                "the background.",
+                self.session_id,
+                self._request_timeout,
+            )
+
+    async def _arecord_trace(self, trace: _Trace) -> None:
+        """Record a turn's reasoning trace. Runs on the bridge loop.
 
         The recording runs as a shielded task, so a wait that runs out does
-        not cancel it. A started trace always has its id kept, so the next
-        message does not start a second trace. Every step gets its tool
-        call. Each recording waits for the one before it, so steps keep
-        their order. A failure is logged by the task and never raised.
+        not cancel it. Each recording waits for the one before it, so the
+        traces keep the order of their turns. A failure is logged by the
+        task and never raised.
         """
         previous = self._tool_record
-        task = self._start_background("tool-calls", self._arecord_after(previous, blocks))
+        task = self._start_background("tool-calls", self._arecord_after(previous, trace))
         self._tool_record = task
         self._live_tool_records.add(task)
         task.add_done_callback(self._live_tool_records.discard)  # also runs for one never started
         await asyncio.shield(task)
 
-    async def _arecord_after(
-        self, previous: asyncio.Task[None] | None, blocks: list[ToolUse]
-    ) -> None:
-        """Wait for the ``previous`` recording, then record ``blocks``.
+    async def _arecord_after(self, previous: asyncio.Task[None] | None, trace: _Trace) -> None:
+        """Wait for the ``previous`` recording, then record ``trace``.
 
         The error is logged here, since the waiter may have stopped waiting.
         A cancellation, which only closing the bridge causes, is logged too.
@@ -1619,7 +1678,7 @@ class Neo4jSessionManager(SessionManager):
         try:
             if previous is not None:
                 await asyncio.wait({previous})
-            await self._arecord_blocks(blocks)
+            await self._arecord_steps(trace)
         except asyncio.CancelledError:
             logger.warning(
                 "Mirroring of tool calls of session %r to reasoning memory was "
@@ -1630,19 +1689,30 @@ class Neo4jSessionManager(SessionManager):
         except Exception as e:
             logger.warning("Failed to mirror tool calls to reasoning memory: %s", _describe(e))
 
-    async def _arecord_blocks(self, blocks: list[ToolUse]) -> None:
-        """Record each block as a step and its tool call, starting the trace once."""
-        trace_id = self._trace_id
-        if trace_id is None:
-            key = await self._aresolve_key()
-            trace = await self._client.reasoning.start_trace(key, task="Strands agent session")
-            trace_id = self._trace_id = trace.id
-        for block in blocks:
+    async def _arecord_steps(self, trace: _Trace) -> None:
+        """Start the trace, record each tool use, and complete the trace.
+
+        Each tool use is a step with its tool call. NAMS keeps no trace
+        outcome, so there the outcome is one more step. Its action is
+        ``"turn outcome"``, its thought is the outcome, and its observation
+        is ``"success"`` or ``"failure"``.
+        """
+        reasoning = self._client.reasoning
+        key = await self._aresolve_key()
+        started = await reasoning.start_trace(key, task=trace.task)
+        for block in trace.blocks:
             name = block.get("name") or "unknown"
-            step = await self._client.reasoning.add_step(
-                trace_id, thought=f"Tool use: {name}", action=name
+            step = await reasoning.add_step(started.id, thought=f"Tool use: {name}", action=name)
+            await reasoning.record_tool_call(step.id, name, block.get("input") or {})
+        outcome = _SUCCEEDED if trace.success else _FAILED
+        if self._is_nams:
+            await reasoning.add_step(
+                started.id,
+                thought=outcome,
+                action=_OUTCOME_ACTION,
+                observation="success" if trace.success else "failure",
             )
-            await self._client.reasoning.record_tool_call(step.id, name, block.get("input") or {})
+        await reasoning.complete_trace(started.id, outcome=outcome, success=trace.success)
 
     def _tool_records_bound(self) -> float | None:
         """How long close waits for tool-call mirroring, the drain timeout.

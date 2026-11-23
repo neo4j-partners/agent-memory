@@ -32,6 +32,7 @@ from neo4j_agent_memory.integrations.base import AsyncBridge  # noqa: E402
 from neo4j_agent_memory.integrations.strands.session_manager import (  # noqa: E402
     Neo4jRetrievalConfig,
     Neo4jSessionManager,
+    _Trace,
 )
 from tests.unit.integrations.strands_fakes import (  # noqa: E402
     AgentNamespace,
@@ -876,7 +877,7 @@ def _uses_tools(manager: Neo4jSessionManager, agent: SimpleNamespace, *names: st
 class TestToolMirroringOutlivesItsWait:
     """A wait that runs out never cuts tool-call mirroring short."""
 
-    async def test_a_trace_that_starts_late_is_started_once(
+    async def test_a_trace_that_starts_late_is_recorded_before_the_next_one(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         client = FakeMemoryClient()
@@ -898,12 +899,13 @@ class TestToolMirroringOutlivesItsWait:
         await manager.aclose()
 
         reasoning = client.reasoning
-        (trace,) = reasoning.traces
+        first, second = reasoning.traces
         assert [(s["trace_id"], s["action"]) for s in reasoning.steps] == [
-            (trace["id"], "lookup"),
-            (trace["id"], "search"),
+            (first["id"], "lookup"),
+            (second["id"], "search"),
         ]
         assert len(reasoning.tool_calls) == 2
+        assert first["completed"] and second["completed"]
         assert any("background" in r.getMessage() for r in caplog.records)
 
     async def test_a_late_step_gets_its_tool_call_and_keeps_its_place(self) -> None:
@@ -986,7 +988,9 @@ class TestToolMirroringOutlivesItsWait:
         block: Any = {"toolUseId": "t1", "name": "lookup", "input": {}}
 
         async def scenario() -> int:  # on the bridge loop, where recordings run
-            waiter = asyncio.ensure_future(manager._arecord_tool_uses([block]))
+            waiter = asyncio.ensure_future(
+                manager._arecord_trace(_Trace("Q1", [block], success=True))
+            )
             await asyncio.sleep(0)  # the waiter starts the recording and waits on it
             assert manager._tool_record is not None
             manager._tool_record.cancel()  # before the recording takes its first step
@@ -1009,11 +1013,13 @@ class TestToolMirroringOutlivesItsWait:
         async def scenario() -> None:  # on the bridge loop, where recordings run
             gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
-            async def record(blocks: list[Any]) -> None:
+            async def record(trace: _Trace) -> None:
                 await gate
 
-            manager._arecord_blocks = record  # type: ignore[method-assign]
-            waiter = asyncio.ensure_future(manager._arecord_tool_uses([block]))
+            manager._arecord_steps = record  # type: ignore[method-assign]
+            waiter = asyncio.ensure_future(
+                manager._arecord_trace(_Trace("Q1", [block], success=True))
+            )
             await asyncio.sleep(0)
             await asyncio.sleep(0)  # the recording waits on the gate
             gate.set_result(None)  # the recording finishes in the next iteration

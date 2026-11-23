@@ -98,6 +98,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Strands session manager now completes the reasoning traces that
+  `record_tool_calls=True` starts. Before, it started one trace per
+  session, never completed it, and left it with no outcome and no
+  `success` flag. Now each turn that used tools gets its own trace, and
+  the trace's task is the turn's first user text. When the turn ends,
+  the manager calls `complete_trace()` with `success=True`. A call that
+  raised or was cancelled gets `success=False`, and its messages are
+  still not stored. NAMS keeps no trace outcome, so there the manager
+  adds a last step with action `"turn outcome"` and result `"success"`
+  or `"failure"`. A turn still open when the manager closes, or left
+  open by a freed agent, gets no trace.
 - Bolt schema setup on `connect()` now reads the existing constraint and
   index names with one `SHOW CONSTRAINTS` and one `SHOW INDEXES`, then
   creates only the missing ones with `IF NOT EXISTS`. Before, it checked
