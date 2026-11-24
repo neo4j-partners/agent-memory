@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Neo4jConfig.auth_manager`, an optional
+  `neo4j.auth_management.AsyncAuthManager`. When it is set, the client's
+  driver asks it for the login on each new connection and does not send
+  `username` and `password`. So a password rotated while the client is
+  connected can be picked up without a new client. It defaults to None,
+  and it is left out of `model_dump()`, `repr()` and the JSON schema.
 - `SharedMemory` in `neo4j_agent_memory.integrations.strands`. Build it
   once with `SharedMemory.open(settings)`, then call
   `session_manager(session_id)` for each session. All of its managers

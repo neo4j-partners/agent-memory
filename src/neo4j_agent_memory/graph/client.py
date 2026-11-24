@@ -13,6 +13,7 @@ from neo4j import (
     AsyncSession,
     unit_of_work,
 )
+from neo4j.auth_management import AsyncAuthManager
 from neo4j.exceptions import AuthError, ServiceUnavailable
 
 from neo4j_agent_memory.config.settings import Neo4jConfig
@@ -74,7 +75,7 @@ class Neo4jClient:
         try:
             self._driver = AsyncGraphDatabase.driver(
                 self._config.uri,
-                auth=(self._config.username, self._config.password.get_secret_value()),
+                auth=self._auth(),
                 max_connection_pool_size=self._config.max_connection_pool_size,
                 connection_timeout=self._config.connection_timeout,
                 max_transaction_retry_time=self._config.max_transaction_retry_time,
@@ -90,6 +91,12 @@ class Neo4jClient:
             raise ConnectionError(f"Neo4j service unavailable: {e}") from e
         except Exception as e:
             raise ConnectionError(f"Failed to connect to Neo4j: {e}") from e
+
+    def _auth(self) -> AsyncAuthManager | tuple[str, str]:
+        """Return the config's auth manager, or its fixed login when it has none."""
+        if self._config.auth_manager is not None:
+            return self._config.auth_manager
+        return (self._config.username, self._config.password.get_secret_value())
 
     async def close(self) -> None:
         """Close the Neo4j connection."""

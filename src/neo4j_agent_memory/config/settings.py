@@ -6,7 +6,9 @@ import warnings
 from enum import Enum
 from typing import Any, Literal
 
+from neo4j.auth_management import AsyncAuthManager
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic.json_schema import SkipJsonSchema
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from pydantic_settings.sources import DotEnvSettingsSource
 
@@ -79,9 +81,16 @@ class ResolverStrategy(str, Enum):
 
 
 class Neo4jConfig(BaseModel):
-    """Neo4j connection configuration."""
+    """Neo4j connection configuration.
 
-    model_config = _STRICT_CONFIG
+    ``auth_manager`` replaces the fixed ``username`` and ``password`` login.
+    The driver then asks it for the login each time it opens a connection,
+    so a password rotated while the client is connected can be picked up
+    without a new client. ``password`` is still required and is not sent
+    while ``auth_manager`` is set.
+    """
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     uri: str = Field(default="bolt://localhost:7687", description="Neo4j connection URI")
     username: str = Field(default="neo4j", description="Neo4j username")
@@ -112,6 +121,15 @@ class Neo4jConfig(BaseModel):
     keep_alive: bool = Field(
         default=True,
         description="Enable TCP keep-alive on connections to prevent idle drops.",
+    )
+    # A live object, so it is left out of model_dump(), repr() and the JSON
+    # schema. Existing configs dump and validate as before.
+    auth_manager: SkipJsonSchema[AsyncAuthManager | None] = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+        description="An async auth manager the driver asks for the login. "
+        "When set, username and password are not sent.",
     )
 
 
