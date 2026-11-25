@@ -635,6 +635,32 @@ class TestAdd:
             await store.add("Ada works at Acme", {"kind": "fact"})
 
     @pytest.mark.asyncio
+    async def test_kind_fact_links_the_store_user(self) -> None:
+        client = FakeMemoryClient()
+        store = _store(name="graph", client=client, user_id="alice")
+        await store.initialize()
+
+        await store.add(
+            "Ada works at Acme",
+            {"kind": "fact", "subject": "Ada", "predicate": "works_at", "object": "Acme"},
+        )
+
+        assert client.long_term.added_fact_users == ["alice"]
+
+    @pytest.mark.asyncio
+    async def test_kind_fact_without_a_store_user_links_none(self) -> None:
+        client = FakeMemoryClient()
+        store = _store(name="graph", client=client)
+        await store.initialize()
+
+        await store.add(
+            "Ada works at Acme",
+            {"kind": "fact", "subject": "Ada", "predicate": "works_at", "object": "Acme"},
+        )
+
+        assert client.long_term.added_fact_users == [None]
+
+    @pytest.mark.asyncio
     async def test_kind_entity_routes_to_add_entity(self) -> None:
         client = FakeMemoryClient()
         store = _store(name="graph", client=client)

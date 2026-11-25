@@ -32,6 +32,7 @@ from neo4j_agent_memory.integrations.strands._messages import (
 )
 from neo4j_agent_memory.integrations.strands._retrieval import (
     Neo4jRetrievalConfig,
+    RecalledEntry,
     _retrieve_context,
 )
 
@@ -75,7 +76,7 @@ _COEXISTENCE_HINT = (
     "extract_entities=False on Neo4jSessionManager (let the store own extraction)."
 )
 
-__all__ = ["Neo4jRetrievalConfig", "Neo4jSessionManager"]
+__all__ = ["Neo4jRetrievalConfig", "Neo4jSessionManager", "RecalledEntry"]
 
 _PERSIST_ERROR_POLICIES = ("raise", "warn")
 
@@ -386,6 +387,22 @@ class Neo4jSessionManager(SessionManager):
         self._closed = False
         self._closing: concurrent.futures.Future[None] | None = None  # done when close ends
         self._warned_double_injection = False
+        # The entries the last recall put in the prompt. Each recall replaces
+        # the whole tuple, so a reader never sees a partial list.
+        self._last_recall: tuple[RecalledEntry, ...] = ()
+
+    @property
+    def last_recall(self) -> tuple[RecalledEntry, ...]:
+        """The long-term memory entries the last recall added to the prompt.
+
+        With ``retrieval_config`` set, each user message with text runs a
+        recall, and this holds what it found, in the order the prompt lists
+        it. Read it after a turn to see which entries the model was given.
+        It is empty before the first recall, without ``retrieval_config``,
+        and after a recall that found nothing or failed. A user message with
+        no text runs no recall and leaves it as it was.
+        """
+        return self._last_recall
 
     @property
     def _is_nams(self) -> bool:
@@ -911,8 +928,9 @@ class Neo4jSessionManager(SessionManager):
         )
         if target is None or target["text"].startswith(f"<{cfg.context_tag}>\nRelevant memory:\n"):
             return  # no text block, or already injected (event re-fired)
+        self._last_recall = ()
         try:
-            block = await self._bridge.run_async(
+            recall = await self._bridge.run_async(
                 _retrieve_context(
                     self._client.long_term,
                     query,
@@ -929,8 +947,9 @@ class Neo4jSessionManager(SessionManager):
                 e,
             )
             return
-        if block:
-            target["text"] = f"{block}\n{target['text']}"
+        self._last_recall = recall.entries
+        if recall.block:
+            target["text"] = f"{recall.block}\n{target['text']}"
 
     def append_message(self, message: StrandsMessage, agent: Agent, **kwargs: Any) -> None:
         """Buffer the new message in the current turn. Does no I/O.

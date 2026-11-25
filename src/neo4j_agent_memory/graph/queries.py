@@ -395,6 +395,28 @@ RETURN node AS e, score
 ORDER BY score DESC
 """
 
+# The same vector search, limited to the entities one user has mentioned.
+# ``:Entity`` nodes and the vector index are global, so the user is found
+# through the mention path that extraction writes, as in the resolver's
+# _FOR_USER queries: ``(:Conversation {user_identifier})-[:HAS_MESSAGE]->
+# (:Message)-[:MENTIONS]->(:Entity)``. The index returns ``$candidates``
+# nearest entities before the filter, more than ``$limit``, so a user whose
+# entities are a small slice of the graph still gets up to ``$limit`` hits.
+# The EXISTS check starts from each candidate and stops at the first
+# mention in one of the user's conversations.
+SEARCH_ENTITIES_BY_EMBEDDING_FOR_USER = """
+CALL db.index.vector.queryNodes('entity_embedding_idx', $candidates, $embedding)
+YIELD node, score
+WHERE score >= $threshold
+  AND EXISTS {
+      MATCH (:Conversation {user_identifier: $user_identifier})-[:HAS_MESSAGE]->(:Message)
+            -[:MENTIONS]->(node)
+  }
+RETURN node AS e, score
+ORDER BY score DESC
+LIMIT $limit
+"""
+
 SEARCH_ENTITIES_BY_TYPE = """
 MATCH (e:Entity {type: $type})
 RETURN e
@@ -518,6 +540,20 @@ YIELD node, score
 WHERE score >= $threshold
 RETURN node AS f, score
 ORDER BY score DESC
+"""
+
+# The same vector search, limited to the facts linked to one user through
+# ``(:User)-[:HAS_FACT]->(:Fact)``, which ``add_fact(user_identifier=...)``
+# writes. As with entities, the index returns ``$candidates`` nearest facts
+# before the filter, more than ``$limit``.
+SEARCH_FACTS_BY_EMBEDDING_FOR_USER = """
+CALL db.index.vector.queryNodes('fact_embedding_idx', $candidates, $embedding)
+YIELD node, score
+WHERE score >= $threshold
+  AND EXISTS { MATCH (:User {identifier: $user_identifier})-[:HAS_FACT]->(node) }
+RETURN node AS f, score
+ORDER BY score DESC
+LIMIT $limit
 """
 
 FIND_DUPLICATE_FACTS = """

@@ -325,7 +325,12 @@ class TestHooksDoNotBlockTheLoop:
         client = FakeMemoryClient()
         client.long_term.entities = [
             SimpleNamespace(
-                display_name="Acme", type="ORGANIZATION", full_type="ORGANIZATION", description=None
+                id="entity-1",
+                display_name="Acme",
+                type="ORGANIZATION",
+                full_type="ORGANIZATION",
+                description=None,
+                metadata={},
             )
         ]
         original = client.long_term.search_entities

@@ -73,6 +73,7 @@ try:
     from neo4j_agent_memory.integrations.strands.session_manager import (
         Neo4jRetrievalConfig,
         Neo4jSessionManager,
+        RecalledEntry,
     )
     from neo4j_agent_memory.integrations.strands.shared import SharedMemory
     from neo4j_agent_memory.integrations.strands.tools import (
@@ -94,6 +95,7 @@ try:
         "llm_provider_from_strands",
         "Neo4jSessionManager",
         "Neo4jRetrievalConfig",
+        "RecalledEntry",
         "SharedMemory",
         "Neo4jMemoryStore",
         "Neo4jMemoryStoreConfig",

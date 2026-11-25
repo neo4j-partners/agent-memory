@@ -290,8 +290,13 @@ class LongTermProtocol(Protocol):
         valid_until: datetime | None = None,
         generate_embedding: bool = True,
         metadata: dict[str, Any] | None = None,
+        user_identifier: str | None = None,
     ) -> Fact:
-        """Record a subject-predicate-object fact."""
+        """Record a subject-predicate-object fact.
+
+        ``user_identifier``, when provided, links the fact to that user with
+        ``(:User)-[:HAS_FACT]->(:Fact)``.
+        """
         ...
 
     async def add_relationship(
@@ -316,11 +321,14 @@ class LongTermProtocol(Protocol):
         entity_types: list[str] | None = None,
         limit: int = 10,
         threshold: float = 0.7,
+        user_identifier: str | None = None,
     ) -> list[Entity]:
         """Vector/keyword search across entities, limited to at most `limit` results.
 
         ``entity_types``, when provided, restricts results to the given
         POLE+O types. ``threshold`` sets the minimum similarity score.
+        ``user_identifier``, when provided, restricts results to entities
+        mentioned in that user's conversations. NAMS ignores it.
         """
         ...
 
@@ -372,8 +380,13 @@ class LongTermProtocol(Protocol):
         *,
         limit: int = 10,
         threshold: float = 0.7,
+        user_identifier: str | None = None,
     ) -> list[Fact]:
-        """Vector/keyword search across facts."""
+        """Vector/keyword search across facts.
+
+        ``user_identifier``, when provided, restricts results to the facts
+        linked to that user.
+        """
         ...
 
     async def get_entity_by_name(self, name: str) -> Entity | None:

@@ -101,6 +101,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only messages from the current turn stay queued. A failure at close
   leaves messages unwritten for good, so in both modes it is logged as
   an ERROR with their number. Failures to restore history still raise.
+- `LongTermMemory.search_entities(user_identifier=...)` on bolt. It
+  returns only the entities mentioned in that user's conversations. The
+  link is `(:Conversation {user_identifier})-[:HAS_MESSAGE]->(:Message)
+  -[:MENTIONS]->(:Entity)`, which extraction writes. Without a user, the
+  search covers every user's entities, as before. NAMS ignores the
+  argument.
+- `LongTermMemory.add_fact(user_identifier=...)` on bolt. It writes
+  `(:User)-[:HAS_FACT]->(:Fact)`, the same way `add_preference` writes
+  `HAS_PREFERENCE`. A deduplicated fact is linked to each user who adds
+  it. Without a user, no edge is written, as before.
+  `search_facts(user_identifier=...)` returns only the facts with that
+  edge. Facts written before this change have no owner, so a scoped
+  search does not return them. Without a user, the search covers every
+  fact.
+- Both scoped searches ask the vector index for ten candidates per
+  requested hit, then keep the user's own, up to `limit`. A user who
+  owns only a small share of the nearest entries can still get fewer
+  than `limit` hits.
+- `Neo4jSessionManager` passes its `user_id` to the entity and fact
+  searches of each recall, as it already did for preferences.
+- `Neo4jSessionManager.last_recall`, a tuple of `RecalledEntry`. Each
+  entry holds the `kind` (`"entity"`, `"preference"`, or `"fact"`),
+  `id`, `type`, `text`, and `score` of one entry the last recall put in
+  the prompt, in prompt order. `score` is `None` when the search gives
+  no similarity, as for a user's preference listing. The tuple is empty
+  before the first recall and after a recall that found nothing or
+  failed. The prompt text is unchanged.
+- `Neo4jMemoryStore` passes its `user_id` to `add_fact` for a
+  `kind="fact"` entry.
 
 ### Fixed
 

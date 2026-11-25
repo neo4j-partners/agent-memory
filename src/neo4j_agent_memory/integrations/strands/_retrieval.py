@@ -8,10 +8,11 @@ nothing about Strands sessions, hooks, or buffering.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from neo4j_agent_memory.core.protocols import LongTermProtocol
@@ -57,6 +58,73 @@ def _format_fact(fact: Fact) -> str:
     return f"[fact] {fact.subject} {fact.predicate} {fact.object}"
 
 
+@dataclass(frozen=True)
+class RecalledEntry:
+    """One long-term memory entry that a recall put in the model's context.
+
+    ``kind`` is ``"entity"``, ``"preference"``, or ``"fact"``. ``id`` is the
+    entry's ID as a string. ``type`` is the entity's type, the preference's
+    category, or the fact's predicate. ``text`` is the entity's display
+    name, the preference text, or the fact as "subject predicate object".
+    ``score`` is the vector similarity, or None when the search gives none,
+    as NAMS searches and the user-scoped preference listing do.
+    """
+
+    kind: str
+    id: str
+    type: str
+    text: str
+    score: float | None
+
+
+def _recalled_entity(entity: Entity) -> RecalledEntry:
+    return RecalledEntry(
+        kind="entity",
+        id=str(entity.id),
+        type=entity.full_type or entity.type,
+        text=entity.display_name,
+        score=entity.metadata.get("similarity"),
+    )
+
+
+def _recalled_preference(preference: Preference) -> RecalledEntry:
+    return RecalledEntry(
+        kind="preference",
+        id=str(preference.id),
+        type=preference.category,
+        text=preference.preference,
+        score=preference.metadata.get("similarity"),
+    )
+
+
+def _recalled_fact(fact: Fact) -> RecalledEntry:
+    return RecalledEntry(
+        kind="fact",
+        id=str(fact.id),
+        type=fact.predicate,
+        text=f"{fact.subject} {fact.predicate} {fact.object}",
+        score=fact.metadata.get("similarity"),
+    )
+
+
+def _entity_search(
+    long_term: LongTermProtocol, user_id: str | None
+) -> Callable[..., Awaitable[list[Any]]]:
+    """The entity search, limited to ``user_id``'s entities when one is set."""
+    if user_id is None:
+        return long_term.search_entities
+    return functools.partial(long_term.search_entities, user_identifier=user_id)
+
+
+def _fact_search(
+    long_term: LongTermProtocol, user_id: str | None
+) -> Callable[..., Awaitable[list[Any]]]:
+    """The fact search, limited to ``user_id``'s facts when one is set."""
+    if user_id is None:
+        return long_term.search_facts
+    return functools.partial(long_term.search_facts, user_identifier=user_id)
+
+
 def _preference_search(
     long_term: LongTermProtocol, user_id: str | None
 ) -> Callable[..., Awaitable[list[Any]]]:
@@ -79,6 +147,13 @@ def _preference_search(
     return _scoped
 
 
+class _Recall(NamedTuple):
+    """The context block for the prompt, and the entries it holds."""
+
+    block: str
+    entries: tuple[RecalledEntry, ...]
+
+
 async def _retrieve_context(
     long_term: LongTermProtocol,
     query: str,
@@ -86,40 +161,65 @@ async def _retrieve_context(
     *,
     nams: bool,
     user_id: str | None = None,
-) -> str:
+) -> _Recall:
     """Run the configured long-term searches concurrently and format the block.
 
-    Returns ``""`` when nothing relevant is found (no empty tags).
+    The block is ``""`` when nothing relevant is found (no empty tags).
+    ``entries`` lists each hit in the block, in the same order.
     Individual search failures are logged and skipped — a memory lookup
     must never break the agent's turn.
     """
     # A heterogeneous dispatch table: each row pairs a long-term search with the
-    # formatter for its result type. The per-type formatters above are precisely
-    # typed; the table itself can only be typed at the loose ``Callable[...]``
-    # supertype because the rows hold different concrete signatures.
+    # formatter and the recalled-entry builder for its result type. The
+    # per-type functions above are precisely typed; the table itself can only
+    # be typed at the loose ``Callable[...]`` supertype because the rows hold
+    # different concrete signatures.
     # NAMS has no preference/fact search endpoints — skip rather than warn every turn.
-    wanted: list[tuple[bool, Callable[..., Awaitable[list[Any]]], Callable[..., str]]] = [
-        (cfg.include_entities, long_term.search_entities, _format_entity),
+    wanted: list[
+        tuple[
+            bool,
+            Callable[..., Awaitable[list[Any]]],
+            Callable[..., str],
+            Callable[..., RecalledEntry],
+        ]
+    ] = [
+        (
+            cfg.include_entities,
+            _entity_search(long_term, user_id),
+            _format_entity,
+            _recalled_entity,
+        ),
         (
             cfg.include_preferences and not nams,
             _preference_search(long_term, user_id),
             _format_preference,
+            _recalled_preference,
         ),
-        (cfg.include_facts and not nams, long_term.search_facts, _format_fact),
+        (
+            cfg.include_facts and not nams,
+            _fact_search(long_term, user_id),
+            _format_fact,
+            _recalled_fact,
+        ),
     ]
-    searches = [s(query, limit=cfg.top_k, threshold=cfg.min_score) for on, s, _ in wanted if on]
-    formatters = [f for on, _, f in wanted if on]
-    results = await asyncio.gather(*searches, return_exceptions=True)
+    active = [(s, f, r) for on, s, f, r in wanted if on]
+    results = await asyncio.gather(
+        *(s(query, limit=cfg.top_k, threshold=cfg.min_score) for s, _, _ in active),
+        return_exceptions=True,
+    )
     lines: list[str] = []
-    for formatter, result in zip(formatters, results):
+    entries: list[RecalledEntry] = []
+    for (_, formatter, recalled), result in zip(active, results):
         if isinstance(result, BaseException):
             logger.warning("Long-term memory search failed: %s", result)
             continue
         lines.extend(formatter(item) for item in result)
+        entries.extend(recalled(item) for item in result)
     if not lines:
-        return ""
+        return _Recall("", ())
     body = "\n".join(f"- {line}" for line in lines)
-    return f"<{cfg.context_tag}>\nRelevant memory:\n{body}\n</{cfg.context_tag}>"
+    block = f"<{cfg.context_tag}>\nRelevant memory:\n{body}\n</{cfg.context_tag}>"
+    return _Recall(block, tuple(entries))
 
 
 @dataclass
@@ -210,14 +310,14 @@ async def _retrieve_entries(
     wanted: list[
         tuple[str, bool, Callable[..., Awaitable[list[Any]]], Callable[..., _EntryRow]]
     ] = [
-        ("entity", include_entities, long_term.search_entities, _entity_row),
+        ("entity", include_entities, _entity_search(long_term, user_id), _entity_row),
         (
             "preference",
             include_preferences and not nams,
             _preference_search(long_term, user_id),
             _preference_row,
         ),
-        ("fact", include_facts and not nams, long_term.search_facts, _fact_row),
+        ("fact", include_facts and not nams, _fact_search(long_term, user_id), _fact_row),
     ]
     active = [(kind, search, row) for kind, on, search, row in wanted if on]
     results = await asyncio.gather(

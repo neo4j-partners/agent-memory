@@ -386,7 +386,7 @@ class Neo4jMemoryStore(MemoryStore):
                     f"Neo4jMemoryStore '{self.name}': kind='fact' requires "
                     "subject, predicate and object in metadata"
                 )
-            fact = await long_term.add_fact(subject, predicate, obj)
+            fact = await long_term.add_fact(subject, predicate, obj, user_identifier=self.user_id)
             return {"kind": "fact", "id": str(fact.id)}
         if kind == "entity":
             # add_entity returns (Entity, DeduplicationResult) on bolt but a bare

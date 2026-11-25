@@ -372,8 +372,10 @@ class MockLongTermMemory:
         entity_types: list[EntityType | str] | None = None,
         limit: int = 10,
         threshold: float = 0.7,
+        user_identifier: str | None = None,
     ) -> list[Entity]:
-        """Search entities (simple string matching)."""
+        """Search entities (simple string matching). The mock keeps no users,
+        so ``user_identifier`` does not filter."""
         results = []
         query_lower = query.lower()
 

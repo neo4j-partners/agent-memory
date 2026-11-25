@@ -301,6 +301,12 @@ class EntityType(str, Enum):
 # POLE+O type constants for convenience
 POLEO_TYPES = ["PERSON", "OBJECT", "LOCATION", "EVENT", "ORGANIZATION"]
 
+# A user-scoped vector search asks the global index for this many candidates
+# per requested hit, then keeps the user's own. The index limit applies
+# before the user filter, so asking for only ``limit`` would leave a user
+# whose entries are a small slice of the graph with few or no hits.
+_USER_SCOPE_CANDIDATES_PER_HIT = 10
+
 
 def normalize_entity_type(entity_type: str | EntityType) -> str:
     """Normalize entity type to uppercase string."""
@@ -1153,6 +1159,7 @@ class LongTermMemory(BaseMemory[Entity], LongTermProtocol):
         valid_until: datetime | None = None,
         generate_embedding: bool = True,
         metadata: dict[str, Any] | None = None,
+        user_identifier: str | None = None,
     ) -> Fact:
         """
         Add a declarative fact with deduplication.
@@ -1170,6 +1177,11 @@ class LongTermMemory(BaseMemory[Entity], LongTermProtocol):
             valid_until: End of validity
             generate_embedding: Whether to generate embedding
             metadata: Optional metadata
+            user_identifier: When provided, writes a
+                ``(:User)-[:HAS_FACT]->(:Fact)`` edge linking the fact to the
+                user's :User node, as ``add_preference`` does for
+                preferences. ``search_facts(user_identifier=...)`` reads
+                that edge. When None, no user edge is written.
 
         Returns:
             The created or existing fact
@@ -1205,6 +1217,11 @@ class LongTermMemory(BaseMemory[Entity], LongTermProtocol):
                     )
                     existing = self._parse_fact(existing_data)
                     existing.metadata["deduplicated"] = True
+                    # As in add_preference, a dedupe hit still links this
+                    # caller's user, who may be another user stating the
+                    # same fact.
+                    if user_identifier is not None:
+                        await self._link_user_to_fact(user_identifier, str(existing.id))
                     return existing
             except Exception:
                 pass  # Vector index may not exist yet; proceed with creation
@@ -1238,7 +1255,23 @@ class LongTermMemory(BaseMemory[Entity], LongTermProtocol):
             },
         )
 
+        if user_identifier is not None:
+            await self._link_user_to_fact(user_identifier, str(fact.id))
+
         return fact
+
+    async def _link_user_to_fact(self, user_identifier: str, fact_id: str) -> None:
+        """Idempotently write ``(:User)-[:HAS_FACT]->(:Fact)``."""
+        await self._client.execute_write(
+            """
+            MERGE (u:User {identifier: $user_identifier})
+            ON CREATE SET u.id = $user_identifier, u.created_at = datetime()
+            WITH u
+            MATCH (f:Fact {id: $fact_id})
+            MERGE (u)-[:HAS_FACT]->(f)
+            """,
+            {"user_identifier": user_identifier, "fact_id": fact_id},
+        )
 
     async def add_relationship(
         self,
@@ -1407,6 +1440,7 @@ class LongTermMemory(BaseMemory[Entity], LongTermProtocol):
         entity_types: list[EntityType | str] | None = None,
         limit: int = 10,
         threshold: float = 0.7,
+        user_identifier: str | None = None,
     ) -> list[Entity]:
         """
         Search for entities by semantic similarity.
@@ -1416,6 +1450,11 @@ class LongTermMemory(BaseMemory[Entity], LongTermProtocol):
             entity_types: Optional filter by entity types
             limit: Maximum results
             threshold: Minimum similarity threshold
+            user_identifier: When given, return only entities mentioned in
+                this user's conversations, reached through
+                ``(:Conversation {user_identifier})-[:HAS_MESSAGE]->
+                (:Message)-[:MENTIONS]->(:Entity)``. When None, search every
+                user's entities.
 
         Returns:
             List of matching entities
@@ -1425,14 +1464,26 @@ class LongTermMemory(BaseMemory[Entity], LongTermProtocol):
 
         query_embedding = await self._embedder.embed(query)
 
-        results = await self._client.execute_read(
-            queries.SEARCH_ENTITIES_BY_EMBEDDING,
-            {
-                "embedding": query_embedding,
-                "limit": limit,
-                "threshold": threshold,
-            },
-        )
+        if user_identifier is None:
+            results = await self._client.execute_read(
+                queries.SEARCH_ENTITIES_BY_EMBEDDING,
+                {
+                    "embedding": query_embedding,
+                    "limit": limit,
+                    "threshold": threshold,
+                },
+            )
+        else:
+            results = await self._client.execute_read(
+                queries.SEARCH_ENTITIES_BY_EMBEDDING_FOR_USER,
+                {
+                    "embedding": query_embedding,
+                    "candidates": limit * _USER_SCOPE_CANDIDATES_PER_HIT,
+                    "limit": limit,
+                    "threshold": threshold,
+                    "user_identifier": user_identifier,
+                },
+            )
 
         # Normalize filter types
         filter_types: set[str] | None = None
@@ -2538,6 +2589,7 @@ class LongTermMemory(BaseMemory[Entity], LongTermProtocol):
         *,
         limit: int = 10,
         threshold: float = 0.7,
+        user_identifier: str | None = None,
     ) -> list[Fact]:
         """
         Search for facts by semantic similarity.
@@ -2546,6 +2598,10 @@ class LongTermMemory(BaseMemory[Entity], LongTermProtocol):
             query: Search query
             limit: Maximum results
             threshold: Minimum similarity threshold
+            user_identifier: When given, return only facts linked to this
+                user through ``(:User)-[:HAS_FACT]->(:Fact)``. Facts added
+                without a user have no such edge, so a scoped search never
+                returns them. When None, search every fact.
 
         Returns:
             List of matching facts
@@ -2555,14 +2611,26 @@ class LongTermMemory(BaseMemory[Entity], LongTermProtocol):
 
         query_embedding = await self._embedder.embed(query)
 
-        results = await self._client.execute_read(
-            queries.SEARCH_FACTS_BY_EMBEDDING,
-            {
-                "embedding": query_embedding,
-                "limit": limit,
-                "threshold": threshold,
-            },
-        )
+        if user_identifier is None:
+            results = await self._client.execute_read(
+                queries.SEARCH_FACTS_BY_EMBEDDING,
+                {
+                    "embedding": query_embedding,
+                    "limit": limit,
+                    "threshold": threshold,
+                },
+            )
+        else:
+            results = await self._client.execute_read(
+                queries.SEARCH_FACTS_BY_EMBEDDING_FOR_USER,
+                {
+                    "embedding": query_embedding,
+                    "candidates": limit * _USER_SCOPE_CANDIDATES_PER_HIT,
+                    "limit": limit,
+                    "threshold": threshold,
+                    "user_identifier": user_identifier,
+                },
+            )
 
         facts = []
         for row in results:

@@ -1020,17 +1020,30 @@ class TestRetrievalInjection:
         manager, client = _make_manager(retrieval_config=Neo4jRetrievalConfig(include_facts=True))
         client.long_term.entities = [
             SimpleNamespace(
+                id="entity-1",
                 display_name="Acme",
                 type="ORGANIZATION",
                 full_type="ORGANIZATION",
                 description="customer",
+                metadata={"similarity": 0.91},
             )
         ]
         client.long_term.preferences = [
-            SimpleNamespace(category="style", preference="concise answers")
+            SimpleNamespace(
+                id="preference-1",
+                category="style",
+                preference="concise answers",
+                metadata={"similarity": 0.62},
+            )
         ]
         client.long_term.facts = [
-            SimpleNamespace(subject="Jane", predicate="works_at", object="Acme")
+            SimpleNamespace(
+                id="fact-1",
+                subject="Jane",
+                predicate="works_at",
+                object="Acme",
+                metadata={"similarity": 0.55},
+            )
         ]
         return manager, client
 
@@ -1315,10 +1328,14 @@ class TestRetrievalInjectionTenancy:
         )
         # What an unscoped search would have surfaced.
         client.long_term.preferences = [
-            SimpleNamespace(category="style", preference="somebody else's style")
+            SimpleNamespace(
+                id="preference-2", category="style", preference="somebody else's style", metadata={}
+            )
         ]
         client.long_term.preferences_by_user["alice"] = [
-            SimpleNamespace(category="style", preference="concise answers")
+            SimpleNamespace(
+                id="preference-1", category="style", preference="concise answers", metadata={}
+            )
         ]
         try:
             manager.initialize(_fake_agent())
@@ -1346,10 +1363,12 @@ class TestRetrievalInjectionExtended:
         manager, client = _make_manager(retrieval_config=Neo4jRetrievalConfig())
         client.long_term.entities = [
             SimpleNamespace(
+                id="entity-1",
                 display_name="Acme",
                 type="ORGANIZATION",
                 full_type="ORGANIZATION",
                 description=None,
+                metadata={},
             )
         ]
         return manager, client
@@ -1663,5 +1682,208 @@ class TestInitializeNormalizesHistory:
             assert agent.messages == []
             stored = client.short_term.conversations["sess-1"].messages
             assert [m.content for m in stored] == ["stale"]
+        finally:
+            manager.close()
+
+
+class TestRecallUserScope:
+    """A manager built with ``user_id`` passes it to every recall search."""
+
+    def _recall_search_kwargs(self, client: Any) -> list[dict[str, Any]]:
+        return [kw for kw in client.long_term.search_kwargs if kw["query"] == "hi"]
+
+    def test_a_scoped_manager_passes_its_user_to_the_fact_search(self) -> None:
+        from neo4j_agent_memory.integrations.strands.session_manager import (
+            Neo4jRetrievalConfig,
+        )
+
+        manager, client = _make_manager(
+            user_id="alice",
+            retrieval_config=Neo4jRetrievalConfig(
+                include_entities=False, include_preferences=False, include_facts=True
+            ),
+        )
+        try:
+            manager.initialize(_fake_agent())
+            asyncio.run(manager._inject_context({"role": "user", "content": [{"text": "hi"}]}))
+
+            assert self._recall_search_kwargs(client) == [
+                {"query": "hi", "limit": 10, "threshold": 0.2, "user_identifier": "alice"}
+            ]
+        finally:
+            manager.close()
+
+    def test_a_scoped_manager_passes_its_user_to_the_entity_search(self) -> None:
+        from neo4j_agent_memory.integrations.strands.session_manager import (
+            Neo4jRetrievalConfig,
+        )
+
+        manager, client = _make_manager(
+            user_id="alice",
+            retrieval_config=Neo4jRetrievalConfig(include_preferences=False),
+        )
+        try:
+            manager.initialize(_fake_agent())
+            asyncio.run(manager._inject_context({"role": "user", "content": [{"text": "hi"}]}))
+
+            assert self._recall_search_kwargs(client) == [
+                {"query": "hi", "limit": 10, "threshold": 0.2, "user_identifier": "alice"}
+            ]
+        finally:
+            manager.close()
+
+    def test_an_unscoped_manager_searches_without_a_user(self) -> None:
+        from neo4j_agent_memory.integrations.strands.session_manager import (
+            Neo4jRetrievalConfig,
+        )
+
+        manager, client = _make_manager(retrieval_config=Neo4jRetrievalConfig())
+        try:
+            manager.initialize(_fake_agent())
+            asyncio.run(manager._inject_context({"role": "user", "content": [{"text": "hi"}]}))
+
+            assert self._recall_search_kwargs(client) == [
+                {"query": "hi", "limit": 10, "threshold": 0.2},
+                {"query": "hi", "limit": 10, "threshold": 0.2},
+            ]
+        finally:
+            manager.close()
+
+
+class TestLastRecall:
+    """``last_recall`` holds the entries the last recall put in the prompt."""
+
+    def _manager(self, **kwargs: Any):
+        from neo4j_agent_memory.integrations.strands.session_manager import (
+            Neo4jRetrievalConfig,
+        )
+        from neo4j_agent_memory.memory.long_term import Entity, Fact, Preference
+
+        manager, client = _make_manager(
+            retrieval_config=Neo4jRetrievalConfig(include_facts=True), **kwargs
+        )
+        entity = Entity(name="Acme", type="ORGANIZATION", description="customer")
+        entity.metadata["similarity"] = 0.91
+        preference = Preference(category="style", preference="concise answers")
+        preference.metadata["similarity"] = 0.62
+        fact = Fact(subject="Jane", predicate="works_at", object="Acme")
+        fact.metadata["similarity"] = 0.55
+        client.long_term.entities = [entity]
+        client.long_term.preferences = [preference]
+        client.long_term.facts = [fact]
+        return manager, client, (entity, preference, fact)
+
+    def test_is_empty_before_any_recall(self) -> None:
+        manager, _, _ = self._manager()
+        try:
+            assert manager.last_recall == ()
+        finally:
+            manager.close()
+
+    def test_is_empty_without_a_retrieval_config(self) -> None:
+        manager, _ = _make_manager()
+        try:
+            manager.initialize(_fake_agent())
+            asyncio.run(manager._inject_context({"role": "user", "content": [{"text": "hi"}]}))
+            assert manager.last_recall == ()
+        finally:
+            manager.close()
+
+    def test_lists_each_injected_entry_in_prompt_order(self) -> None:
+        from neo4j_agent_memory.integrations.strands import RecalledEntry
+
+        manager, _, (entity, preference, fact) = self._manager()
+        try:
+            manager.initialize(_fake_agent())
+            message = {"role": "user", "content": [{"text": "tell me about Acme"}]}
+            asyncio.run(manager._inject_context(message))
+
+            assert manager.last_recall == (
+                RecalledEntry("entity", str(entity.id), "ORGANIZATION", "Acme", 0.91),
+                RecalledEntry("preference", str(preference.id), "style", "concise answers", 0.62),
+                RecalledEntry("fact", str(fact.id), "works_at", "Jane works_at Acme", 0.55),
+            )
+            # The prompt text is the same block as before the accessor existed.
+            assert message["content"][0]["text"] == (
+                "<user_context>\n"
+                "Relevant memory:\n"
+                "- [entity] Acme (ORGANIZATION) — customer\n"
+                "- [preference] style: concise answers\n"
+                "- [fact] Jane works_at Acme\n"
+                "</user_context>\n"
+                "tell me about Acme"
+            )
+        finally:
+            manager.close()
+
+    def test_a_scoped_preference_listing_has_no_score(self) -> None:
+        from neo4j_agent_memory.memory.long_term import Preference
+
+        manager, client, _ = self._manager(user_id="alice")
+        own = Preference(category="style", preference="short answers")
+        client.long_term.preferences_by_user["alice"] = [own]
+        try:
+            manager.initialize(_fake_agent())
+            asyncio.run(manager._inject_context({"role": "user", "content": [{"text": "hi"}]}))
+
+            preferences = [e for e in manager.last_recall if e.kind == "preference"]
+            assert [(e.id, e.text, e.score) for e in preferences] == [
+                (str(own.id), "short answers", None)
+            ]
+        finally:
+            manager.close()
+
+    def test_is_replaced_by_the_next_recall(self) -> None:
+        manager, client, _ = self._manager()
+        try:
+            manager.initialize(_fake_agent())
+            asyncio.run(manager._inject_context({"role": "user", "content": [{"text": "one"}]}))
+            assert len(manager.last_recall) == 3
+
+            client.long_term.preferences = []
+            client.long_term.facts = []
+            asyncio.run(manager._inject_context({"role": "user", "content": [{"text": "two"}]}))
+            assert [e.kind for e in manager.last_recall] == ["entity"]
+        finally:
+            manager.close()
+
+    def test_is_cleared_by_a_recall_that_finds_nothing(self) -> None:
+        manager, client, _ = self._manager()
+        try:
+            manager.initialize(_fake_agent())
+            asyncio.run(manager._inject_context({"role": "user", "content": [{"text": "one"}]}))
+            client.long_term.entities = []
+            client.long_term.preferences = []
+            client.long_term.facts = []
+            message = {"role": "user", "content": [{"text": "two"}]}
+            asyncio.run(manager._inject_context(message))
+
+            assert manager.last_recall == ()
+            assert message["content"][0]["text"] == "two"
+        finally:
+            manager.close()
+
+    def test_is_cleared_when_every_search_fails(self) -> None:
+        manager, client, _ = self._manager()
+        try:
+            manager.initialize(_fake_agent())
+            asyncio.run(manager._inject_context({"role": "user", "content": [{"text": "one"}]}))
+            client.long_term.fail_searches = True
+            asyncio.run(manager._inject_context({"role": "user", "content": [{"text": "two"}]}))
+
+            assert manager.last_recall == ()
+        finally:
+            manager.close()
+
+    def test_a_message_that_was_already_injected_keeps_the_recall(self) -> None:
+        manager, _, _ = self._manager()
+        try:
+            manager.initialize(_fake_agent())
+            message = {"role": "user", "content": [{"text": "tell me about Acme"}]}
+            asyncio.run(manager._inject_context(message))
+            first = manager.last_recall
+            asyncio.run(manager._inject_context(message))
+
+            assert manager.last_recall == first
         finally:
             manager.close()

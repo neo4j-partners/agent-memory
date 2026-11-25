@@ -334,6 +334,8 @@ class FakeLongTerm:
         self.search_kwargs: list[dict[str, Any]] = []
         self.added_preferences: list[tuple[str, str]] = []
         self.added_facts: list[tuple[str, str, str]] = []
+        #: The ``user_identifier`` each ``add_fact`` call passed, in order.
+        self.added_fact_users: list[str | None] = []
         self.added_entities: list[tuple[str, str]] = []
         self.related: list[Any] = []
         #: Optional per-entity relationship type override, keyed by
@@ -397,8 +399,17 @@ class FakeLongTerm:
             self.preferences_by_user.setdefault(user_identifier, []).append(stored)
         return stored
 
-    async def add_fact(self, subject: str, predicate: str, obj: str, **kwargs: Any) -> Any:
+    async def add_fact(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        *,
+        user_identifier: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
         self.added_facts.append((subject, predicate, obj))
+        self.added_fact_users.append(user_identifier)
         from neo4j_agent_memory.memory.long_term import Fact
 
         return Fact(subject=subject, predicate=predicate, object=obj)

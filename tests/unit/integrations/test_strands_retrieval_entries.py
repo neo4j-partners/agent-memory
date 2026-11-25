@@ -135,3 +135,87 @@ class TestRetrieveEntries:
 
         assert [r.metadata["kind"] for r in rows] == ["entity", "preference", "fact"]
         assert all("score" not in r.metadata for r in rows)
+
+
+class TestRetrieveEntriesUserScope:
+    @pytest.mark.asyncio
+    async def test_passes_the_user_to_the_entity_search(self) -> None:
+        from neo4j_agent_memory.integrations.strands._retrieval import _retrieve_entries
+        from tests.unit.integrations.strands_fakes import FakeLongTerm
+
+        long_term = FakeLongTerm()
+        await _retrieve_entries(
+            cast("LongTermProtocol", long_term),
+            "acme",
+            limit=10,
+            min_score=0.2,
+            include_entities=True,
+            include_preferences=False,
+            include_facts=False,
+            nams=False,
+            user_id="alice",
+        )
+
+        assert long_term.search_kwargs == [
+            {"query": "acme", "limit": 10, "threshold": 0.2, "user_identifier": "alice"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_searches_without_a_user_when_none_is_set(self) -> None:
+        from neo4j_agent_memory.integrations.strands._retrieval import _retrieve_entries
+        from tests.unit.integrations.strands_fakes import FakeLongTerm
+
+        long_term = FakeLongTerm()
+        await _retrieve_entries(
+            cast("LongTermProtocol", long_term),
+            "acme",
+            limit=10,
+            min_score=0.2,
+            include_entities=True,
+            include_preferences=False,
+            include_facts=False,
+            nams=False,
+        )
+
+        assert long_term.search_kwargs == [{"query": "acme", "limit": 10, "threshold": 0.2}]
+
+    @pytest.mark.asyncio
+    async def test_passes_the_user_to_the_fact_search(self) -> None:
+        from neo4j_agent_memory.integrations.strands._retrieval import _retrieve_entries
+        from tests.unit.integrations.strands_fakes import FakeLongTerm
+
+        long_term = FakeLongTerm()
+        await _retrieve_entries(
+            cast("LongTermProtocol", long_term),
+            "acme",
+            limit=10,
+            min_score=0.2,
+            include_entities=False,
+            include_preferences=False,
+            include_facts=True,
+            nams=False,
+            user_id="alice",
+        )
+
+        assert long_term.search_kwargs == [
+            {"query": "acme", "limit": 10, "threshold": 0.2, "user_identifier": "alice"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_searches_facts_without_a_user_when_none_is_set(self) -> None:
+        from neo4j_agent_memory.integrations.strands._retrieval import _retrieve_entries
+        from tests.unit.integrations.strands_fakes import FakeLongTerm
+
+        long_term = FakeLongTerm()
+        await _retrieve_entries(
+            cast("LongTermProtocol", long_term),
+            "acme",
+            limit=10,
+            min_score=0.2,
+            include_entities=False,
+            include_preferences=False,
+            include_facts=True,
+            nams=False,
+        )
+
+        assert long_term.search_kwargs == [{"query": "acme", "limit": 10, "threshold": 0.2}]
