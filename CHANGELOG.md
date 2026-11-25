@@ -350,6 +350,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Bedrock rejects before the fallback to `toolChoice` auto does not count
   toward `max_retries`.
 
+### Known limits
+
+- User scoping decides which entities and facts a user recalls. It does
+  not decide what those entries contain.
+- An entity that two users mention is one `:Entity` node. Its
+  description goes into the recall prompt, and it can hold text
+  extracted from another user's conversation.
+- A deduplicated fact is one `:Fact` node, linked to each user who adds
+  it. When one user adds it again with a higher confidence, the new
+  object replaces the old one, and every linked user sees the change.
+
 ## [0.8.0] - 2026-10-22
 
 ### Changed
